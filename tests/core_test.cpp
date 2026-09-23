@@ -1569,6 +1569,165 @@ static void test_block_cache_lru_and_read_ahead() {
     std::cout << "  PASS: test_block_cache_lru_and_read_ahead\n";
 }
 
+static void test_production_hardening_and_recovery() {
+    std::cout << "Running test_production_hardening_and_recovery...\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_hardening";
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Create a dummy base raw image (64 KiB)
+    auto base_path = test_dir / "base_img.raw";
+    {
+        std::ofstream ofs(base_path, std::ios::binary);
+        std::vector<uint8_t> zeros(64 * 1024, 0xAA);
+        ofs.write(reinterpret_cast<const char*>(zeros.data()), zeros.size());
+    }
+    auto base_dev = RawImageBackend::open(base_path.string(), false).value();
+
+    // 2. Corrupt COW file test (bad magic)
+    auto corrupt_cow_path = test_dir / "bad_magic.cow";
+    {
+        std::ofstream ofs(corrupt_cow_path, std::ios::binary);
+        ofs.write("BAD!CORRUPT_DATA", 16);
+    }
+    // Attempting to open bad_magic.cow directly fails
+    auto dev_fail = CowBlockDevice::create(base_dev, corrupt_cow_path);
+    assert(!dev_fail.is_ok());
+
+    // 3. Quarantine corrupted overlay test
+    assert(CowBlockDevice::quarantine_corrupted_overlay(corrupt_cow_path).is_ok());
+    assert(!std::filesystem::exists(corrupt_cow_path));
+    auto quarantined_path = std::filesystem::path(corrupt_cow_path.string() + ".corrupted");
+    assert(std::filesystem::exists(quarantined_path));
+
+    // 4. Truncated COW file auto-recovery test (power failure simulation)
+    // Create header specifying 5 allocated chunks, but only write 2 chunk slots to disk
+    auto trunc_cow_path = test_dir / "truncated.cow";
+    const uint32_t chunk_size = 4096;
+    {
+        std::ofstream ofs(trunc_cow_path, std::ios::binary);
+        // Direct write of CowHeader layout
+        struct RawHdr {
+            char magic[4];
+            uint32_t version;
+            uint32_t chunk_size;
+            uint32_t reserved;
+            uint64_t virtual_capacity;
+            uint64_t allocated_chunks;
+            uint64_t checksum;
+            uint8_t pad[472];
+        } hdr{};
+        std::memcpy(hdr.magic, "COWB", 4);
+        hdr.version = 1;
+        hdr.chunk_size = chunk_size;
+        hdr.virtual_capacity = base_dev->size();
+        hdr.allocated_chunks = 5; // Claims 5 slots exist
+        ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+
+        // Write only 2 valid slots:
+        // Slot 0: virtual chunk 1
+        uint64_t v0 = 1;
+        ofs.write(reinterpret_cast<const char*>(&v0), sizeof(v0));
+        std::vector<uint8_t> payload0(chunk_size, 0x11);
+        ofs.write(reinterpret_cast<const char*>(payload0.data()), payload0.size());
+
+        // Slot 1: virtual chunk 3
+        uint64_t v1 = 3;
+        ofs.write(reinterpret_cast<const char*>(&v1), sizeof(v1));
+        std::vector<uint8_t> payload1(chunk_size, 0x33);
+        ofs.write(reinterpret_cast<const char*>(payload1.data()), payload1.size());
+        // Abrupt termination here! File truncated before slots 2, 3, 4!
+    }
+
+    // Opening truncated.cow should auto-repair and clamp allocated chunks to 2
+    auto recovered_cow = CowBlockDevice::create(base_dev, trunc_cow_path, chunk_size);
+    assert(recovered_cow.is_ok());
+    auto r_dev = recovered_cow.value();
+    assert(r_dev->allocated_chunks() == 2);
+
+    // Verify chunk 1 data was preserved
+    std::vector<std::byte> read_buf(chunk_size);
+    auto read_res = r_dev->read(1 * chunk_size, read_buf);
+    assert(read_res.is_ok());
+    assert(read_buf[0] == std::byte{0x11});
+
+    // Verify unwritten chunk reads from base device (0xAA)
+    read_res = r_dev->read(0, read_buf);
+    assert(read_res.is_ok());
+    assert(read_buf[0] == std::byte{0xAA});
+
+    r_dev->close();
+    r_dev.reset();
+
+    // 5. ClientSessionManager auto-quarantine test
+    Configuration cfg;
+    cfg.set_os_images_dir(test_dir);
+    cfg.set_writeback_dir(test_dir / "writeback");
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    img_mgr->configure(cfg);
+    auto import_res = img_mgr->import_image(base_path, ImageRole::OsImage, ImageId("base_img"));
+    assert(import_res.is_ok());
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir / "writeback");
+
+    // Pre-create a corrupt writeback file for client "faulty_pc"
+    auto client_wb = test_dir / "writeback" / "wb_faulty_pc.cow";
+    std::filesystem::create_directories(client_wb.parent_path(), ec);
+    {
+        std::ofstream ofs(client_wb, std::ios::binary);
+        ofs.write("CORRUPT_HEADER_GARBAGE", 22);
+    }
+    assert(std::filesystem::exists(client_wb));
+
+    // ClientSessionManager must auto-quarantine faulty_pc.cow and succeed in creating session!
+    ClientId cid("faulty_pc");
+    NetworkAddress client_ip(192, 168, 1, 99);
+    ImageId os_id("base_img");
+    auto sess_res = sess_mgr->get_or_create_session(cid, client_ip, os_id);
+    assert(sess_res.is_ok());
+    assert(std::filesystem::exists(test_dir / "writeback" / "wb_faulty_pc.cow.corrupted"));
+    assert(std::filesystem::exists(client_wb));
+    assert(sess_res.value()->cow_device()->allocated_chunks() == 0);
+    assert(sess_mgr->terminate_session(cid).is_ok());
+
+    // 6. TFTP RRQ safety checks
+    // Malformed: no null terminator
+    std::vector<uint8_t> malformed_rrq = {0x00, 0x01, 'b', 'o', 'o', 't'};
+    auto fn_res = TftpServer::parse_rrq_filename(malformed_rrq);
+    assert(!fn_res.is_ok());
+
+    // Traversal attack rejected
+    std::vector<uint8_t> traversal_rrq = {0x00, 0x01, '.', '.', '/', 'e', 't', 'c', '/', 'p', 'a', 's', 's', 'w', 'd', 0x00, 'o', 'c', 't', 'e', 't', 0x00};
+    fn_res = TftpServer::parse_rrq_filename(traversal_rrq);
+    assert(!fn_res.is_ok());
+
+    // Valid RRQ accepted
+    std::vector<uint8_t> valid_rrq = {0x00, 0x01, 'b', 'o', 'o', 't', '.', 'i', 'p', 'x', 'e', 0x00, 'o', 'c', 't', 'e', 't', 0x00};
+    fn_res = TftpServer::parse_rrq_filename(valid_rrq);
+    assert(fn_res.is_ok());
+    assert(fn_res.value() == "boot.ipxe");
+
+    // 7. iSCSI Target bounds validation
+    IscsiTargetConfig iscsi_cfg;
+    iscsi_cfg.default_os_image_id = os_id;
+    auto target = std::make_shared<IscsiTarget>(iscsi_cfg, sess_mgr);
+    auto sess_ok = sess_mgr->get_or_create_session(cid, client_ip, os_id).value();
+
+    // Out of bounds read: base image is 64 KiB = 128 sectors. Try reading at LBA 130!
+    std::vector<std::byte> oob_buf(512);
+    auto oob_read = target->execute_read(*sess_ok, 130, 1, oob_buf);
+    assert(!oob_read.is_ok());
+
+    auto oob_write = target->execute_write(*sess_ok, 130, 1, oob_buf);
+    assert(!oob_write.is_ok());
+
+    assert(sess_mgr->terminate_session(cid).is_ok());
+    base_dev.reset();
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_production_hardening_and_recovery\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -1614,8 +1773,11 @@ int main() {
     // Phase 10 Tests
     test_block_cache_lru_and_read_ahead();
 
+    // Phase 11 Tests
+    test_production_hardening_and_recovery();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (24/24 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (25/25 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

@@ -66,6 +66,11 @@ public:
     [[nodiscard]] Result<void> reset() noexcept;
 
     /**
+     * @brief Quarantines a corrupted overlay file by moving it to .corrupted.
+     */
+    [[nodiscard]] static Result<void> quarantine_corrupted_overlay(const std::filesystem::path& path);
+
+    /**
      * @brief Factory to create and initialize a CowBlockDevice.
      */
     [[nodiscard]] static Result<std::shared_ptr<CowBlockDevice>> create(

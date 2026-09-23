@@ -114,6 +114,10 @@ Result<size_t> IscsiTarget::execute_read(
     uint64_t offset = start_lba * 512;
     size_t req_bytes = sector_count * 512;
 
+    if (offset + req_bytes > session.cow_device()->size()) {
+        return Error(ErrorCode::StorageFailure, "SCSI read exceeds device capacity");
+    }
+
     if (destination.size() < req_bytes) {
         return Error(ErrorCode::StorageFailure, "Destination buffer smaller than requested sectors");
     }
@@ -138,6 +142,10 @@ Result<size_t> IscsiTarget::execute_write(
 
     uint64_t offset = start_lba * 512;
     size_t req_bytes = sector_count * 512;
+
+    if (offset + req_bytes > session.cow_device()->size()) {
+        return Error(ErrorCode::StorageFailure, "SCSI write exceeds device capacity");
+    }
 
     if (source.size() < req_bytes) {
         return Error(ErrorCode::StorageFailure, "Source buffer smaller than write sectors");
@@ -317,6 +325,10 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
             }
         }
+    }
+
+    if (session) {
+        session->set_state(ClientState::Offline);
     }
 
     closesocket(s);

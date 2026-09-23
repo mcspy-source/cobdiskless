@@ -64,8 +64,13 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
 
     auto cow_res = CowBlockDevice::create(golden_img->device(), wb_path);
     if (!cow_res.is_ok()) {
-        (void)image_manager_->release_image(os_image_id);
-        return cow_res.error();
+        // Crash / corruption recovery: quarantine corrupted file and retry with a clean one
+        (void)CowBlockDevice::quarantine_corrupted_overlay(wb_path);
+        cow_res = CowBlockDevice::create(golden_img->device(), wb_path);
+        if (!cow_res.is_ok()) {
+            (void)image_manager_->release_image(os_image_id);
+            return cow_res.error();
+        }
     }
 
     auto session = std::make_shared<ClientSession>(

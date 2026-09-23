@@ -78,6 +78,11 @@ public:
         const std::string& error_message
     );
 
+    /**
+     * @brief Parses and validates an RRQ packet filename, guarding against traversal and overflow.
+     */
+    [[nodiscard]] static Result<std::string> parse_rrq_filename(std::span<const uint8_t> packet);
+
     [[nodiscard]] uint16_t port() const noexcept { return port_; }
     [[nodiscard]] const std::filesystem::path& root_dir() const noexcept { return root_dir_; }
 

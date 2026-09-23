@@ -96,31 +96,55 @@ Result<void> CowBlockDevice::init_or_load_overlay() {
         std::filesystem::create_directories(writeback_path_.parent_path(), ec);
     }
 
-    bool exists = std::filesystem::exists(writeback_path_);
-    if (exists && std::filesystem::file_size(writeback_path_) >= sizeof(CowHeader)) {
+    std::error_code ec;
+    bool exists = std::filesystem::exists(writeback_path_, ec);
+    if (exists) {
+        uint64_t actual_file_size = std::filesystem::file_size(writeback_path_, ec);
+        if (actual_file_size < sizeof(CowHeader)) {
+            return Error(ErrorCode::StorageFailure, "Truncated writeback header: " + writeback_path_.string());
+        }
+
         // Open existing file
         overlay_stream_.open(writeback_path_, std::ios::in | std::ios::out | std::ios::binary);
         if (!overlay_stream_.is_open()) {
             return Error(ErrorCode::StorageFailure, "Failed to open existing writeback file: " + writeback_path_.string());
         }
 
-        CowHeader header;
+        CowHeader header{};
         overlay_stream_.read(reinterpret_cast<char*>(&header), sizeof(header));
         if (std::memcmp(header.magic, "COWB", 4) != 0) {
+            overlay_stream_.close();
             return Error(ErrorCode::StorageFailure, "Invalid COW header magic in " + writeback_path_.string());
+        }
+
+        if (header.chunk_size == 0 || (header.chunk_size % 512 != 0) || header.chunk_size > (64 * 1024 * 1024)) {
+            overlay_stream_.close();
+            return Error(ErrorCode::StorageFailure, "Invalid COW chunk size: " + std::to_string(header.chunk_size));
         }
 
         chunk_size_ = header.chunk_size;
         uint64_t count = header.allocated_chunks;
+        const size_t slot_size = sizeof(uint64_t) + chunk_size_;
+
+        // Crash recovery: check for truncated file (e.g. power outage mid-write)
+        uint64_t max_possible_slots = (actual_file_size > sizeof(CowHeader)) ? (actual_file_size - sizeof(CowHeader)) / slot_size : 0;
+        if (count > max_possible_slots) {
+            count = max_possible_slots;
+            header.allocated_chunks = count;
+            overlay_stream_.seekp(0);
+            overlay_stream_.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            overlay_stream_.flush();
+        }
+
+        uint64_t max_virtual_chunks = (virtual_capacity_ + chunk_size_ - 1) / chunk_size_;
 
         // Read slot headers
-        const size_t slot_size = sizeof(uint64_t) + chunk_size_;
         for (uint64_t slot = 0; slot < count; ++slot) {
             uint64_t slot_offset = sizeof(CowHeader) + (slot * slot_size);
             overlay_stream_.seekg(slot_offset);
             uint64_t v_chunk = 0;
             overlay_stream_.read(reinterpret_cast<char*>(&v_chunk), sizeof(v_chunk));
-            if (overlay_stream_) {
+            if (overlay_stream_ && v_chunk < max_virtual_chunks) {
                 chunk_table_[v_chunk] = slot;
             }
         }
@@ -137,6 +161,20 @@ Result<void> CowBlockDevice::init_or_load_overlay() {
         }
     }
 
+    return {};
+}
+
+Result<void> CowBlockDevice::quarantine_corrupted_overlay(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return {};
+    }
+    auto corrupt_path = path;
+    corrupt_path += ".corrupted";
+    std::filesystem::rename(path, corrupt_path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+    }
     return {};
 }
 

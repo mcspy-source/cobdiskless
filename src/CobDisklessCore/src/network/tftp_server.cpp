@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cstring>
 #include <sstream>
+#include <algorithm>
 #include <span>
 
 #if defined(_WIN32)
@@ -123,6 +124,37 @@ std::vector<uint8_t> TftpServer::create_error_packet(
     return packet;
 }
 
+Result<std::string> TftpServer::parse_rrq_filename(std::span<const uint8_t> packet) {
+    if (packet.size() < 4) {
+        return Error(ErrorCode::NetworkFailure, "Packet too short for TFTP request");
+    }
+
+    uint16_t opcode = (static_cast<uint16_t>(packet[0]) << 8) | packet[1];
+    if (opcode != 1) { // 1 = RRQ
+        return Error(ErrorCode::NetworkFailure, "Expected RRQ opcode (1), got " + std::to_string(opcode));
+    }
+
+    const char* start = reinterpret_cast<const char*>(packet.data() + 2);
+    const char* end = reinterpret_cast<const char*>(packet.data() + packet.size());
+    auto null_it = std::find(start, end, '\0');
+    if (null_it == end) {
+        return Error(ErrorCode::NetworkFailure, "Malformed RRQ: missing null terminator");
+    }
+
+    std::string filename(start, null_it);
+    if (filename.empty()) {
+        return Error(ErrorCode::NetworkFailure, "Empty filename in RRQ");
+    }
+
+    // Traversal attack protection
+    if (filename.find("..") != std::string::npos || filename.starts_with("/") || filename.starts_with("\\") ||
+        (filename.size() >= 2 && filename[1] == ':')) {
+        return Error(ErrorCode::NetworkFailure, "Directory traversal or absolute path rejected: " + filename);
+    }
+
+    return filename;
+}
+
 Result<void> TftpServer::initialize() {
     if (state_ == SubsystemState::Running) {
         return {};
@@ -206,11 +238,10 @@ void TftpServer::run_server_loop() {
         int bytes = recvfrom(s, reinterpret_cast<char*>(recv_buf.data()), recv_buf.size(), 0,
                              (sockaddr*)&client_addr, &client_addr_len);
         if (bytes >= 4) {
-            uint16_t opcode = (static_cast<uint16_t>(recv_buf[0]) << 8) | recv_buf[1];
-            if (opcode == 1) { // RRQ (Read Request)
-                const char* fn_start = reinterpret_cast<const char*>(recv_buf.data() + 2);
-                std::string filename(fn_start);
-
+            auto span = std::span<const uint8_t>(recv_buf.data(), static_cast<size_t>(bytes));
+            auto fn_res = parse_rrq_filename(span);
+            if (fn_res.is_ok()) {
+                const auto& filename = fn_res.value();
                 auto content_res = get_file_content(filename);
                 if (content_res.is_ok()) {
                     const auto& data = content_res.value();
@@ -224,6 +255,11 @@ void TftpServer::run_server_loop() {
                     sendto(s, reinterpret_cast<const char*>(err_pkt.data()), err_pkt.size(), 0,
                            (sockaddr*)&client_addr, sizeof(client_addr));
                 }
+            } else {
+                // Reject malformed or traversal attempts
+                auto err_pkt = create_error_packet(2, fn_res.error().message());
+                sendto(s, reinterpret_cast<const char*>(err_pkt.data()), err_pkt.size(), 0,
+                       (sockaddr*)&client_addr, sizeof(client_addr));
             }
         }
     }
