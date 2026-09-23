@@ -40,6 +40,7 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/image/image_inspector.cpp
     src/CobDisklessCore/src/image/golden_image.cpp
     src/CobDisklessCore/src/image/image_registry.cpp
+    src/CobDisklessCore/src/image/image_manager.cpp
 )
 
 target_include_directories(CobDisklessCore

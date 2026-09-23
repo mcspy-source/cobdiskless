@@ -23,6 +23,7 @@
 #include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/image/golden_image.hpp"
 #include "CobDisklessCore/image/image_registry.hpp"
+#include "CobDisklessCore/image/image_manager.hpp"
 #include "CobDisklessCore/storage/storage_tester.hpp"
 
 using namespace cobdiskless;
@@ -958,6 +959,99 @@ void test_storage_tester_health_and_benchmark() {
     std::cout << "  PASS: test_storage_tester_health_and_benchmark\n";
 }
 
+// =============================================================================
+// Phase 6 Image Management, Validation & Safe Handling Tests
+// =============================================================================
+
+void test_image_manager_lifecycle_and_safe_handling() {
+    std::cout << "[RUN] test_image_manager_lifecycle_and_safe_handling\n";
+
+    const std::filesystem::path test_dir = "./test_img_mgr";
+    const std::filesystem::path os_dir = test_dir / "os";
+    const std::filesystem::path games_dir = test_dir / "games";
+    const std::filesystem::path wb_dir = test_dir / "wb";
+    const std::filesystem::path cache_dir = test_dir / "cache";
+
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(os_dir, ec);
+    std::filesystem::create_directories(games_dir, ec);
+    std::filesystem::create_directories(wb_dir, ec);
+    std::filesystem::create_directories(cache_dir, ec);
+
+    // Create a mock OS image
+    const std::filesystem::path win11_path = os_dir / "win11_pro.raw";
+    {
+        std::ofstream out(win11_path, std::ios::binary);
+        std::vector<char> dummy(1048576, 0x11);
+        out.write(dummy.data(), dummy.size());
+    }
+
+    // Create a mock Game image
+    const std::filesystem::path game_path = games_dir / "cyberpunk.raw";
+    {
+        std::ofstream out(game_path, std::ios::binary);
+        std::vector<char> dummy(2097152, 0x22);
+        out.write(dummy.data(), dummy.size());
+    }
+
+    Configuration cfg;
+    cfg.set_os_images_dir(os_dir);
+    cfg.set_games_dir(games_dir);
+    cfg.set_writeback_dir(wb_dir);
+    cfg.set_cache_dir(cache_dir);
+
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    ImageManager manager(registry);
+    manager.configure(cfg);
+
+    // 1. Directory scan
+    auto scan_res = manager.scan_directories();
+    assert(scan_res.is_ok());
+    assert(scan_res.value() == 2);
+
+    assert(manager.list_all_images().size() == 2);
+    assert(manager.list_images(ImageRole::OsImage).size() == 1);
+    assert(manager.list_images(ImageRole::GameDisk).size() == 1);
+
+    // 2. Storage usage report
+    auto usage = manager.get_storage_usage();
+    assert(usage.os_images_bytes == 1048576);
+    assert(usage.game_images_bytes == 2097152);
+
+    // 3. Image validation
+    auto val_res = manager.validate_image(ImageId("win11_pro"));
+    assert(val_res.is_ok());
+    assert(val_res.value().health_status == ImageHealthStatus::Healthy);
+
+    // 4. Safe image handling: Acquire reference
+    auto acq_res = manager.acquire_image(ImageId("win11_pro"));
+    assert(acq_res.is_ok());
+    assert(acq_res.value() != nullptr);
+
+    // Verify info shows active reference
+    auto info_res = manager.get_image_info(ImageId("win11_pro"));
+    assert(info_res.is_ok());
+    assert(info_res.value().active_references == 1);
+
+    // 5. Invariant: Attempting to remove an image with active client references MUST FAIL
+    auto remove_fail = manager.remove_image(ImageId("win11_pro"), false);
+    assert(remove_fail.is_err());
+    assert(remove_fail.error().code() == ErrorCode::StorageFailure);
+
+    // 6. Release reference and remove safely
+    assert(manager.release_image(ImageId("win11_pro")).is_ok());
+    auto remove_ok = manager.remove_image(ImageId("win11_pro"), true); // delete file on disk
+    assert(remove_ok.is_ok());
+    assert(!std::filesystem::exists(win11_path));
+    assert(manager.list_images(ImageRole::OsImage).empty());
+
+    // Cleanup
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_image_manager_lifecycle_and_safe_handling\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -986,8 +1080,11 @@ int main() {
     test_configuration_persistence_and_directories();
     test_storage_tester_health_and_benchmark();
 
+    // Phase 6 Tests
+    test_image_manager_lifecycle_and_safe_handling();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (17/17 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (18/18 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }
