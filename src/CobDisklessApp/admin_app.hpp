@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <atomic>
 #include "CobDisklessCore/core.hpp"
 #include "CobDisklessCore/config/configuration.hpp"
 #include "CobDisklessCore/image/image_registry.hpp"
@@ -35,16 +36,24 @@ public:
     int cli_add_image(const std::filesystem::path& image_path, const std::string& image_id);
     int cli_start_server(bool run_in_background = false);
 
+    // Server lifecycle controls
+    Result<void> start_server_services();
+    void stop_server_services();
+    [[nodiscard]] bool is_server_running() const noexcept { return server_running_.load(); }
+
     [[nodiscard]] const Configuration& config() const noexcept { return config_; }
     void set_config(Configuration cfg) { config_ = std::move(cfg); }
 
     [[nodiscard]] std::shared_ptr<GoldenImageRegistry> registry() const noexcept { return registry_; }
+    [[nodiscard]] const std::filesystem::path& config_file_path() const noexcept { return config_file_path_; }
 
 private:
     Configuration config_;
     std::filesystem::path config_file_path_{"cobdiskless.conf"};
     std::shared_ptr<GoldenImageRegistry> registry_;
     std::shared_ptr<Logger> logger_;
+    std::unique_ptr<Core> active_core_;
+    std::atomic<bool> server_running_{false};
 };
 
 } // namespace cobdiskless

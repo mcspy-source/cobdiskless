@@ -1,3 +1,9 @@
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+#include <thread>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -1930,6 +1936,400 @@ static void test_end_to_end_diskless_boot_pipeline() {
     std::cout << "  PASS: test_end_to_end_diskless_boot_pipeline\n";
 }
 
+// =============================================================================
+// PHASE 13: Reality Verification & Hardening Tests
+// =============================================================================
+
+void test_vhdx_rejection_and_vhd_handling() {
+    std::cout << "[RUN] test_vhdx_rejection_and_vhd_handling\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_vhdx_env";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Synthesize a mock VHDX file with "vhdxfile" header
+    std::filesystem::path vhdx_file = test_dir / "test_image.vhdx";
+    {
+        std::ofstream out(vhdx_file, std::ios::binary);
+        std::vector<uint8_t> header(1024 * 1024, 0); // 1 MB
+        const char* magic = "vhdxfile";
+        std::memcpy(header.data(), magic, 8);
+        out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    }
+
+    // Verify format detection explicitly identifies ImageFormat::Vhdx
+    auto format = ImageInspector::detect_format(vhdx_file);
+    assert(format == ImageFormat::Vhdx);
+
+    // Verify GoldenImage::open rejects VHDX with a clear diagnostic instead of silently treating as RAW
+    auto open_res = GoldenImage::open(vhdx_file, ImageId("vhdx_test"));
+    assert(!open_res.is_ok());
+    assert(open_res.error().code() == ErrorCode::StorageFailure);
+    assert(open_res.error().message().find("VHDX dynamic block translation is not supported") != std::string::npos);
+
+    // 2. Synthesize a valid Fixed VHD with "conectix" footer
+    std::filesystem::path vhd_file = test_dir / "test_image.vhd";
+    {
+        std::ofstream out(vhd_file, std::ios::binary);
+        std::vector<uint8_t> disk_data(65536, 0x5A); // 64 KB data
+        out.write(reinterpret_cast<const char*>(disk_data.data()), static_cast<std::streamsize>(disk_data.size()));
+
+        // 512-byte conectix footer
+        std::vector<uint8_t> footer(512, 0);
+        std::memcpy(footer.data(), "conectix", 8);
+        // disk_type = 2 (Fixed) at offset 0x3C (big-endian)
+        footer[0x3C] = 0x00; footer[0x3D] = 0x00; footer[0x3E] = 0x00; footer[0x3F] = 0x02;
+        // current_size at offset 0x30
+        uint64_t v_size = 65536;
+        for (int i = 0; i < 8; ++i) {
+            footer[0x30 + i] = static_cast<uint8_t>((v_size >> ((7 - i) * 8)) & 0xFF);
+        }
+        out.write(reinterpret_cast<const char*>(footer.data()), static_cast<std::streamsize>(footer.size()));
+    }
+
+    auto vhd_format = ImageInspector::detect_format(vhd_file);
+    assert(vhd_format == ImageFormat::VhdFixed);
+
+    auto vhd_open = GoldenImage::open(vhd_file, ImageId("vhd_fixed_test"));
+    assert(vhd_open.is_ok());
+    assert(vhd_open.value()->virtual_size() == 65536);
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_vhdx_rejection_and_vhd_handling\n";
+}
+
+void test_real_socket_networking() {
+    std::cout << "[RUN] test_real_socket_networking\n";
+
+#if defined(_WIN32)
+    WSADATA wsa;
+    int wsa_res = WSAStartup(MAKEWORD(2, 2), &wsa);
+    assert(wsa_res == 0);
+#endif
+
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_socket_env";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // =========================================================================
+    // 1. TFTP Server Real UDP Socket Test
+    // =========================================================================
+    {
+        uint16_t tftp_port = 10069;
+        TftpServer tftp(NetworkAddress(127, 0, 0, 1), test_dir, tftp_port);
+        assert(tftp.initialize().is_ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Create client UDP socket
+        SOCKET s_tftp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        assert(s_tftp != INVALID_SOCKET);
+
+        DWORD tv_ms = 3000;
+        setsockopt(s_tftp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+
+        sockaddr_in tftp_srv_addr{};
+        tftp_srv_addr.sin_family = AF_INET;
+        tftp_srv_addr.sin_port = htons(tftp_port);
+        tftp_srv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        // Send TFTP RRQ for "boot.ipxe" (opcode 1, "boot.ipxe\0octet\0")
+        std::vector<uint8_t> rrq = {0x00, 0x01, 'b', 'o', 'o', 't', '.', 'i', 'p', 'x', 'e', 0x00, 'o', 'c', 't', 'e', 't', 0x00};
+        int sent = sendto(s_tftp, reinterpret_cast<const char*>(rrq.data()), static_cast<int>(rrq.size()), 0,
+                          reinterpret_cast<const sockaddr*>(&tftp_srv_addr), sizeof(tftp_srv_addr));
+        assert(sent == static_cast<int>(rrq.size()));
+
+        // Receive real DATA packet
+        std::vector<uint8_t> recv_buf(2048);
+        sockaddr_in from_addr{};
+        int from_len = sizeof(from_addr);
+        int recvd = recvfrom(s_tftp, reinterpret_cast<char*>(recv_buf.data()), static_cast<int>(recv_buf.size()), 0,
+                             reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+        assert(recvd >= 4);
+        assert(recv_buf[0] == 0x00 && recv_buf[1] == 0x03); // Opcode 3 (DATA)
+        assert(recv_buf[2] == 0x00 && recv_buf[3] == 0x01); // Block 1
+        std::string payload(recv_buf.begin() + 4, recv_buf.begin() + recvd);
+        assert(payload.find("#!ipxe") != std::string::npos);
+
+        // Test path traversal security rejection
+        std::vector<uint8_t> bad_rrq = {0x00, 0x01, '.', '.', '/', 'e', 't', 'c', 0x00, 'o', 'c', 't', 'e', 't', 0x00};
+        sent = sendto(s_tftp, reinterpret_cast<const char*>(bad_rrq.data()), static_cast<int>(bad_rrq.size()), 0,
+                      reinterpret_cast<const sockaddr*>(&tftp_srv_addr), sizeof(tftp_srv_addr));
+        assert(sent == static_cast<int>(bad_rrq.size()));
+
+        recvd = recvfrom(s_tftp, reinterpret_cast<char*>(recv_buf.data()), static_cast<int>(recv_buf.size()), 0,
+                         reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+        assert(recvd >= 4);
+        assert(recv_buf[0] == 0x00 && recv_buf[1] == 0x05); // Opcode 5 (ERROR)
+
+        closesocket(s_tftp);
+        tftp.shutdown();
+    }
+
+    // =========================================================================
+    // 2. DHCP Server Real UDP Socket Test
+    // =========================================================================
+    {
+        uint16_t dhcp_port = 16767;
+        DhcpServer dhcp(
+            NetworkAddress(127, 0, 0, 1),
+            NetworkAddress(255, 255, 255, 0),
+            NetworkAddress(192, 168, 1, 100),
+            NetworkAddress(192, 168, 1, 200),
+            dhcp_port
+        );
+        assert(dhcp.initialize().is_ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        SOCKET s_dhcp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        assert(s_dhcp != INVALID_SOCKET);
+
+        DWORD tv_ms = 3000;
+        setsockopt(s_dhcp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+
+        sockaddr_in dhcp_srv_addr{};
+        dhcp_srv_addr.sin_family = AF_INET;
+        dhcp_srv_addr.sin_port = htons(dhcp_port);
+        dhcp_srv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        // Send real DHCPDISCOVER with Option 93 = 7 (UEFI x64)
+        std::vector<uint8_t> d_pkt(sizeof(DhcpHeader) + 64, 0);
+        auto* hdr = reinterpret_cast<DhcpHeader*>(d_pkt.data());
+        hdr->op = 1; // BOOTREQUEST
+        hdr->htype = 1;
+        hdr->hlen = 6;
+        hdr->xid = htonl(0x11223344);
+        hdr->flags = htons(0x8000);
+        hdr->chaddr[0] = 0xAA; hdr->chaddr[1] = 0xBB; hdr->chaddr[2] = 0xCC;
+        hdr->chaddr[3] = 0xDD; hdr->chaddr[4] = 0xEE; hdr->chaddr[5] = 0xFF;
+        hdr->magic_cookie[0] = 99; hdr->magic_cookie[1] = 130; hdr->magic_cookie[2] = 83; hdr->magic_cookie[3] = 99;
+
+        size_t opt_pos = sizeof(DhcpHeader);
+        d_pkt[opt_pos++] = 53; d_pkt[opt_pos++] = 1; d_pkt[opt_pos++] = 1; // DHCPDISCOVER
+        d_pkt[opt_pos++] = 93; d_pkt[opt_pos++] = 2; d_pkt[opt_pos++] = 0; d_pkt[opt_pos++] = 7; // UEFI x64
+        d_pkt[opt_pos++] = 255; // END
+        d_pkt.resize(opt_pos);
+
+        int sent = sendto(s_dhcp, reinterpret_cast<const char*>(d_pkt.data()), static_cast<int>(d_pkt.size()), 0,
+                          reinterpret_cast<const sockaddr*>(&dhcp_srv_addr), sizeof(dhcp_srv_addr));
+        assert(sent == static_cast<int>(d_pkt.size()));
+
+        std::vector<uint8_t> offer_buf(2048);
+        sockaddr_in from_addr{};
+        int from_len = sizeof(from_addr);
+        int recvd = recvfrom(s_dhcp, reinterpret_cast<char*>(offer_buf.data()), static_cast<int>(offer_buf.size()), 0,
+                             reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+        assert(recvd >= static_cast<int>(sizeof(DhcpHeader)));
+        const auto* reply_hdr = reinterpret_cast<const DhcpHeader*>(offer_buf.data());
+        assert(reply_hdr->op == 2); // BOOTREPLY
+        assert(reply_hdr->xid == htonl(0x11223344));
+        assert(std::string(reinterpret_cast<const char*>(reply_hdr->file)) == "ipxe.efi");
+
+        // Test truncated/malformed DHCP packet (must not crash server)
+        std::vector<uint8_t> short_pkt = {0x01, 0x01, 0x06, 0x00};
+        sendto(s_dhcp, reinterpret_cast<const char*>(short_pkt.data()), static_cast<int>(short_pkt.size()), 0,
+               reinterpret_cast<const sockaddr*>(&dhcp_srv_addr), sizeof(dhcp_srv_addr));
+
+        closesocket(s_dhcp);
+        dhcp.shutdown();
+    }
+
+    // =========================================================================
+    // 3. iSCSI Target Real TCP Socket Test
+    // =========================================================================
+    {
+        uint16_t iscsi_port = 13260;
+        auto reg = std::make_shared<GoldenImageRegistry>();
+        auto img_mgr = std::make_shared<ImageManager>(reg);
+        auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir);
+
+        IscsiTargetConfig cfg;
+        cfg.listen_address = NetworkAddress(127, 0, 0, 1, iscsi_port);
+        cfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
+        IscsiTarget target(cfg, sess_mgr);
+        assert(target.initialize().is_ok());
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        SOCKET s_iscsi = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        assert(s_iscsi != INVALID_SOCKET);
+
+        DWORD tv_ms = 3000;
+        setsockopt(s_iscsi, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+
+        sockaddr_in iscsi_srv_addr{};
+        iscsi_srv_addr.sin_family = AF_INET;
+        iscsi_srv_addr.sin_port = htons(iscsi_port);
+        iscsi_srv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        int conn = connect(s_iscsi, reinterpret_cast<const sockaddr*>(&iscsi_srv_addr), sizeof(iscsi_srv_addr));
+        assert(conn == 0);
+
+        // Send iSCSI Login Request
+        IscsiBhs login_req{};
+        login_req.opcode = 0x03; // Login Request
+        login_req.flags = 0x80;  // Transit bit
+        login_req.initiator_task_tag = 0x44332211;
+        int sent = send(s_iscsi, reinterpret_cast<const char*>(&login_req), sizeof(login_req), 0);
+        assert(sent == sizeof(login_req));
+
+        IscsiBhs login_resp{};
+        int recvd = recv(s_iscsi, reinterpret_cast<char*>(&login_resp), sizeof(login_resp), 0);
+        assert(recvd == sizeof(login_resp));
+        assert((login_resp.opcode & 0x3F) == 0x23); // Login Response
+        assert(login_resp.initiator_task_tag == 0x44332211);
+
+        // Send SCSI INQUIRY
+        IscsiBhs inq_req{};
+        inq_req.opcode = 0x01; // SCSI Command
+        inq_req.flags = 0x40;  // Read
+        inq_req.initiator_task_tag = 0x55667788;
+        inq_req.cdb[0] = 0x12; // INQUIRY
+        inq_req.cdb[4] = 36;
+        sent = send(s_iscsi, reinterpret_cast<const char*>(&inq_req), sizeof(inq_req), 0);
+        assert(sent == sizeof(inq_req));
+
+        IscsiBhs data_in_bhs{};
+        recvd = recv(s_iscsi, reinterpret_cast<char*>(&data_in_bhs), sizeof(data_in_bhs), 0);
+        assert(recvd == sizeof(data_in_bhs));
+        assert((data_in_bhs.opcode & 0x3F) == 0x25); // SCSI Data-In
+        assert(data_in_bhs.initiator_task_tag == 0x55667788);
+
+        std::vector<uint8_t> inq_payload(36);
+        recvd = recv(s_iscsi, reinterpret_cast<char*>(inq_payload.data()), static_cast<int>(inq_payload.size()), 0);
+        assert(recvd == 36);
+        std::string vendor(reinterpret_cast<char*>(inq_payload.data() + 8), 8);
+        assert(vendor == "COB     ");
+
+        // Send iSCSI Logout Request
+        IscsiBhs logout_req{};
+        logout_req.opcode = 0x06;
+        logout_req.flags = 0x80;
+        logout_req.initiator_task_tag = 0x9999;
+        send(s_iscsi, reinterpret_cast<const char*>(&logout_req), sizeof(logout_req), 0);
+
+        IscsiBhs logout_resp{};
+        recvd = recv(s_iscsi, reinterpret_cast<char*>(&logout_resp), sizeof(logout_resp), 0);
+        assert(recvd == sizeof(logout_resp));
+        assert((logout_resp.opcode & 0x3F) == 0x26);
+
+        closesocket(s_iscsi);
+        target.shutdown();
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+
+    std::cout << "  PASS: test_real_socket_networking\n";
+}
+
+void test_concurrency_and_stress() {
+    std::cout << "[RUN] test_concurrency_and_stress\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_concurrency_env";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // Create 1 MB base image filled with 0xAA
+    auto base_mem = std::make_shared<MemoryBlockDevice>(1024 * 1024);
+    std::vector<std::byte> init_fill(1024 * 1024, std::byte{0xAA});
+    (void)base_mem->write(0, init_fill);
+
+    auto base_ro = std::make_shared<ReadOnlyBlockDevice>(base_mem);
+    auto cow_file = test_dir / "cow_stress.bin";
+    auto cow_dev = CowBlockDevice::create(base_ro, cow_file, 4096).value();
+
+    auto cached_dev = CachedBlockDevice::create(cow_dev, 65536, 4096, 2).value();
+
+    constexpr size_t num_threads = 8;
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    std::atomic<bool> start_gate{false};
+    std::atomic<bool> failure{false};
+
+    // 4 reader threads
+    for (size_t t = 0; t < 4; ++t) {
+        workers.emplace_back([&, t]() {
+            while (!start_gate.load()) {
+                std::this_thread::yield();
+            }
+            std::vector<std::byte> buf(4096);
+            for (size_t iter = 0; iter < 100; ++iter) {
+                uint64_t offset = ((t * 10 + iter) % 200) * 4096;
+                auto read_res = cached_dev->read(offset, buf);
+                if (!read_res.is_ok() || read_res.value() != 4096) {
+                    failure.store(true);
+                    break;
+                }
+            }
+        });
+    }
+
+    // 4 writer threads, each writing unique byte patterns to independent non-overlapping ranges
+    for (size_t t = 0; t < 4; ++t) {
+        workers.emplace_back([&, t]() {
+            while (!start_gate.load()) {
+                std::this_thread::yield();
+            }
+            uint8_t pattern = static_cast<uint8_t>(0x10 + t);
+            std::vector<std::byte> buf(4096, std::byte{pattern});
+            for (size_t iter = 0; iter < 20; ++iter) {
+                uint64_t offset = (t * 20 + iter) * 4096;
+                auto write_res = cached_dev->write(offset, buf);
+                if (!write_res.is_ok() || write_res.value() != 4096) {
+                    failure.store(true);
+                    break;
+                }
+            }
+        });
+    }
+
+    start_gate.store(true);
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    assert(!failure.load());
+
+    // Flush and verify all written patterns
+    assert(cached_dev->flush().is_ok());
+
+    for (size_t t = 0; t < 4; ++t) {
+        uint8_t expected_pattern = static_cast<uint8_t>(0x10 + t);
+        std::vector<std::byte> verify_buf(4096);
+        for (size_t iter = 0; iter < 20; ++iter) {
+            uint64_t offset = (t * 20 + iter) * 4096;
+            auto read_res = cached_dev->read(offset, verify_buf);
+            assert(read_res.is_ok());
+            for (auto b : verify_buf) {
+                assert(b == std::byte{expected_pattern});
+            }
+        }
+    }
+
+    // Verify untouched area retains original 0xAA
+    std::vector<std::byte> untouched_buf(4096);
+    auto untouched_res = cached_dev->read(150 * 4096, untouched_buf);
+    assert(untouched_res.is_ok());
+    for (auto b : untouched_buf) {
+        assert(b == std::byte{0xAA});
+    }
+
+    // Verify cache hits occurred
+    assert(cached_dev->stats().hits > 0);
+
+    cached_dev.reset();
+    cow_dev.reset();
+    base_ro.reset();
+    base_mem.reset();
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_concurrency_and_stress\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -1981,8 +2381,13 @@ int main() {
     // Phase 12 Tests
     test_end_to_end_diskless_boot_pipeline();
 
+    // Phase 13 Reality Verification & Hardening Tests
+    test_vhdx_rejection_and_vhd_handling();
+    test_real_socket_networking();
+    test_concurrency_and_stress();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (26/26 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (29/29 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

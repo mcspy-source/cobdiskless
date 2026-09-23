@@ -75,7 +75,7 @@ public:
      */
     [[nodiscard]] static std::vector<uint8_t> create_error_packet(
         uint16_t error_code,
-        const std::string& error_message
+        std::string_view error_message
     );
 
     /**

@@ -25,7 +25,9 @@ Result<std::shared_ptr<GoldenImage>> GoldenImage::open(
     std::shared_ptr<BlockDevice> backend;
     ImageFormat fmt = ImageInspector::detect_format(path);
 
-    if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic || fmt == ImageFormat::VhdDifferencing) {
+    if (fmt == ImageFormat::Vhdx) {
+        return Error(ErrorCode::StorageFailure, "VHDX image format detected: VHDX dynamic block translation is not supported (convert to VHD or RAW for production boot)");
+    } else if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic || fmt == ImageFormat::VhdDifferencing) {
         auto vhd_res = VhdImageBackend::open(path, true);
         if (!vhd_res.is_ok()) {
             return vhd_res.error();

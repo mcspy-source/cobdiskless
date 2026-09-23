@@ -77,7 +77,8 @@ public:
         NetworkAddress server_ip,
         NetworkAddress subnet_mask = NetworkAddress(255, 255, 255, 0),
         NetworkAddress ip_pool_start = NetworkAddress(192, 168, 1, 100),
-        NetworkAddress ip_pool_end = NetworkAddress(192, 168, 1, 200)
+        NetworkAddress ip_pool_end = NetworkAddress(192, 168, 1, 200),
+        uint16_t port = 67
     );
     ~DhcpServer() override;
 
@@ -107,6 +108,7 @@ public:
 
     void set_server_ip(NetworkAddress ip) noexcept { server_ip_ = ip; }
     [[nodiscard]] NetworkAddress server_ip() const noexcept { return server_ip_; }
+    [[nodiscard]] uint16_t port() const noexcept { return port_; }
 
     [[nodiscard]] size_t active_leases_count() const noexcept;
 
@@ -116,6 +118,7 @@ private:
     NetworkAddress subnet_mask_;
     NetworkAddress ip_pool_start_;
     NetworkAddress ip_pool_end_;
+    uint16_t port_{67};
 
     mutable std::mutex lease_mutex_;
     std::unordered_map<std::string, NetworkAddress> mac_to_ip_leases_;

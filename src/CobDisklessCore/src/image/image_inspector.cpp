@@ -124,6 +124,18 @@ ImageFormat ImageInspector::detect_format(const std::filesystem::path& path) {
         return ImageFormat::Vhdx;
     }
 
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) >= 8) {
+        std::ifstream f(path, std::ios::binary);
+        if (f.is_open()) {
+            char magic[8];
+            f.read(magic, 8);
+            if (f.gcount() == 8 && std::memcmp(magic, "vhdxfile", 8) == 0) {
+                return ImageFormat::Vhdx;
+            }
+        }
+    }
+
     if (VhdImageBackend::is_vhd(path)) {
         // Probe deeper
         auto backend = VhdImageBackend::open(path, true);

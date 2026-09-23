@@ -15,11 +15,13 @@ DhcpServer::DhcpServer(
     NetworkAddress server_ip,
     NetworkAddress subnet_mask,
     NetworkAddress ip_pool_start,
-    NetworkAddress ip_pool_end
+    NetworkAddress ip_pool_end,
+    uint16_t port
 ) : server_ip_(server_ip),
     subnet_mask_(subnet_mask),
     ip_pool_start_(ip_pool_start),
-    ip_pool_end_(ip_pool_end) {}
+    ip_pool_end_(ip_pool_end),
+    port_(port) {}
 
 DhcpServer::~DhcpServer() {
     (void)shutdown();
@@ -265,10 +267,9 @@ void DhcpServer::run_packet_loop() {
 
     sockaddr_in bind_addr{};
     bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(67);
+    bind_addr.sin_port = htons(port_);
     bind_addr.sin_addr.s_addr = INADDR_ANY;
 
-    // Note: Binding port 67 may require admin privileges on Windows.
     // If bind fails, we stay in loop checking running_ to gracefully handle non-elevated runs.
     if (bind(s, (sockaddr*)&bind_addr, sizeof(bind_addr)) != 0) {
         while (running_) {
@@ -314,8 +315,12 @@ void DhcpServer::run_packet_loop() {
                     const auto& reply_bytes = reply_res.value();
                     sockaddr_in send_addr{};
                     send_addr.sin_family = AF_INET;
-                    send_addr.sin_port = htons(68);
-                    send_addr.sin_addr.s_addr = INADDR_BROADCAST;
+                    if (port_ != 67 && client_addr.sin_port != 0) {
+                        send_addr = client_addr; // Loopback/unicast test client
+                    } else {
+                        send_addr.sin_port = htons(68);
+                        send_addr.sin_addr.s_addr = INADDR_BROADCAST;
+                    }
                     sendto(s, reinterpret_cast<const char*>(reply_bytes.data()), reply_bytes.size(), 0,
                            (sockaddr*)&send_addr, sizeof(send_addr));
                 }

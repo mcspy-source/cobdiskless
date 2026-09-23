@@ -18,7 +18,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(MSVC)
     add_compile_options(/W4 /permissive-)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wunused -Woverloaded-virtual)
+    if(CYGWIN OR MSYS OR WIN32)
+        add_compile_options(-mwin32)
+    endif()
 endif()
 
 # ==============================================================================
@@ -55,7 +58,7 @@ target_include_directories(CobDisklessCore
         $<INSTALL_INTERFACE:include>
 )
 
-if(WIN32)
+if(CYGWIN OR MSYS OR WIN32)
     target_link_libraries(CobDisklessCore PUBLIC ws2_32)
 endif()
 
@@ -77,7 +80,7 @@ target_link_libraries(cobdiskless_app
         CobDisklessCore
 )
 
-if(WIN32)
+if(CYGWIN OR MSYS OR WIN32)
     target_link_libraries(cobdiskless_app
         PRIVATE
             comctl32
@@ -112,6 +115,13 @@ if(BUILD_TESTING)
         PRIVATE
             CobDisklessCore
     )
+
+    if(CYGWIN OR MSYS OR WIN32)
+        target_link_libraries(cobdiskless_core_test
+            PRIVATE
+                ws2_32
+        )
+    endif()
 
     add_test(
         NAME CoreLifecycleTest

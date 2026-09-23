@@ -109,7 +109,7 @@ std::vector<uint8_t> TftpServer::create_ack_packet(uint16_t block_num) {
 
 std::vector<uint8_t> TftpServer::create_error_packet(
     uint16_t error_code,
-    const std::string& error_message
+    std::string_view error_message
 ) {
     std::vector<uint8_t> packet;
     packet.resize(4 + error_message.size() + 1);
@@ -120,7 +120,8 @@ std::vector<uint8_t> TftpServer::create_error_packet(
     packet[2] = static_cast<uint8_t>((error_code >> 8) & 0xFF);
     packet[3] = static_cast<uint8_t>(error_code & 0xFF);
 
-    std::memcpy(packet.data() + 4, error_message.c_str(), error_message.size() + 1);
+    std::memcpy(packet.data() + 4, error_message.data(), error_message.size());
+    packet[packet.size() - 1] = 0;
     return packet;
 }
 

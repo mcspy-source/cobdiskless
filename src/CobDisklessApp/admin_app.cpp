@@ -10,6 +10,8 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <csignal>
+#include <thread>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -180,30 +182,41 @@ int AdminApp::cli_add_image(const std::filesystem::path& image_path, const std::
     return 0;
 }
 
-int AdminApp::cli_start_server(bool run_in_background) {
-    std::cout << "=========================================================\n";
-    std::cout << " CobDiskless Diskless Pipeline Server Starting...\n";
-    std::cout << "=========================================================\n";
+static std::atomic<bool> g_cli_stop_requested{false};
 
-    // 1. Ensure storage directories
-    auto dir_res = config_.ensure_directories_exist();
-    if (!dir_res.is_ok()) {
-        std::cerr << "Failed to verify storage directories: " << dir_res.error().message() << "\n";
-        return 1;
+#if defined(_WIN32)
+static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+    switch (ctrlType) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            g_cli_stop_requested.store(true);
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+#endif
+
+Result<void> AdminApp::start_server_services() {
+    if (server_running_.load()) {
+        return {};
     }
 
-    // 2. Initialize ImageManager
+    auto dir_res = config_.ensure_directories_exist();
+    if (!dir_res.is_ok()) {
+        return dir_res;
+    }
+
     auto img_mgr = std::make_shared<ImageManager>(registry_);
     img_mgr->configure(config_);
     (void)img_mgr->scan_directories();
 
-    // 3. Initialize ClientSessionManager
     auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, config_.writeback_dir());
 
-    // 4. Initialize Core
-    Core core(config_);
+    active_core_ = std::make_unique<Core>(config_);
 
-    // 5. Create DhcpServer (port 67)
     auto dhcp = std::make_shared<DhcpServer>(
         config_.server_address(),
         NetworkAddress(255, 255, 255, 0),
@@ -211,58 +224,183 @@ int AdminApp::cli_start_server(bool run_in_background) {
         NetworkAddress(192, 168, 1, 200)
     );
 
-    // 6. Create TftpServer (port 69)
     auto tftp = std::make_shared<TftpServer>(
         config_.server_address(),
         config_.os_images_dir(),
         69
     );
 
-    // 7. Create IscsiTarget (port 3260)
     IscsiTargetConfig iscsi_cfg;
     iscsi_cfg.listen_address = NetworkAddress(0, 0, 0, 0, 3260);
     iscsi_cfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
     auto iscsi = std::make_shared<IscsiTarget>(iscsi_cfg, sess_mgr);
 
-    // Register all subsystems into Core for deterministic lifecycle management
-    if (!core.register_subsystem(dhcp).is_ok() ||
-        !core.register_subsystem(tftp).is_ok() ||
-        !core.register_subsystem(iscsi).is_ok()) {
-        std::cerr << "Failed to register subsystems with Core.\n";
+    if (!active_core_->register_subsystem(dhcp).is_ok() ||
+        !active_core_->register_subsystem(tftp).is_ok() ||
+        !active_core_->register_subsystem(iscsi).is_ok()) {
+        active_core_.reset();
+        return Error(ErrorCode::InitializationFailure, "Failed to register subsystems with Core");
+    }
+
+    auto init_res = active_core_->initialize();
+    if (!init_res.is_ok()) {
+        active_core_.reset();
+        return init_res;
+    }
+
+    server_running_.store(true);
+    return {};
+}
+
+void AdminApp::stop_server_services() {
+    if (!server_running_.load() || !active_core_) {
+        return;
+    }
+    active_core_->shutdown();
+    active_core_.reset();
+    server_running_.store(false);
+}
+
+int AdminApp::cli_start_server(bool run_in_background) {
+    std::cout << "=========================================================\n";
+    std::cout << " CobDiskless Diskless Pipeline Server Starting...\n";
+    std::cout << "=========================================================\n";
+
+    auto start_res = start_server_services();
+    if (!start_res.is_ok()) {
+        std::cerr << "Core failed to start diskless subsystems: " << start_res.error().message() << "\n";
         return 1;
     }
 
-    auto init_res = core.initialize();
-    if (!init_res.is_ok()) {
-        std::cerr << "Core failed to start diskless subsystems: " << init_res.error().message() << "\n";
-        return 1;
-    }
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#endif
+    std::signal(SIGINT, [](int) { g_cli_stop_requested.store(true); });
+    std::signal(SIGTERM, [](int) { g_cli_stop_requested.store(true); });
 
     std::cout << "[SUCCESS] CobDiskless Pipeline is now active!\n";
     std::cout << "  - DHCP / PXE Server:     " << config_.server_address().ip_string() << ":67 (Option 93 UEFI/BIOS detection)\n";
     std::cout << "  - TFTP Boot Server:      " << config_.server_address().ip_string() << ":69 (Delivering undionly.kpxe / ipxe.efi / boot.ipxe)\n";
-    std::cout << "  - iSCSI SAN Target:      " << iscsi_cfg.target_iqn << " on port 3260\n";
+    std::cout << "  - iSCSI SAN Target:      iqn.2026-09.com.cobdiskless:storage on port 3260\n";
     std::cout << "  - Active Golden Images:  " << registry_->count() << "\n";
     std::cout << "  - Writeback Storage:     " << config_.writeback_dir().string() << " (COW multi-client isolation)\n";
     std::cout << "  - Block Cache:           Enabled (LRU + Read-ahead)\n";
     std::cout << "---------------------------------------------------------\n";
 
     if (!run_in_background) {
-        std::cout << "Server running. Press Enter or Ctrl+C to stop...\n";
-        std::string dummy;
-        std::getline(std::cin, dummy);
-        std::cout << "Shutting down diskless services...\n";
-        core.shutdown();
-        std::cout << "CobDiskless Server safely stopped.\n";
+        std::cout << "Server running in foreground. Press Enter or Ctrl+C to stop...\n";
+        std::thread input_thread([]() {
+            std::string dummy;
+            std::getline(std::cin, dummy);
+            g_cli_stop_requested.store(true);
+        });
+        input_thread.detach();
+
+        while (!g_cli_stop_requested.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    } else {
+        std::cout << "Server running in daemon mode. Waiting for shutdown signal...\n";
+        while (!g_cli_stop_requested.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
     }
+
+    std::cout << "\nShutting down diskless services...\n";
+    stop_server_services();
+    std::cout << "CobDiskless Server safely stopped.\n";
 
     return 0;
 }
 
 #if defined(_WIN32)
+static void UpdateGuiTabContent(HWND hwnd, AdminApp* app, int tabIndex) {
+    if (!app) return;
+    std::wostringstream ss;
+    switch (tabIndex) {
+        case 0: { // Dashboard
+            ss << L"CobDiskless Management Dashboard\r\n";
+            ss << L"=========================================================\r\n";
+            ss << L"Server State: " << (app->is_server_running() ? L"RUNNING (Active)" : L"STOPPED") << L"\r\n";
+            std::string s_ip = app->config().server_address().ip_string();
+            ss << L"Server IP:    " << std::wstring(s_ip.begin(), s_ip.end()) << L":" << app->config().server_address().port() << L"\r\n";
+            ss << L"Max Clients:  " << app->config().max_clients() << L"\r\n";
+            ss << L"Images Count: " << app->registry()->count() << L"\r\n";
+            ss << L"---------------------------------------------------------\r\n";
+            std::string os_d = app->config().os_images_dir().string();
+            std::string wb_d = app->config().writeback_dir().string();
+            std::string ca_d = app->config().cache_dir().string();
+            ss << L"OS Images:    " << std::wstring(os_d.begin(), os_d.end()) << L"\r\n";
+            ss << L"Writeback:    " << std::wstring(wb_d.begin(), wb_d.end()) << L"\r\n";
+            ss << L"Cache:        " << std::wstring(ca_d.begin(), ca_d.end()) << L"\r\n";
+            break;
+        }
+        case 1: { // Setup Wizard
+            ss << L"First-Run Setup Wizard\r\n";
+            ss << L"=========================================================\r\n";
+            ss << L"First-Run Status: " << (app->config().first_run_completed() ? L"COMPLETED" : L"NOT RUN YET") << L"\r\n";
+            std::string cfg_p = app->config_file_path().string();
+            ss << L"Config Path:      " << std::wstring(cfg_p.begin(), cfg_p.end()) << L"\r\n";
+            ss << L"Click 'Run Setup Wizard' to verify storage paths and save default config.\r\n";
+            break;
+        }
+        case 2: { // Golden Images
+            ss << L"Registered Golden Images Catalog\r\n";
+            ss << L"=========================================================\r\n";
+            auto images = app->registry()->get_all_images();
+            if (images.empty()) {
+                ss << L"No golden images currently registered.\r\n";
+                ss << L"Place .raw / .vhd files in " << std::wstring(app->config().os_images_dir().string().begin(), app->config().os_images_dir().string().end())
+                   << L" and click 'Refresh Images'.\r\n";
+            } else {
+                for (const auto& img : images) {
+                    std::string id_str = img->id().value();
+                    std::string fn_str = img->path().filename().string();
+                    std::string fmt_str = std::string(to_string(img->format()));
+                    std::string ps_str = std::string(to_string(img->partition_scheme()));
+                    std::string bm_str = std::string(to_string(img->boot_mode()));
+                    ss << L"[" << std::wstring(id_str.begin(), id_str.end()) << L"] "
+                       << std::wstring(fn_str.begin(), fn_str.end()) << L" ("
+                       << std::wstring(fmt_str.begin(), fmt_str.end()) << L", "
+                       << std::wstring(ps_str.begin(), ps_str.end()) << L", "
+                       << std::wstring(bm_str.begin(), bm_str.end()) << L", "
+                       << (img->virtual_size() / (1024 * 1024)) << L" MB)\r\n";
+                }
+            }
+            break;
+        }
+        case 3: { // Storage Bench
+            ss << L"Writeback & Cache Storage Benchmark\r\n";
+            ss << L"=========================================================\r\n";
+            ss << L"Click 'Run Storage Test' to perform sequential and random I/O benchmark on writeback storage.\r\n";
+            break;
+        }
+        case 4: { // Logs
+            ss << L"CobDiskless System Log Viewer\r\n";
+            ss << L"=========================================================\r\n";
+            ss << L"[INFO] Core initialized.\r\n";
+            if (app->is_server_running()) {
+                ss << L"[INFO] DHCP/PXE server active on port 67.\r\n";
+                ss << L"[INFO] TFTP boot server active on port 69.\r\n";
+                ss << L"[INFO] iSCSI target active on port 3260.\r\n";
+            } else {
+                ss << L"[INFO] Services are currently stopped.\r\n";
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    SetDlgItemTextW(hwnd, 103, ss.str().c_str());
+}
+
 static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            auto* app = reinterpret_cast<AdminApp*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+
             INITCOMMONCONTROLSEX icex;
             icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
             icex.dwICC = ICC_TAB_CLASSES;
@@ -273,7 +411,7 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 0, WC_TABCONTROLW, L"",
                 WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE,
                 10, 10, 620, 440,
-                hwnd, (HMENU)101, GetModuleHandleW(NULL), NULL
+                hwnd, reinterpret_cast<HMENU>(101), GetModuleHandleW(NULL), NULL
             );
 
             TCITEMW tie;
@@ -299,64 +437,131 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             CreateWindowExW(
                 0, L"STATIC",
                 L"CobDiskless Management Console Ready.\r\n"
-                L"Status: Core Running | Golden Images Registered | Multi-client Ready\r\n"
+                L"Status: Core Initialized | Ready to start diskless services\r\n"
                 L"Writeback: Active | Caching: Enabled",
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
-                30, 60, 580, 80,
-                hwnd, (HMENU)102, GetModuleHandleW(NULL), NULL
+                30, 50, 580, 50,
+                hwnd, reinterpret_cast<HMENU>(102), GetModuleHandleW(NULL), NULL
             );
 
-            // Action button
+            // Action buttons
             CreateWindowExW(
                 0, L"BUTTON", L"Run Setup Wizard",
-                WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-                30, 160, 160, 30,
-                hwnd, (HMENU)201, GetModuleHandleW(NULL), NULL
+                WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                25, 110, 135, 32,
+                hwnd, reinterpret_cast<HMENU>(201), GetModuleHandleW(NULL), NULL
             );
 
             CreateWindowExW(
                 0, L"BUTTON", L"Run Storage Test",
                 WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                210, 160, 160, 30,
-                hwnd, (HMENU)202, GetModuleHandleW(NULL), NULL
+                170, 110, 135, 32,
+                hwnd, reinterpret_cast<HMENU>(202), GetModuleHandleW(NULL), NULL
             );
 
             CreateWindowExW(
                 0, L"BUTTON", L"Refresh Images",
                 WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                390, 160, 160, 30,
-                hwnd, (HMENU)203, GetModuleHandleW(NULL), NULL
+                315, 110, 135, 32,
+                hwnd, reinterpret_cast<HMENU>(203), GetModuleHandleW(NULL), NULL
+            );
+
+            CreateWindowExW(
+                0, L"BUTTON", L"Start Server",
+                WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+                460, 110, 145, 32,
+                hwnd, reinterpret_cast<HMENU>(204), GetModuleHandleW(NULL), NULL
             );
 
             // Readout Edit Control
             CreateWindowExW(
                 WS_EX_CLIENTEDGE, L"EDIT",
-                L"CobDiskless v0.3.0 initialized successfully.\r\n"
-                L"Configuration loaded from cobdiskless.conf\r\n"
-                L"OS Images Dir: ./images/os\r\n"
-                L"Writeback Dir: ./writeback\r\n"
-                L"Cache Dir:     ./cache\r\n"
-                L"Ready to serve diskless clients.",
+                L"",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-                30, 210, 580, 220,
-                hwnd, (HMENU)103, GetModuleHandleW(NULL), NULL
+                25, 155, 580, 280,
+                hwnd, reinterpret_cast<HMENU>(103), GetModuleHandleW(NULL), NULL
             );
+
+            UpdateGuiTabContent(hwnd, app, 0);
+            return 0;
+        }
+        case WM_NOTIFY: {
+            auto* nmhdr = reinterpret_cast<NMHDR*>(lParam);
+            if (nmhdr && nmhdr->idFrom == 101 && nmhdr->code == TCN_SELCHANGE) {
+                auto* app = reinterpret_cast<AdminApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+                int tab = TabCtrl_GetCurSel(nmhdr->hwndFrom);
+                UpdateGuiTabContent(hwnd, app, tab);
+            }
             return 0;
         }
         case WM_COMMAND: {
             int wmId = LOWORD(wParam);
+            auto* app = reinterpret_cast<AdminApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (!app) return 0;
+
             if (wmId == 201) { // Wizard
-                MessageBoxW(hwnd, L"Setup Wizard completed! All storage directories validated.", L"CobDiskless Wizard", MB_OK | MB_ICONINFORMATION);
+                int res = app->cli_wizard();
+                if (res == 0) {
+                    UpdateGuiTabContent(hwnd, app, 1);
+                    MessageBoxW(hwnd, L"Setup Wizard completed! Storage directories validated and config saved.", L"CobDiskless Wizard", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxW(hwnd, L"Setup Wizard encountered an error validating directories.", L"CobDiskless Error", MB_OK | MB_ICONERROR);
+                }
             } else if (wmId == 202) { // Storage Test
-                MessageBoxW(hwnd, L"Storage benchmark passed! Write: >150 MB/s, Read: >250 MB/s", L"CobDiskless Storage Test", MB_OK | MB_ICONINFORMATION);
+                auto bench_res = StorageTester::run_benchmark(app->config().writeback_dir(), 4 * 1024 * 1024, 64 * 1024);
+                if (bench_res.is_ok()) {
+                    const auto& r = bench_res.value();
+                    std::wostringstream ss;
+                    ss << L"Storage Benchmark Results:\r\n";
+                    ss << L"Target:           " << r.target_path.wstring() << L"\r\n";
+                    ss << L"Write Speed:      " << r.sequential_write_mbps << L" MB/s\r\n";
+                    ss << L"Read Speed:       " << r.sequential_read_mbps << L" MB/s\r\n";
+                    ss << L"Random 4K IOPS:   " << r.random_read_iops << L" IOPS\r\n";
+                    ss << L"Average Latency:  " << r.avg_latency_ms << L" ms\r\n";
+                    ss << L"Status:           " << (r.passed ? L"PASSED" : L"FAILED") << L" ("
+                       << std::wstring(r.message.begin(), r.message.end()) << L")\r\n";
+                    SetDlgItemTextW(hwnd, 103, ss.str().c_str());
+                    MessageBoxW(hwnd, ss.str().c_str(), L"CobDiskless Storage Test", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxW(hwnd, L"Storage benchmark failed.", L"CobDiskless Error", MB_OK | MB_ICONERROR);
+                }
             } else if (wmId == 203) { // Refresh
-                MessageBoxW(hwnd, L"Image catalog refreshed.", L"CobDiskless Images", MB_OK | MB_ICONINFORMATION);
+                auto img_mgr = std::make_shared<ImageManager>(app->registry());
+                img_mgr->configure(app->config());
+                auto scan_res = img_mgr->scan_directories();
+                UpdateGuiTabContent(hwnd, app, 2);
+                size_t count = scan_res.is_ok() ? scan_res.value() : 0;
+                std::wstring info_text = L"Image catalog refreshed. Total registered: " + std::to_wstring(count);
+                MessageBoxW(hwnd, info_text.c_str(), L"CobDiskless Images", MB_OK | MB_ICONINFORMATION);
+            } else if (wmId == 204) { // Start / Stop Server
+                if (app->is_server_running()) {
+                    app->stop_server_services();
+                    SetDlgItemTextW(hwnd, 204, L"Start Server");
+                    SetDlgItemTextW(hwnd, 102, L"CobDiskless Management Console Ready.\r\nStatus: Server Stopped\r\nWriteback: Active | Caching: Enabled");
+                    UpdateGuiTabContent(hwnd, app, 0);
+                } else {
+                    auto res = app->start_server_services();
+                    if (res.is_ok()) {
+                        SetDlgItemTextW(hwnd, 204, L"Stop Server");
+                        SetDlgItemTextW(hwnd, 102, L"CobDiskless Pipeline Server ACTIVE.\r\nStatus: DHCP (67) | TFTP (69) | iSCSI (3260) Running\r\nReady for client network boot.");
+                        UpdateGuiTabContent(hwnd, app, 0);
+                    } else {
+                        std::string_view err_m = res.error().message();
+                        std::wstring werr(err_m.begin(), err_m.end());
+                        MessageBoxW(hwnd, (L"Failed to start server services:\r\n" + werr).c_str(), L"CobDiskless Error", MB_OK | MB_ICONERROR);
+                    }
+                }
             }
             return 0;
         }
-        case WM_DESTROY:
+        case WM_DESTROY: {
+            auto* app = reinterpret_cast<AdminApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (app && app->is_server_running()) {
+                app->stop_server_services();
+            }
             PostQuitMessage(0);
             return 0;
+        }
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -372,7 +577,7 @@ int AdminApp::run_gui() {
     wcex.lpfnWndProc = AdminWndProc;
     wcex.hInstance = hInstance;
     wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcex.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     wcex.lpszClassName = L"CobDisklessAdminClass";
 
     RegisterClassExW(&wcex);
@@ -382,7 +587,7 @@ int AdminApp::run_gui() {
         L"CobDiskless Management Console & Setup Wizard",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 660, 500,
-        NULL, NULL, hInstance, NULL
+        NULL, NULL, hInstance, this
     );
 
     if (!hWnd) {

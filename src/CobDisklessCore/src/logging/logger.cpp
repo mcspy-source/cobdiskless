@@ -39,7 +39,9 @@ std::string Logger::current_timestamp() {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
     std::tm tm_buf{};
-#if defined(_WIN32)
+#if defined(_MSC_VER)
+    localtime_s(&tm_buf, &time_t_now);
+#elif defined(_WIN32) && !defined(__CYGWIN__)
     localtime_s(&tm_buf, &time_t_now);
 #else
     localtime_r(&time_t_now, &tm_buf);
