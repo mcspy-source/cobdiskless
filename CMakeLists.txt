@@ -85,6 +85,15 @@ if(WIN32)
             user32
             ws2_32
     )
+
+    if(EXISTS "C:/msys64/usr/bin/msys-2.0.dll")
+        add_custom_command(TARGET cobdiskless_app POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "C:/msys64/usr/bin/msys-2.0.dll" $<TARGET_FILE_DIR:cobdiskless_app>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "C:/msys64/usr/bin/msys-gcc_s-seh-1.dll" $<TARGET_FILE_DIR:cobdiskless_app>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "C:/msys64/usr/bin/msys-stdc++-6.dll" $<TARGET_FILE_DIR:cobdiskless_app>
+            COMMENT "Copying MSYS2 runtime DLLs to output directory"
+        )
+    endif()
 endif()
 
 # ==============================================================================

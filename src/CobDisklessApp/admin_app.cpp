@@ -406,8 +406,12 @@ int AdminApp::run_gui() {
 
 int AdminApp::run(int argc, char* argv[]) {
     if (argc <= 1) {
-        // Default execution: Launch GUI on Windows, or print status if headless
+        // Default execution on double-click: Launch native Windows GUI
+#if defined(_WIN32)
+        return run_gui();
+#else
         return cli_status();
+#endif
     }
 
     std::string arg1 = argv[1];
