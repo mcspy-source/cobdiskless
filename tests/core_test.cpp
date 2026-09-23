@@ -25,6 +25,8 @@
 #include "CobDisklessCore/image/image_registry.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
 #include "CobDisklessCore/storage/storage_tester.hpp"
+#include "CobDisklessCore/storage/cow_block_device.hpp"
+#include "CobDisklessCore/client/client_session.hpp"
 
 using namespace cobdiskless;
 
@@ -1052,6 +1054,175 @@ void test_image_manager_lifecycle_and_safe_handling() {
     std::cout << "  PASS: test_image_manager_lifecycle_and_safe_handling\n";
 }
 
+// =============================================================================
+// Phase 7 Client Copy-On-Write (COW) & Writeback Tests
+// =============================================================================
+
+void test_cow_block_device_lifecycle() {
+    std::cout << "[RUN] test_cow_block_device_lifecycle\n";
+
+    const std::filesystem::path base_path = "golden_base.raw";
+    const std::filesystem::path cow_path = "client_test.cow";
+
+    std::error_code ec;
+    std::filesystem::remove(base_path, ec);
+    std::filesystem::remove(cow_path, ec);
+
+    // 1. Create 1 MiB base image filled with 0x11
+    {
+        std::ofstream base_out(base_path, std::ios::binary);
+        std::vector<uint8_t> base_data(1024 * 1024, 0x11);
+        base_out.write(reinterpret_cast<const char*>(base_data.data()), base_data.size());
+    }
+
+    auto base_dev_res = RawImageBackend::open(base_path, true);
+    assert(base_dev_res.is_ok());
+    auto base_dev = base_dev_res.value();
+
+    // 2. Create CowBlockDevice
+    auto cow_res = CowBlockDevice::create(base_dev, cow_path, 4096);
+    assert(cow_res.is_ok());
+    auto cow = cow_res.value();
+
+    assert(cow->is_open());
+    assert(!cow->is_read_only());
+    assert(cow->size_bytes() == 1024 * 1024);
+    assert(cow->allocated_chunks() == 0);
+
+    // 3. Read before write: should read through to base image (0x11)
+    std::vector<std::byte> buf(4096, std::byte{0});
+    auto r1 = cow->read(0, buf);
+    assert(r1.is_ok());
+    assert(r1.value() == 4096);
+    assert(std::to_integer<int>(buf[0]) == 0x11);
+
+    // 4. Write modified data to chunk 0
+    std::vector<std::byte> write_data(4096, std::byte{0xAA});
+    auto w1 = cow->write(0, write_data);
+    assert(w1.is_ok());
+    assert(w1.value() == 4096);
+    assert(cow->allocated_chunks() == 1);
+    assert(cow->dirty_bytes() == 4096);
+
+    // 5. Read back modified chunk: should return 0xAA
+    std::fill(buf.begin(), buf.end(), std::byte{0});
+    auto r2 = cow->read(0, buf);
+    assert(r2.is_ok());
+    assert(std::to_integer<int>(buf[0]) == 0xAA);
+
+    // 6. Read unmodified chunk 1: should still return 0x11 from base image
+    std::fill(buf.begin(), buf.end(), std::byte{0});
+    auto r3 = cow->read(4096, buf);
+    assert(r3.is_ok());
+    assert(std::to_integer<int>(buf[0]) == 0x11);
+
+    // 7. Verify base image file is STRICTLY UNTOUCHED
+    {
+        std::ifstream verify_base(base_path, std::ios::binary);
+        char ch;
+        verify_base.read(&ch, 1);
+        assert(static_cast<uint8_t>(ch) == 0x11);
+    }
+
+    // 8. Client Reset: wipe overlay and restore pristine state
+    assert(cow->reset().is_ok());
+    assert(cow->allocated_chunks() == 0);
+
+    std::fill(buf.begin(), buf.end(), std::byte{0});
+    auto r4 = cow->read(0, buf);
+    assert(r4.is_ok());
+    assert(std::to_integer<int>(buf[0]) == 0x11); // Restored!
+
+    // Cleanup
+    cow->close();
+    base_dev.reset();
+    std::filesystem::remove(base_path, ec);
+    std::filesystem::remove(cow_path, ec);
+
+    std::cout << "  PASS: test_cow_block_device_lifecycle\n";
+}
+
+void test_client_session_manager_isolation() {
+    std::cout << "[RUN] test_client_session_manager_isolation\n";
+
+    const std::filesystem::path test_dir = "./test_sessions";
+    const std::filesystem::path os_dir = test_dir / "os";
+    const std::filesystem::path wb_dir = test_dir / "wb";
+
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(os_dir, ec);
+    std::filesystem::create_directories(wb_dir, ec);
+
+    const std::filesystem::path win10_path = os_dir / "win10.raw";
+    {
+        std::ofstream out(win10_path, std::ios::binary);
+        std::vector<uint8_t> base_data(512 * 1024, 0x55);
+        out.write(reinterpret_cast<const char*>(base_data.data()), base_data.size());
+    }
+
+    Configuration cfg;
+    cfg.set_os_images_dir(os_dir);
+    cfg.set_writeback_dir(wb_dir);
+
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto image_mgr = std::make_shared<ImageManager>(registry);
+    image_mgr->configure(cfg);
+    auto import_res = image_mgr->import_image(win10_path, ImageRole::OsImage, ImageId("win10"));
+    assert(import_res.is_ok());
+
+    ClientSessionManager session_mgr(image_mgr, wb_dir);
+
+    // Client 1 (PC-01) connects
+    ClientId c1("00:11:22:33:44:01");
+    auto s1_res = session_mgr.get_or_create_session(c1, NetworkAddress(192, 168, 1, 101), ImageId("win10"));
+    assert(s1_res.is_ok());
+    auto s1 = s1_res.value();
+
+    // Client 2 (PC-02) connects
+    ClientId c2("00:11:22:33:44:02");
+    auto s2_res = session_mgr.get_or_create_session(c2, NetworkAddress(192, 168, 1, 102), ImageId("win10"));
+    assert(s2_res.is_ok());
+    auto s2 = s2_res.value();
+
+    assert(session_mgr.active_clients_count() == 2);
+
+    // Client 1 writes 0xAA to block 0
+    std::vector<std::byte> c1_write(512, std::byte{0xAA});
+    assert(s1->cow_device()->write(0, c1_write).is_ok());
+
+    // Client 2 writes 0xBB to block 0
+    std::vector<std::byte> c2_write(512, std::byte{0xBB});
+    assert(s2->cow_device()->write(0, c2_write).is_ok());
+
+    // Verify isolation: Client 1 reads 0xAA, Client 2 reads 0xBB
+    std::vector<std::byte> read_buf(512, std::byte{0});
+    assert(s1->cow_device()->read(0, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0xAA);
+
+    assert(s2->cow_device()->read(0, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0xBB);
+
+    // Reset Client 1
+    assert(session_mgr.reset_client(c1).is_ok());
+    assert(s1->cow_device()->read(0, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0x55); // Restored to base image
+
+    // Client 2 remains unaffected (still 0xBB)
+    assert(s2->cow_device()->read(0, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0xBB);
+
+    // Terminate both
+    assert(session_mgr.terminate_session(c1).is_ok());
+    assert(session_mgr.terminate_session(c2).is_ok());
+    assert(session_mgr.active_clients_count() == 0);
+
+    // Cleanup
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_client_session_manager_isolation\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -1083,8 +1254,12 @@ int main() {
     // Phase 6 Tests
     test_image_manager_lifecycle_and_safe_handling();
 
+    // Phase 7 Tests
+    test_cow_block_device_lifecycle();
+    test_client_session_manager_isolation();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (18/18 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (20/20 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

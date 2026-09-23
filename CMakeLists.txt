@@ -37,6 +37,8 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/storage/vhd_image_backend.cpp
     src/CobDisklessCore/src/storage/storage_tester.cpp
     src/CobDisklessCore/src/network/network_service.cpp
+    src/CobDisklessCore/src/storage/cow_block_device.cpp
+    src/CobDisklessCore/src/client/client_session.cpp
     src/CobDisklessCore/src/image/image_inspector.cpp
     src/CobDisklessCore/src/image/golden_image.cpp
     src/CobDisklessCore/src/image/image_registry.cpp
