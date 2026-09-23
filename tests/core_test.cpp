@@ -1728,6 +1728,208 @@ static void test_production_hardening_and_recovery() {
     std::cout << "  PASS: test_production_hardening_and_recovery\n";
 }
 
+static void test_end_to_end_diskless_boot_pipeline() {
+    std::cout << "Running test_end_to_end_diskless_boot_pipeline...\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_e2e";
+    std::filesystem::create_directories(test_dir / "os_images", ec);
+    std::filesystem::create_directories(test_dir / "games", ec);
+    std::filesystem::create_directories(test_dir / "writeback", ec);
+    std::filesystem::create_directories(test_dir / "cache", ec);
+
+    // 1. Create a pristine golden OS image (256 KiB)
+    auto os_image_path = test_dir / "os_images" / "win11_pro.raw";
+    const size_t img_size = 256 * 1024;
+    {
+        std::ofstream ofs(os_image_path, std::ios::binary);
+        std::vector<uint8_t> base_data(img_size, 0xEE);
+        // Put boot signature at sector 0
+        base_data[510] = 0x55;
+        base_data[511] = 0xAA;
+        ofs.write(reinterpret_cast<const char*>(base_data.data()), base_data.size());
+    }
+
+    // 2. Configure system
+    Configuration config;
+    config.set_server_address(NetworkAddress(192, 168, 1, 10));
+    config.set_os_images_dir(test_dir / "os_images");
+    config.set_games_dir(test_dir / "games");
+    config.set_writeback_dir(test_dir / "writeback");
+    config.set_cache_dir(test_dir / "cache");
+
+    // 3. Image Registry & Management
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    img_mgr->configure(config);
+    auto import_res = img_mgr->import_image(os_image_path, ImageRole::OsImage, ImageId("win11_pro"));
+    assert(import_res.is_ok());
+    assert(registry->count() == 1);
+
+    // 4. Client Session Manager (Multi-tenant COW)
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, config.writeback_dir());
+
+    // 5. Build Subsystems
+    auto dhcp = std::make_shared<DhcpServer>(
+        config.server_address(),
+        NetworkAddress(255, 255, 255, 0),
+        NetworkAddress(192, 168, 1, 100),
+        NetworkAddress(192, 168, 1, 200)
+    );
+
+    auto tftp = std::make_shared<TftpServer>(
+        config.server_address(),
+        config.os_images_dir(),
+        10069
+    );
+
+    IscsiTargetConfig iscsi_cfg;
+    iscsi_cfg.listen_address = NetworkAddress(127, 0, 0, 1, 13260);
+    iscsi_cfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
+    iscsi_cfg.default_os_image_id = ImageId("win11_pro");
+    auto iscsi = std::make_shared<IscsiTarget>(iscsi_cfg, sess_mgr);
+
+    // 6. Host in Core and initialize
+    Core core(config);
+    assert(core.register_subsystem(dhcp).is_ok());
+    assert(core.register_subsystem(tftp).is_ok());
+    assert(core.register_subsystem(iscsi).is_ok());
+    assert(core.initialize().is_ok());
+    assert(core.is_initialized());
+    assert(dhcp->is_initialized());
+    assert(tftp->is_initialized());
+    assert(iscsi->is_initialized());
+
+    // =========================================================================
+    // PIPELINE STEP 1: DHCP Architecture Detection (UEFI vs BIOS)
+    // =========================================================================
+    // Client boots with UEFI x64 firmware: DHCPDISCOVER with Option 93 = 7
+    DhcpHeader uefi_hdr{};
+    uefi_hdr.op = 1;
+    uefi_hdr.htype = 1;
+    uefi_hdr.hlen = 6;
+    uefi_hdr.xid = 0xCAFEBABE;
+    uefi_hdr.magic_cookie[0] = 99; uefi_hdr.magic_cookie[1] = 130;
+    uefi_hdr.magic_cookie[2] = 83; uefi_hdr.magic_cookie[3] = 99;
+    uefi_hdr.chaddr[0] = 0xAA; uefi_hdr.chaddr[1] = 0xBB; uefi_hdr.chaddr[2] = 0xCC;
+    uefi_hdr.chaddr[3] = 0x11; uefi_hdr.chaddr[4] = 0x22; uefi_hdr.chaddr[5] = 0x33;
+
+    std::vector<uint8_t> uefi_packet(reinterpret_cast<const uint8_t*>(&uefi_hdr),
+                                     reinterpret_cast<const uint8_t*>(&uefi_hdr) + sizeof(uefi_hdr));
+    // Option 53: DHCPDISCOVER
+    uefi_packet.push_back(53); uefi_packet.push_back(1); uefi_packet.push_back(1);
+    // Option 93: UEFI x64
+    uefi_packet.push_back(93); uefi_packet.push_back(2); uefi_packet.push_back(0); uefi_packet.push_back(7);
+    uefi_packet.push_back(255); // END
+
+    auto uefi_opts = dhcp->parse_packet(uefi_packet);
+    assert(uefi_opts.is_ok());
+    assert(uefi_opts.value().client_arch == ClientArch::Efi_x64);
+    assert(!uefi_opts.value().is_ipxe_client);
+
+    // DHCP Offer responds with ipxe.efi stage-1 loader
+    auto uefi_offer = dhcp->build_reply(uefi_hdr, uefi_opts.value(), 2, NetworkAddress(192, 168, 1, 150));
+    assert(uefi_offer.is_ok());
+    const auto* uefi_reply = reinterpret_cast<const DhcpHeader*>(uefi_offer.value().data());
+    assert(std::string(reinterpret_cast<const char*>(uefi_reply->file)) == "ipxe.efi");
+
+    // =========================================================================
+    // PIPELINE STEP 2: iPXE Client Identification
+    // =========================================================================
+    // Client boots ipxe.efi, which sends second DHCPDISCOVER with Option 175
+    std::vector<uint8_t> ipxe_packet(reinterpret_cast<const uint8_t*>(&uefi_hdr),
+                                     reinterpret_cast<const uint8_t*>(&uefi_hdr) + sizeof(uefi_hdr));
+    ipxe_packet.push_back(53); ipxe_packet.push_back(1); ipxe_packet.push_back(1);
+    ipxe_packet.push_back(175); ipxe_packet.push_back(1); ipxe_packet.push_back(1);
+    ipxe_packet.push_back(255);
+
+    auto ipxe_opts = dhcp->parse_packet(ipxe_packet);
+    assert(ipxe_opts.is_ok());
+    assert(ipxe_opts.value().is_ipxe_client);
+
+    auto ipxe_offer = dhcp->build_reply(uefi_hdr, ipxe_opts.value(), 2, NetworkAddress(192, 168, 1, 150));
+    assert(ipxe_offer.is_ok());
+    const auto* ipxe_reply = reinterpret_cast<const DhcpHeader*>(ipxe_offer.value().data());
+    assert(std::string(reinterpret_cast<const char*>(ipxe_reply->file)) == "boot.ipxe");
+
+    // =========================================================================
+    // PIPELINE STEP 3: TFTP Boot Script Retrieval
+    // =========================================================================
+    auto script_res = tftp->get_file_content("boot.ipxe");
+    assert(script_res.is_ok());
+    std::string script_str(script_res.value().begin(), script_res.value().end());
+    assert(script_str.find("sanboot iscsi:") != std::string::npos);
+
+    // =========================================================================
+    // PIPELINE STEP 4: iSCSI Multi-client Session & Cache Verification
+    // =========================================================================
+    ClientId client_a("AA:BB:CC:11:22:33");
+    NetworkAddress client_a_ip(192, 168, 1, 150);
+    auto sess_a_res = sess_mgr->get_or_create_session(client_a, client_a_ip, ImageId("win11_pro"));
+    assert(sess_a_res.is_ok());
+    auto sess_a = sess_a_res.value();
+    sess_a->set_state(ClientState::Online);
+
+    ClientId client_b("AA:BB:CC:99:88:77");
+    NetworkAddress client_b_ip(192, 168, 1, 151);
+    auto sess_b_res = sess_mgr->get_or_create_session(client_b, client_b_ip, ImageId("win11_pro"));
+    assert(sess_b_res.is_ok());
+    auto sess_b = sess_b_res.value();
+    sess_b->set_state(ClientState::Online);
+
+    assert(sess_mgr->active_clients_count() == 2);
+
+    // Wrap Client A device with CachedBlockDevice
+    auto cached_dev_a = CachedBlockDevice::create(sess_a->cow_device(), 32768, 4096, 2).value();
+
+    // Client A: Read sector 0 (MBR)
+    std::vector<std::byte> sector_buf(512);
+    auto r_a = cached_dev_a->read(0, sector_buf);
+    assert(r_a.is_ok() && r_a.value() == 512);
+    assert(static_cast<uint8_t>(sector_buf[510]) == 0x55);
+    assert(static_cast<uint8_t>(sector_buf[511]) == 0xAA);
+
+    // Cache hit on second read
+    assert(cached_dev_a->read(0, sector_buf).is_ok());
+    assert(cached_dev_a->stats().hits >= 1);
+
+    // Client A writes 0x42 to sector 10
+    std::vector<std::byte> write_buf(512, std::byte{0x42});
+    auto w_a = iscsi->execute_write(*sess_a, 10, 1, write_buf);
+    assert(w_a.is_ok());
+
+    // Client B reads sector 10 -> MUST get pristine 0xEE from golden image!
+    std::vector<std::byte> read_b(512);
+    auto r_b = iscsi->execute_read(*sess_b, 10, 1, read_b);
+    assert(r_b.is_ok());
+    assert(read_b[0] == std::byte{0xEE}); // Completely isolated!
+
+    // Client A reads sector 10 -> MUST get 0x42
+    std::vector<std::byte> read_a(512);
+    auto r_a2 = iscsi->execute_read(*sess_a, 10, 1, read_a);
+    assert(r_a2.is_ok());
+    assert(read_a[0] == std::byte{0x42});
+
+    // =========================================================================
+    // PIPELINE STEP 5: Instant Zero-Cost Reset
+    // =========================================================================
+    assert(sess_mgr->reset_client(client_a).is_ok());
+    auto r_a_reset = iscsi->execute_read(*sess_a, 10, 1, read_a);
+    assert(r_a_reset.is_ok());
+    assert(read_a[0] == std::byte{0xEE}); // Restored!
+
+    // =========================================================================
+    // PIPELINE STEP 6: Deterministic Core Shutdown
+    // =========================================================================
+    cached_dev_a.reset();
+    assert(sess_mgr->terminate_session(client_a).is_ok());
+    assert(sess_mgr->terminate_session(client_b).is_ok());
+    core.shutdown();
+    assert(!core.is_initialized());
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_end_to_end_diskless_boot_pipeline\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -1776,8 +1978,11 @@ int main() {
     // Phase 11 Tests
     test_production_hardening_and_recovery();
 
+    // Phase 12 Tests
+    test_end_to_end_diskless_boot_pipeline();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (25/25 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (26/26 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

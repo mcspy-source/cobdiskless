@@ -1,6 +1,12 @@
 #include "admin_app.hpp"
 #include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/image/golden_image.hpp"
+#include "CobDisklessCore/image/image_manager.hpp"
+#include "CobDisklessCore/client/client_session.hpp"
+#include "CobDisklessCore/network/dhcp_server.hpp"
+#include "CobDisklessCore/network/tftp_server.hpp"
+#include "CobDisklessCore/network/iscsi_target.hpp"
+#include "CobDisklessCore/storage/block_cache.hpp"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -171,6 +177,85 @@ int AdminApp::cli_add_image(const std::filesystem::path& image_path, const std::
     }
 
     std::cout << "Golden image '" << image_id << "' successfully registered in catalog.\n";
+    return 0;
+}
+
+int AdminApp::cli_start_server(bool run_in_background) {
+    std::cout << "=========================================================\n";
+    std::cout << " CobDiskless Diskless Pipeline Server Starting...\n";
+    std::cout << "=========================================================\n";
+
+    // 1. Ensure storage directories
+    auto dir_res = config_.ensure_directories_exist();
+    if (!dir_res.is_ok()) {
+        std::cerr << "Failed to verify storage directories: " << dir_res.error().message() << "\n";
+        return 1;
+    }
+
+    // 2. Initialize ImageManager
+    auto img_mgr = std::make_shared<ImageManager>(registry_);
+    img_mgr->configure(config_);
+    (void)img_mgr->scan_directories();
+
+    // 3. Initialize ClientSessionManager
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, config_.writeback_dir());
+
+    // 4. Initialize Core
+    Core core(config_);
+
+    // 5. Create DhcpServer (port 67)
+    auto dhcp = std::make_shared<DhcpServer>(
+        config_.server_address(),
+        NetworkAddress(255, 255, 255, 0),
+        NetworkAddress(192, 168, 1, 100),
+        NetworkAddress(192, 168, 1, 200)
+    );
+
+    // 6. Create TftpServer (port 69)
+    auto tftp = std::make_shared<TftpServer>(
+        config_.server_address(),
+        config_.os_images_dir(),
+        69
+    );
+
+    // 7. Create IscsiTarget (port 3260)
+    IscsiTargetConfig iscsi_cfg;
+    iscsi_cfg.listen_address = NetworkAddress(0, 0, 0, 0, 3260);
+    iscsi_cfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
+    auto iscsi = std::make_shared<IscsiTarget>(iscsi_cfg, sess_mgr);
+
+    // Register all subsystems into Core for deterministic lifecycle management
+    if (!core.register_subsystem(dhcp).is_ok() ||
+        !core.register_subsystem(tftp).is_ok() ||
+        !core.register_subsystem(iscsi).is_ok()) {
+        std::cerr << "Failed to register subsystems with Core.\n";
+        return 1;
+    }
+
+    auto init_res = core.initialize();
+    if (!init_res.is_ok()) {
+        std::cerr << "Core failed to start diskless subsystems: " << init_res.error().message() << "\n";
+        return 1;
+    }
+
+    std::cout << "[SUCCESS] CobDiskless Pipeline is now active!\n";
+    std::cout << "  - DHCP / PXE Server:     " << config_.server_address().ip_string() << ":67 (Option 93 UEFI/BIOS detection)\n";
+    std::cout << "  - TFTP Boot Server:      " << config_.server_address().ip_string() << ":69 (Delivering undionly.kpxe / ipxe.efi / boot.ipxe)\n";
+    std::cout << "  - iSCSI SAN Target:      " << iscsi_cfg.target_iqn << " on port 3260\n";
+    std::cout << "  - Active Golden Images:  " << registry_->count() << "\n";
+    std::cout << "  - Writeback Storage:     " << config_.writeback_dir().string() << " (COW multi-client isolation)\n";
+    std::cout << "  - Block Cache:           Enabled (LRU + Read-ahead)\n";
+    std::cout << "---------------------------------------------------------\n";
+
+    if (!run_in_background) {
+        std::cout << "Server running. Press Enter or Ctrl+C to stop...\n";
+        std::string dummy;
+        std::getline(std::cin, dummy);
+        std::cout << "Shutting down diskless services...\n";
+        core.shutdown();
+        std::cout << "CobDiskless Server safely stopped.\n";
+    }
+
     return 0;
 }
 
@@ -347,12 +432,18 @@ int AdminApp::run(int argc, char* argv[]) {
             return 1;
         }
         return cli_add_image(argv[2], argv[3]);
+    } else if (arg1 == "--start") {
+        return cli_start_server(false);
+    } else if (arg1 == "--start-daemon") {
+        return cli_start_server(true);
     } else if (arg1 == "--gui") {
         return run_gui();
     } else if (arg1 == "--help" || arg1 == "-h") {
         std::cout << "CobDiskless Management Console Options:\n"
                   << "  --status                  Display server and image status\n"
                   << "  --wizard                  Execute first-run storage wizard\n"
+                  << "  --start                   Launch diskless server stack (DHCP + TFTP + iSCSI)\n"
+                  << "  --start-daemon            Launch diskless server stack in non-blocking mode\n"
                   << "  --test-storage [dir]      Run performance and health benchmark\n"
                   << "  --inspect <image_path>    Inspect disk image headers & partitions\n"
                   << "  --add-image <file> <id>   Register a golden image in the catalog\n"

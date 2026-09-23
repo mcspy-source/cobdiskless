@@ -33,6 +33,7 @@ public:
     int cli_inspect_image(const std::filesystem::path& image_path);
     int cli_list_images();
     int cli_add_image(const std::filesystem::path& image_path, const std::string& image_id);
+    int cli_start_server(bool run_in_background = false);
 
     [[nodiscard]] const Configuration& config() const noexcept { return config_; }
     void set_config(Configuration cfg) { config_ = std::move(cfg); }
