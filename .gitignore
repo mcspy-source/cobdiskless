@@ -1,0 +1,58 @@
+# Prerequisites
+build/
+bin/
+lib/
+out/
+
+# Visual Studio / MSVC
+.vs/
+*.sln.docstates
+*.suo
+*.user
+*.userosscache
+*.sln.ide
+*.vcxproj.user
+Debug/
+Release/
+x64/
+x86/
+ARM/
+ARM64/
+
+# Intermediate build objects
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.idb
+*.ilk
+*.exp
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+Testing/
+CTestTestfile.cmake
+
+# IDE & Editor caches
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files & logs
+*.log
+*.tmp
+*.bak
