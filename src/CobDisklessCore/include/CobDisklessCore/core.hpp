@@ -1,51 +1,69 @@
 #pragma once
 
+#include <vector>
+#include <memory>
 #include <string_view>
+#include "CobDisklessCore/config/configuration.hpp"
+#include "CobDisklessCore/logging/logger.hpp"
+#include "CobDisklessCore/subsystem/subsystem.hpp"
+#include "CobDisklessCore/errors/result.hpp"
 
 namespace cobdiskless {
 
 /**
- * @brief CobDisklessCore engine lifecycle skeleton.
+ * @brief Subsystem host and orchestrator for the CobDiskless platform.
  *
- * Represents the central lifecycle foundation of the CobDiskless platform.
- * Subsystems (DHCP, TFTP, Bootloader, Storage, and Caching) will be wired into
- * this core in subsequent phases.
+ * Manages deterministic subsystem registration, ordered initialization, clean
+ * reverse teardown, and failure rollback without global mutable state.
  */
 class Core {
 public:
     Core();
+    explicit Core(Configuration config);
     ~Core();
 
     Core(const Core&) = delete;
     Core& operator=(const Core&) = delete;
-
-    Core(Core&&) noexcept = default;
-    Core& operator=(Core&&) noexcept = default;
+    Core(Core&&) = delete;
+    Core& operator=(Core&&) = delete;
 
     /**
-     * @brief Initializes the CobDiskless engine lifecycle.
-     * @return true if initialization was successful, false otherwise.
+     * @brief Registers a subsystem to be hosted by the core.
+     * Registration order determines the deterministic startup sequence.
      */
-    bool initialize();
+    Result<void> register_subsystem(std::shared_ptr<ISubsystem> subsystem);
 
     /**
-     * @brief Shuts down the engine and releases resources.
+     * @brief Validates configuration and deterministically initializes all registered subsystems.
+     * If any subsystem fails initialization, all previously initialized subsystems are rolled back
+     * in strict reverse order, ensuring no partially initialized state.
+     */
+    Result<void> initialize();
+
+    /**
+     * @brief Shuts down all running subsystems in strict reverse order of registration.
      */
     void shutdown();
 
-    /**
-     * @brief Queries whether the engine is currently initialized.
-     */
     [[nodiscard]] bool is_initialized() const noexcept;
 
-    /**
-     * @brief Returns the version string of the CobDiskless platform.
-     */
+    [[nodiscard]] Logger& logger() noexcept { return logger_; }
+    [[nodiscard]] const Logger& logger() const noexcept { return logger_; }
+
+    [[nodiscard]] const Configuration& config() const noexcept { return config_; }
+    Result<void> set_config(Configuration config);
+
+    [[nodiscard]] size_t subsystem_count() const noexcept { return subsystems_.size(); }
+
     [[nodiscard]] static constexpr std::string_view version() noexcept {
-        return "0.1.0-skeleton";
+        return "0.2.0-core";
     }
 
 private:
+    Configuration config_;
+    Logger logger_;
+    std::vector<std::shared_ptr<ISubsystem>> subsystems_;
+    std::vector<std::shared_ptr<ISubsystem>> initialized_subsystems_;
     bool initialized_{false};
 };
 

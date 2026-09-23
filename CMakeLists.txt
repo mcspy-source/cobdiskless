@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(CobDiskless
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "CobDiskless Platform Core"
     LANGUAGES CXX
 )
@@ -26,6 +26,13 @@ endif()
 # ==============================================================================
 add_library(CobDisklessCore
     src/CobDisklessCore/src/core.cpp
+    src/CobDisklessCore/src/types/network_address.cpp
+    src/CobDisklessCore/src/errors/error.cpp
+    src/CobDisklessCore/src/logging/logger.cpp
+    src/CobDisklessCore/src/config/configuration.cpp
+    src/CobDisklessCore/src/subsystem/subsystem.cpp
+    src/CobDisklessCore/src/storage/block_device.cpp
+    src/CobDisklessCore/src/network/network_service.cpp
 )
 
 target_include_directories(CobDisklessCore
@@ -39,7 +46,7 @@ target_include_directories(CobDisklessCore
 # ==============================================================================
 # NOTE: The components located in third_party/ (dhcplite, tftp, ipxe, iscsi, libvhdi)
 # are isolated reference implementations and plumbing code. They are intentionally
-# NOT compiled into CobDisklessCore during Phase 2. Integration will be addressed
+# NOT compiled into CobDisklessCore during Phase 3. Integration will be addressed
 # in subsequent architectural phases.
 
 # ==============================================================================
