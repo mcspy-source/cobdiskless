@@ -39,6 +39,7 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/network/network_service.cpp
     src/CobDisklessCore/src/network/dhcp_server.cpp
     src/CobDisklessCore/src/network/tftp_server.cpp
+    src/CobDisklessCore/src/network/iscsi_target.cpp
     src/CobDisklessCore/src/storage/cow_block_device.cpp
     src/CobDisklessCore/src/client/client_session.cpp
     src/CobDisklessCore/src/image/image_inspector.cpp

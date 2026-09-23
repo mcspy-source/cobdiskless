@@ -29,6 +29,7 @@
 #include "CobDisklessCore/client/client_session.hpp"
 #include "CobDisklessCore/network/dhcp_server.hpp"
 #include "CobDisklessCore/network/tftp_server.hpp"
+#include "CobDisklessCore/network/iscsi_target.hpp"
 
 using namespace cobdiskless;
 
@@ -1363,6 +1364,107 @@ void test_tftp_server_virtual_payloads_and_ipxe_script() {
     std::cout << "  PASS: test_tftp_server_virtual_payloads_and_ipxe_script\n";
 }
 
+// =============================================================================
+// Phase 9 Network Disk Service (iSCSI Target & Multi-Client Transport) Tests
+// =============================================================================
+
+void test_iscsi_target_scsi_emulation_and_client_dispatch() {
+    std::cout << "[RUN] test_iscsi_target_scsi_emulation_and_client_dispatch\n";
+
+    // 1. Test INQUIRY response
+    uint8_t cdb_inquiry[16] = {0x12, 0, 0, 0, 36, 0};
+    auto inq_res = IscsiTarget::handle_inquiry(cdb_inquiry);
+    assert(inq_res.is_ok());
+    const auto& inq = inq_res.value();
+    assert(inq.size() == 36);
+    assert(inq[0] == 0x00); // Direct access block device
+    assert(std::string(reinterpret_cast<const char*>(inq.data() + 8), 8) == "COB     ");
+    assert(std::string(reinterpret_cast<const char*>(inq.data() + 16), 16) == "CobDiskless SAN ");
+
+    // 2. Test READ CAPACITY (10)
+    // 1000 sectors, 512 bytes each
+    auto cap_res = IscsiTarget::handle_read_capacity(1000, 512);
+    assert(cap_res.is_ok());
+    const auto& cap = cap_res.value();
+    assert(cap.size() == 8);
+    // Last LBA = 999 (0x000003E7)
+    uint32_t last_lba = (cap[0] << 24) | (cap[1] << 16) | (cap[2] << 8) | cap[3];
+    assert(last_lba == 999);
+    // Block size = 512 (0x00000200)
+    uint32_t blk_size = (cap[4] << 24) | (cap[5] << 16) | (cap[6] << 8) | cap[7];
+    assert(blk_size == 512);
+
+    // 3. Test SCSI Read/Write dispatch through ClientSession and COW overlay
+    const std::filesystem::path test_dir = "./test_iscsi_dispatch";
+    const std::filesystem::path base_path = test_dir / "golden_os.raw";
+    const std::filesystem::path wb_dir = test_dir / "wb";
+
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+    std::filesystem::create_directories(wb_dir, ec);
+
+    // Create 1 MiB base image filled with 0x33
+    {
+        std::ofstream base_out(base_path, std::ios::binary);
+        std::vector<uint8_t> data(1024 * 1024, 0x33);
+        base_out.write(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+
+    Configuration cfg;
+    cfg.set_os_images_dir(test_dir);
+    cfg.set_writeback_dir(wb_dir);
+
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    img_mgr->configure(cfg);
+    assert(img_mgr->import_image(base_path, ImageRole::OsImage, ImageId("os_image")).is_ok());
+
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, wb_dir);
+
+    IscsiTargetConfig target_cfg;
+    target_cfg.default_os_image_id = ImageId("os_image");
+    IscsiTarget target(target_cfg, sess_mgr);
+
+    ClientId client_id("00:50:56:C0:00:08");
+    auto session_res = sess_mgr->get_or_create_session(client_id, NetworkAddress(192, 168, 1, 150), ImageId("os_image"));
+    assert(session_res.is_ok());
+    auto session = session_res.value();
+
+    // Read Sector 10 before write -> should return base image byte 0x33
+    std::vector<std::byte> read_buf(512, std::byte{0});
+    auto r1 = IscsiTarget::execute_read(*session, 10, 1, read_buf);
+    assert(r1.is_ok());
+    assert(r1.value() == 512);
+    assert(std::to_integer<int>(read_buf[0]) == 0x33);
+    assert(session->bytes_read() == 512);
+
+    // Write Sector 10 with 0x77
+    std::vector<std::byte> write_buf(512, std::byte{0x77});
+    auto w1 = IscsiTarget::execute_write(*session, 10, 1, write_buf);
+    assert(w1.is_ok());
+    assert(w1.value() == 512);
+    assert(session->bytes_written() == 512);
+
+    // Read Sector 10 after write -> should return modified byte 0x77 from COW overlay
+    std::fill(read_buf.begin(), read_buf.end(), std::byte{0});
+    auto r2 = IscsiTarget::execute_read(*session, 10, 1, read_buf);
+    assert(r2.is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0x77);
+
+    // Read Sector 11 -> untouched, still 0x33
+    std::fill(read_buf.begin(), read_buf.end(), std::byte{0});
+    auto r3 = IscsiTarget::execute_read(*session, 11, 1, read_buf);
+    assert(r3.is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0x33);
+
+    // Terminate session and cleanup
+    assert(sess_mgr->terminate_session(client_id).is_ok());
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_iscsi_target_scsi_emulation_and_client_dispatch\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -1402,8 +1504,11 @@ int main() {
     test_dhcp_architecture_detection_and_pxe_provisioning();
     test_tftp_server_virtual_payloads_and_ipxe_script();
 
+    // Phase 9 Tests
+    test_iscsi_target_scsi_emulation_and_client_dispatch();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (22/22 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (23/23 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }
