@@ -56,3 +56,8 @@ CTestTestfile.cmake
 *.log
 *.tmp
 *.bak
+cobdiskless.conf
+writeback/
+cache/
+games/
+images/

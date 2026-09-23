@@ -65,6 +65,11 @@ public:
     [[nodiscard]] size_t count() const;
 
     /**
+     * @brief Returns a snapshot of all currently registered GoldenImages.
+     */
+    [[nodiscard]] std::vector<std::shared_ptr<GoldenImage>> get_all_images() const;
+
+    /**
      * @brief Clears all registered images.
      */
     void clear();

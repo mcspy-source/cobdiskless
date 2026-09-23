@@ -35,6 +35,7 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/storage/read_only_block_device.cpp
     src/CobDisklessCore/src/storage/raw_image_backend.cpp
     src/CobDisklessCore/src/storage/vhd_image_backend.cpp
+    src/CobDisklessCore/src/storage/storage_tester.cpp
     src/CobDisklessCore/src/network/network_service.cpp
     src/CobDisklessCore/src/image/image_inspector.cpp
     src/CobDisklessCore/src/image/golden_image.cpp
@@ -47,12 +48,37 @@ target_include_directories(CobDisklessCore
         $<INSTALL_INTERFACE:include>
 )
 
+if(WIN32)
+    target_link_libraries(CobDisklessCore PUBLIC ws2_32)
+endif()
+
 # ==============================================================================
-# Third-Party Dependencies Note
+# CobDiskless Management App (GUI + Admin CLI)
 # ==============================================================================
-# NOTE: The components located in third_party/ (dhcplite, tftp, ipxe, iscsi, libvhdi)
-# are reference implementations. Reusable format specifications (such as VHD headers
-# and structures from libvhdi) are adapted directly into CobDiskless storage backends.
+add_executable(cobdiskless_app
+    src/CobDisklessApp/main.cpp
+    src/CobDisklessApp/admin_app.cpp
+)
+
+target_include_directories(cobdiskless_app
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/CobDisklessApp
+)
+
+target_link_libraries(cobdiskless_app
+    PRIVATE
+        CobDisklessCore
+)
+
+if(WIN32)
+    target_link_libraries(cobdiskless_app
+        PRIVATE
+            comctl32
+            gdi32
+            user32
+            ws2_32
+    )
+endif()
 
 # ==============================================================================
 # Testing

@@ -23,6 +23,7 @@
 #include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/image/golden_image.hpp"
 #include "CobDisklessCore/image/image_registry.hpp"
+#include "CobDisklessCore/storage/storage_tester.hpp"
 
 using namespace cobdiskless;
 
@@ -863,9 +864,103 @@ void test_golden_image_registry() {
     std::cout << "  PASS: test_golden_image_registry\n";
 }
 
+// =============================================================================
+// Phase 5 Setup Wizard, Persistence & Storage Benchmarking Tests
+// =============================================================================
+
+void test_configuration_persistence_and_directories() {
+    std::cout << "[RUN] test_configuration_persistence_and_directories\n";
+
+    const std::filesystem::path cfg_file = "test_persist.conf";
+    const std::filesystem::path test_wb = "./test_persist_wb";
+    const std::filesystem::path test_os = "./test_persist_os";
+    const std::filesystem::path test_gm = "./test_persist_gm";
+    const std::filesystem::path test_ch = "./test_persist_ch";
+
+    if (std::filesystem::exists(cfg_file)) std::filesystem::remove(cfg_file);
+
+    Configuration cfg;
+    cfg.set_server_address(NetworkAddress(192, 168, 1, 100, 3260));
+    cfg.set_network_interface("eth0");
+    cfg.set_writeback_dir(test_wb);
+    cfg.set_os_images_dir(test_os);
+    cfg.set_games_dir(test_gm);
+    cfg.set_cache_dir(test_ch);
+    cfg.set_first_run_completed(true);
+    cfg.set_max_clients(128);
+
+    assert(cfg.validate().is_ok());
+
+    // Ensure directories exist
+    auto dir_res = cfg.ensure_directories_exist();
+    assert(dir_res.is_ok());
+    assert(std::filesystem::exists(test_wb));
+    assert(std::filesystem::exists(test_os));
+    assert(std::filesystem::exists(test_gm));
+    assert(std::filesystem::exists(test_ch));
+
+    // Save to file
+    auto save_res = cfg.save_to_file(cfg_file);
+    assert(save_res.is_ok());
+    assert(std::filesystem::exists(cfg_file));
+
+    // Load from file into new configuration
+    Configuration loaded;
+    auto load_res = loaded.load_from_file(cfg_file);
+    assert(load_res.is_ok());
+
+    assert(loaded.server_address().ip_string() == "192.168.1.100");
+    assert(loaded.server_address().port() == 3260);
+    assert(loaded.network_interface() == "eth0");
+    assert(loaded.writeback_dir() == test_wb);
+    assert(loaded.os_images_dir() == test_os);
+    assert(loaded.games_dir() == test_gm);
+    assert(loaded.cache_dir() == test_ch);
+    assert(loaded.first_run_completed() == true);
+    assert(loaded.max_clients() == 128);
+
+    // Cleanup
+    std::filesystem::remove(cfg_file);
+    std::filesystem::remove_all(test_wb);
+    std::filesystem::remove_all(test_os);
+    std::filesystem::remove_all(test_gm);
+    std::filesystem::remove_all(test_ch);
+
+    std::cout << "  PASS: test_configuration_persistence_and_directories\n";
+}
+
+void test_storage_tester_health_and_benchmark() {
+    std::cout << "[RUN] test_storage_tester_health_and_benchmark\n";
+
+    const std::filesystem::path bench_dir = "./test_storage_bench";
+    std::error_code ec;
+    std::filesystem::remove_all(bench_dir, ec);
+
+    // 1. Health check (creates dir if missing, checks free space, validates write probe)
+    auto health_res = StorageTester::check_storage_health(bench_dir);
+    assert(health_res.is_ok());
+    const auto& health = health_res.value();
+    assert(health.passed);
+    assert(health.total_space_bytes > 0);
+    assert(health.free_space_bytes > 0);
+
+    // 2. Fast benchmark (1 MiB with 64 KiB blocks for fast test execution)
+    auto bench_res = StorageTester::run_benchmark(bench_dir, 1024 * 1024, 64 * 1024);
+    assert(bench_res.is_ok());
+    const auto& bench = bench_res.value();
+    assert(bench.passed);
+    assert(bench.sequential_write_mbps > 0.0);
+    assert(bench.sequential_read_mbps > 0.0);
+
+    // Cleanup
+    std::filesystem::remove_all(bench_dir, ec);
+
+    std::cout << "  PASS: test_storage_tester_health_and_benchmark\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
-    std::cout << "CobDisklessCore Phase 4 Architecture & Golden Image Suite\n";
+    std::cout << "CobDisklessCore Test Suite\n";
     std::cout << "=========================================================\n";
 
     // Phase 3 Tests
@@ -887,8 +982,12 @@ int main() {
     test_golden_image_readonly_invariant();
     test_golden_image_registry();
 
+    // Phase 5 Tests
+    test_configuration_persistence_and_directories();
+    test_storage_tester_health_and_benchmark();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (15/15 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (17/17 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

@@ -74,6 +74,16 @@ size_t GoldenImageRegistry::count() const {
     return images_.size();
 }
 
+std::vector<std::shared_ptr<GoldenImage>> GoldenImageRegistry::get_all_images() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::shared_ptr<GoldenImage>> result;
+    result.reserve(images_.size());
+    for (const auto& [_, img] : images_) {
+        result.push_back(img);
+    }
+    return result;
+}
+
 void GoldenImageRegistry::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     images_.clear();

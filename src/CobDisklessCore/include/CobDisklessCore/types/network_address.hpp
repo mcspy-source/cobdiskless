@@ -32,6 +32,13 @@ public:
 
     [[nodiscard]] std::string to_string() const;
 
+    [[nodiscard]] std::string ip_string() const {
+        return std::to_string(octets_[0]) + "." +
+               std::to_string(octets_[1]) + "." +
+               std::to_string(octets_[2]) + "." +
+               std::to_string(octets_[3]);
+    }
+
     [[nodiscard]] static NetworkAddress parse(std::string_view str, uint16_t default_port = 0);
 
     constexpr auto operator<=>(const NetworkAddress&) const noexcept = default;
