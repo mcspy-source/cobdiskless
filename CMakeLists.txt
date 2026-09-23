@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(CobDiskless
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "CobDiskless Platform Core"
     LANGUAGES CXX
 )
@@ -32,7 +32,13 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/config/configuration.cpp
     src/CobDisklessCore/src/subsystem/subsystem.cpp
     src/CobDisklessCore/src/storage/block_device.cpp
+    src/CobDisklessCore/src/storage/read_only_block_device.cpp
+    src/CobDisklessCore/src/storage/raw_image_backend.cpp
+    src/CobDisklessCore/src/storage/vhd_image_backend.cpp
     src/CobDisklessCore/src/network/network_service.cpp
+    src/CobDisklessCore/src/image/image_inspector.cpp
+    src/CobDisklessCore/src/image/golden_image.cpp
+    src/CobDisklessCore/src/image/image_registry.cpp
 )
 
 target_include_directories(CobDisklessCore
@@ -45,9 +51,8 @@ target_include_directories(CobDisklessCore
 # Third-Party Dependencies Note
 # ==============================================================================
 # NOTE: The components located in third_party/ (dhcplite, tftp, ipxe, iscsi, libvhdi)
-# are isolated reference implementations and plumbing code. They are intentionally
-# NOT compiled into CobDisklessCore during Phase 3. Integration will be addressed
-# in subsequent architectural phases.
+# are reference implementations. Reusable format specifications (such as VHD headers
+# and structures from libvhdi) are adapted directly into CobDiskless storage backends.
 
 # ==============================================================================
 # Testing
