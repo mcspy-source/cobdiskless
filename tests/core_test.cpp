@@ -30,6 +30,7 @@
 #include "CobDisklessCore/network/dhcp_server.hpp"
 #include "CobDisklessCore/network/tftp_server.hpp"
 #include "CobDisklessCore/network/iscsi_target.hpp"
+#include "CobDisklessCore/storage/block_cache.hpp"
 
 using namespace cobdiskless;
 
@@ -1465,6 +1466,109 @@ void test_iscsi_target_scsi_emulation_and_client_dispatch() {
     std::cout << "  PASS: test_iscsi_target_scsi_emulation_and_client_dispatch\n";
 }
 
+static void test_block_cache_lru_and_read_ahead() {
+    std::cout << "Running test_block_cache_lru_and_read_ahead...\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_cache";
+    std::filesystem::create_directories(test_dir, ec);
+    auto raw_path = test_dir / "cache_backing.raw";
+
+    // 16 KiB backing file
+    const size_t total_size = 16 * 1024;
+    {
+        std::ofstream ofs(raw_path, std::ios::binary);
+        std::vector<uint8_t> init_data(total_size);
+        for (size_t i = 0; i < total_size; ++i) {
+            init_data[i] = static_cast<uint8_t>(i % 251);
+        }
+        ofs.write(reinterpret_cast<const char*>(init_data.data()), init_data.size());
+    }
+
+    auto raw_backend = RawImageBackend::open(raw_path.string(), false).value();
+
+    // Cache: 4 pages total (1024 bytes / 256 bytes per page), read-ahead window of 2 pages
+    const size_t max_cache_bytes = 1024;
+    const size_t page_size = 256;
+    const size_t read_ahead_pages = 2;
+
+    auto cached_dev = CachedBlockDevice::create(raw_backend, max_cache_bytes, page_size, read_ahead_pages).value();
+    assert(cached_dev != nullptr);
+    assert(cached_dev->size() == total_size);
+
+    CacheStats s = cached_dev->stats();
+    assert(s.hits == 0);
+    assert(s.misses == 0);
+    assert(s.active_pages == 0);
+    assert(s.max_pages == 4);
+
+    // 1. Read first page (256 bytes) -> Miss
+    std::vector<std::byte> buf(page_size);
+    auto r1 = cached_dev->read(0, buf);
+    assert(r1.is_ok() && r1.value() == page_size);
+    assert(static_cast<uint8_t>(buf[0]) == 0);
+    assert(static_cast<uint8_t>(buf[10]) == 10);
+
+    s = cached_dev->stats();
+    assert(s.misses == 1);
+    assert(s.hits == 0);
+    assert(s.active_pages == 1);
+
+    // 2. Read first page again -> Hit
+    auto r2 = cached_dev->read(0, buf);
+    assert(r2.is_ok() && r2.value() == page_size);
+    s = cached_dev->stats();
+    assert(s.misses == 1);
+    assert(s.hits == 1);
+    assert(s.hit_ratio() == 50.0);
+
+    // 3. Read page 1 sequentially (offset 256) -> Triggers read-ahead for page 2 and page 3!
+    auto r3 = cached_dev->read(256, buf);
+    assert(r3.is_ok() && r3.value() == page_size);
+    s = cached_dev->stats();
+    assert(s.misses == 2);
+    assert(s.read_ahead_prefetches >= 1);
+    // Page 0, 1, 2, 3 should now be cached (active_pages == 4, maxed out)
+    assert(s.active_pages == 4);
+
+    // 4. Reading page 2 (offset 512) and page 3 (offset 768) should be hits because of read-ahead!
+    auto r4 = cached_dev->read(512, buf);
+    assert(r4.is_ok());
+    auto r5 = cached_dev->read(768, buf);
+    assert(r5.is_ok());
+    s = cached_dev->stats();
+    assert(s.hits >= 3);
+
+    // 5. Read page 4 (offset 1024) -> Must evict oldest page from LRU
+    auto r6 = cached_dev->read(1024, buf);
+    assert(r6.is_ok());
+    s = cached_dev->stats();
+    assert(s.evictions >= 1);
+    assert(s.active_pages <= 4);
+
+    // 6. Test write-through and cache invalidation
+    std::vector<std::byte> write_data(64, std::byte{0x7F});
+    auto w1 = cached_dev->write(1024, write_data);
+    assert(w1.is_ok() && w1.value() == 64);
+
+    // Read back modified area
+    std::vector<std::byte> read_back(64);
+    auto r7 = cached_dev->read(1024, read_back);
+    assert(r7.is_ok());
+    assert(read_back[0] == std::byte{0x7F});
+    assert(read_back[63] == std::byte{0x7F});
+
+    // 7. Clear cache
+    cached_dev->clear_cache();
+    s = cached_dev->stats();
+    assert(s.active_pages == 0);
+
+    raw_backend.reset();
+    cached_dev.reset();
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_block_cache_lru_and_read_ahead\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -1507,8 +1611,11 @@ int main() {
     // Phase 9 Tests
     test_iscsi_target_scsi_emulation_and_client_dispatch();
 
+    // Phase 10 Tests
+    test_block_cache_lru_and_read_ahead();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (23/23 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (24/24 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }
