@@ -27,6 +27,8 @@
 #include "CobDisklessCore/storage/storage_tester.hpp"
 #include "CobDisklessCore/storage/cow_block_device.hpp"
 #include "CobDisklessCore/client/client_session.hpp"
+#include "CobDisklessCore/network/dhcp_server.hpp"
+#include "CobDisklessCore/network/tftp_server.hpp"
 
 using namespace cobdiskless;
 
@@ -1223,6 +1225,144 @@ void test_client_session_manager_isolation() {
     std::cout << "  PASS: test_client_session_manager_isolation\n";
 }
 
+// =============================================================================
+// Phase 8 Network Boot (DHCP, PXE, TFTP & iPXE Architecture Detection) Tests
+// =============================================================================
+
+void test_dhcp_architecture_detection_and_pxe_provisioning() {
+    std::cout << "[RUN] test_dhcp_architecture_detection_and_pxe_provisioning\n";
+
+    DhcpServer server(NetworkAddress(192, 168, 1, 1));
+
+    // 1. BIOS Client (Arch 0): DHCPDISCOVER with Option 93 = 0
+    DhcpHeader bios_hdr{};
+    bios_hdr.op = 1;
+    bios_hdr.htype = 1;
+    bios_hdr.hlen = 6;
+    bios_hdr.xid = 0x12345678;
+    bios_hdr.magic_cookie[0] = 99; bios_hdr.magic_cookie[1] = 130;
+    bios_hdr.magic_cookie[2] = 83; bios_hdr.magic_cookie[3] = 99;
+    bios_hdr.chaddr[0] = 0x00; bios_hdr.chaddr[1] = 0x11; bios_hdr.chaddr[2] = 0x22;
+    bios_hdr.chaddr[3] = 0x33; bios_hdr.chaddr[4] = 0x44; bios_hdr.chaddr[5] = 0x55;
+
+    std::vector<uint8_t> bios_packet(reinterpret_cast<const uint8_t*>(&bios_hdr),
+                                      reinterpret_cast<const uint8_t*>(&bios_hdr) + sizeof(DhcpHeader));
+
+    // Option 53 (Discover)
+    bios_packet.push_back(53); bios_packet.push_back(1); bios_packet.push_back(1);
+    // Option 93 (Client Arch: 0 = BIOS x86)
+    bios_packet.push_back(93); bios_packet.push_back(2); bios_packet.push_back(0); bios_packet.push_back(0);
+    bios_packet.push_back(255); // End
+
+    auto bios_parse = DhcpServer::parse_packet(bios_packet);
+    assert(bios_parse.is_ok());
+    assert(bios_parse.value().client_arch == ClientArch::Bios_x86);
+    assert(!bios_parse.value().is_ipxe_client);
+    assert(bios_parse.value().client_mac == "00:11:22:33:44:55");
+
+    auto bios_reply = server.build_reply(bios_hdr, bios_parse.value(), 2, NetworkAddress(192, 168, 1, 100));
+    assert(bios_reply.is_ok());
+    const auto* reply_hdr = reinterpret_cast<const DhcpHeader*>(bios_reply.value().data());
+    assert(std::string(reinterpret_cast<const char*>(reply_hdr->file)) == "undionly.kpxe");
+
+    // 2. UEFI Client (Arch 7): DHCPDISCOVER with Option 93 = 7
+    DhcpHeader uefi_hdr{};
+    uefi_hdr.op = 1;
+    uefi_hdr.htype = 1;
+    uefi_hdr.hlen = 6;
+    uefi_hdr.xid = 0x87654321;
+    uefi_hdr.magic_cookie[0] = 99; uefi_hdr.magic_cookie[1] = 130;
+    uefi_hdr.magic_cookie[2] = 83; uefi_hdr.magic_cookie[3] = 99;
+    uefi_hdr.chaddr[0] = 0xAA; uefi_hdr.chaddr[1] = 0xBB; uefi_hdr.chaddr[2] = 0xCC;
+    uefi_hdr.chaddr[3] = 0xDD; uefi_hdr.chaddr[4] = 0xEE; uefi_hdr.chaddr[5] = 0xFF;
+
+    std::vector<uint8_t> uefi_packet(reinterpret_cast<const uint8_t*>(&uefi_hdr),
+                                      reinterpret_cast<const uint8_t*>(&uefi_hdr) + sizeof(DhcpHeader));
+
+    uefi_packet.push_back(53); uefi_packet.push_back(1); uefi_packet.push_back(1);
+    uefi_packet.push_back(93); uefi_packet.push_back(2); uefi_packet.push_back(0); uefi_packet.push_back(7); // Arch 7
+    uefi_packet.push_back(255);
+
+    auto uefi_parse = DhcpServer::parse_packet(uefi_packet);
+    assert(uefi_parse.is_ok());
+    assert(uefi_parse.value().client_arch == ClientArch::Efi_x64);
+
+    auto uefi_reply = server.build_reply(uefi_hdr, uefi_parse.value(), 2, NetworkAddress(192, 168, 1, 101));
+    assert(uefi_reply.is_ok());
+    const auto* uefi_reply_hdr = reinterpret_cast<const DhcpHeader*>(uefi_reply.value().data());
+    assert(std::string(reinterpret_cast<const char*>(uefi_reply_hdr->file)) == "ipxe.efi");
+
+    // 3. iPXE Client Stage 2: DHCPREQUEST with Option 175
+    DhcpHeader ipxe_hdr{};
+    ipxe_hdr.op = 1;
+    ipxe_hdr.htype = 1;
+    ipxe_hdr.hlen = 6;
+    ipxe_hdr.xid = 0x99999999;
+    ipxe_hdr.magic_cookie[0] = 99; ipxe_hdr.magic_cookie[1] = 130;
+    ipxe_hdr.magic_cookie[2] = 83; ipxe_hdr.magic_cookie[3] = 99;
+    std::memcpy(ipxe_hdr.chaddr, uefi_hdr.chaddr, 16);
+
+    std::vector<uint8_t> ipxe_packet(reinterpret_cast<const uint8_t*>(&ipxe_hdr),
+                                      reinterpret_cast<const uint8_t*>(&ipxe_hdr) + sizeof(DhcpHeader));
+
+    ipxe_packet.push_back(53); ipxe_packet.push_back(1); ipxe_packet.push_back(3); // Request
+    ipxe_packet.push_back(175); ipxe_packet.push_back(1); ipxe_packet.push_back(1); // iPXE option
+    ipxe_packet.push_back(255);
+
+    auto ipxe_parse = DhcpServer::parse_packet(ipxe_packet);
+    assert(ipxe_parse.is_ok());
+    assert(ipxe_parse.value().is_ipxe_client);
+
+    auto ipxe_reply = server.build_reply(ipxe_hdr, ipxe_parse.value(), 5, NetworkAddress(192, 168, 1, 101));
+    assert(ipxe_reply.is_ok());
+    const auto* ipxe_reply_hdr = reinterpret_cast<const DhcpHeader*>(ipxe_reply.value().data());
+    assert(std::string(reinterpret_cast<const char*>(ipxe_reply_hdr->file)) == "boot.ipxe");
+
+    std::cout << "  PASS: test_dhcp_architecture_detection_and_pxe_provisioning\n";
+}
+
+void test_tftp_server_virtual_payloads_and_ipxe_script() {
+    std::cout << "[RUN] test_tftp_server_virtual_payloads_and_ipxe_script\n";
+
+    TftpServer server(NetworkAddress(192, 168, 1, 1));
+
+    // 1. Dynamic iPXE script generation
+    std::string script = server.generate_ipxe_script("iqn.2026-09.com.cobdiskless:storage");
+    assert(script.find("#!ipxe") != std::string::npos);
+    assert(script.find("sanboot iscsi:192.168.1.1::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+
+    // 2. Virtual file content checks
+    auto ipxe_res = server.get_file_content("boot.ipxe");
+    assert(ipxe_res.is_ok());
+    assert(!ipxe_res.value().empty());
+
+    auto bios_stage1 = server.get_file_content("undionly.kpxe");
+    assert(bios_stage1.is_ok());
+    assert(!bios_stage1.value().empty());
+
+    auto uefi_stage1 = server.get_file_content("ipxe.efi");
+    assert(uefi_stage1.is_ok());
+    assert(!uefi_stage1.value().empty());
+
+    // 3. TFTP Packet serialization
+    std::vector<uint8_t> payload = {0x01, 0x02, 0x03, 0x04};
+    auto data_pkt = TftpServer::create_data_packet(1, payload);
+    assert(data_pkt.size() == 8);
+    assert(data_pkt[1] == 0x03); // DATA opcode
+    assert(data_pkt[3] == 0x01); // Block 1
+
+    auto ack_pkt = TftpServer::create_ack_packet(1);
+    assert(ack_pkt.size() == 4);
+    assert(ack_pkt[1] == 0x04); // ACK opcode
+    assert(ack_pkt[3] == 0x01); // Block 1
+
+    auto err_pkt = TftpServer::create_error_packet(1, "File not found");
+    assert(err_pkt.size() > 5);
+    assert(err_pkt[1] == 0x05); // ERROR opcode
+
+    std::cout << "  PASS: test_tftp_server_virtual_payloads_and_ipxe_script\n";
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << "CobDisklessCore Test Suite\n";
@@ -1258,8 +1398,12 @@ int main() {
     test_cow_block_device_lifecycle();
     test_client_session_manager_isolation();
 
+    // Phase 8 Tests
+    test_dhcp_architecture_detection_and_pxe_provisioning();
+    test_tftp_server_virtual_payloads_and_ipxe_script();
+
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (20/20 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (22/22 suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }
