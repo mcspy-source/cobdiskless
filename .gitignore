@@ -57,6 +57,8 @@ CTestTestfile.cmake
 *.tmp
 *.bak
 cobdiskless.conf
+# Runtime client enrollment registry (MAC -> hostname / reserved IP / image)
+clients.json
 writeback/
 cache/
 games/

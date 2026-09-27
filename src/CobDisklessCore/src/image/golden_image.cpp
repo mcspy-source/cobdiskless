@@ -1,6 +1,8 @@
 #include "CobDisklessCore/image/golden_image.hpp"
 #include "CobDisklessCore/storage/raw_image_backend.hpp"
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
+#include "CobDisklessCore/storage/vhdx_image_backend.hpp"
+#include "CobDisklessCore/storage/block_cache.hpp"
 
 namespace cobdiskless {
 
@@ -16,7 +18,8 @@ GoldenImage::GoldenImage(
 
 Result<std::shared_ptr<GoldenImage>> GoldenImage::open(
     const std::filesystem::path& path,
-    ImageId id
+    ImageId id,
+    size_t ram_cache_bytes
 ) {
     if (id.empty()) {
         id = ImageId(path.stem().string());
@@ -26,7 +29,11 @@ Result<std::shared_ptr<GoldenImage>> GoldenImage::open(
     ImageFormat fmt = ImageInspector::detect_format(path);
 
     if (fmt == ImageFormat::Vhdx) {
-        return Error(ErrorCode::StorageFailure, "VHDX image format detected: VHDX dynamic block translation is not supported (convert to VHD or RAW for production boot)");
+        auto vhdx_res = VhdxImageBackend::open(path, true);
+        if (!vhdx_res.is_ok()) {
+            return vhdx_res.error();
+        }
+        backend = vhdx_res.value();
     } else if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic || fmt == ImageFormat::VhdDifferencing) {
         auto vhd_res = VhdImageBackend::open(path, true);
         if (!vhd_res.is_ok()) {
@@ -46,12 +53,22 @@ Result<std::shared_ptr<GoldenImage>> GoldenImage::open(
         return inspect_res.error();
     }
 
+    bool has_cache = false;
+    if (ram_cache_bytes > 0) {
+        auto cache_res = CachedBlockDevice::create(backend, ram_cache_bytes);
+        if (cache_res.is_ok()) {
+            backend = cache_res.value();
+            has_cache = true;
+        }
+    }
+
     auto golden = std::make_shared<GoldenImage>(
         std::move(id),
         path,
         inspect_res.value(),
         std::move(backend)
     );
+    golden->set_cache_metadata(has_cache, ram_cache_bytes);
 
     return golden;
 }

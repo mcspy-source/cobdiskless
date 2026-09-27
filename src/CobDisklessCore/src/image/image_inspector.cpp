@@ -1,5 +1,7 @@
 #include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
+#include "CobDisklessCore/storage/vhdx_image_backend.hpp"
+#include "CobDisklessCore/storage/raw_image_backend.hpp"
 #include <cstring>
 #include <sstream>
 #include <iomanip>
@@ -110,6 +112,40 @@ std::string ImageInspectionReport::to_string() const {
     return ss.str();
 }
 
+std::string ImageInspectionReport::detailed_inspection_summary() const {
+    std::ostringstream ss;
+    ss << "=== CobDiskless Deep Virtual Disk Inspection ===\r\n";
+    ss << "Format:                  " << cobdiskless::to_string(format);
+    if (!vhd_subtype.empty()) {
+        ss << " (" << vhd_subtype << ")";
+    }
+    ss << "\r\n";
+    ss << "Virtual Disk Size:       " << virtual_size << " bytes ("
+       << std::fixed << std::setprecision(2) << (static_cast<double>(virtual_size) / (1024.0 * 1024.0 * 1024.0)) << " GiB)\r\n";
+    ss << "Sector Size:             " << sector_size << " bytes\r\n";
+    ss << "Partition Style: " << (partition_scheme == PartitionScheme::Gpt ? "GPT" : partition_scheme == PartitionScheme::Mbr ? "MBR" : "Unpartitioned") << "\r\n";
+    ss << "Determined Boot Mode: " << (boot_mode == BootMode::Uefi ? "UEFI" : boot_mode == BootMode::Bios ? "BIOS" : boot_mode == BootMode::Dual ? "Dual" : "Unknown") << "\r\n";
+    ss << "ESP FAT32: " << (has_esp ? "YES" : "NO") << "\r\n";
+    ss << "EFI Bootloader: " << (has_efi_boot_files ? "YES" : "NO") << "\r\n";
+    ss << "Windows Partition: " << (has_windows_partition ? "YES (NTFS)" : "NO") << "\r\n";
+    ss << "Windows Directory Marker: " << (has_windows_dir ? "YES" : "NO") << "\r\n";
+    ss << "Microsoft EFI Boot:      " << (has_efi_boot_files ? "Detected (EFI\\Microsoft\\Boot\\bootmgfw.efi)" : "Not Detected") << "\r\n";
+    ss << "BIOS Boot Manager:       " << (has_bios_bootmgr ? "Detected (bootmgr)" : (has_active_boot_partition ? "Active Partition Marked" : "Not Detected")) << "\r\n";
+    ss << "Total Partitions:        " << partitions.size() << "\r\n";
+    ss << "------------------------------------------------\r\n";
+    for (const auto& part : partitions) {
+        ss << "  #" << part.index << ": LBA " << part.start_lba << ".."
+           << (part.start_lba + part.sector_count - 1)
+           << " (" << (part.byte_size / (1024 * 1024)) << " MB) "
+           << "FS: " << cobdiskless::to_string(part.filesystem)
+           << (part.is_esp ? " [ESP]" : "")
+           << (part.is_bootable ? " [BOOT]" : "")
+           << (!part.name.empty() ? (" Name: '" + part.name + "'") : "") << "\r\n";
+    }
+    ss << "================================================\r\n";
+    return ss.str();
+}
+
 ImageFormat ImageInspector::detect_format(const std::filesystem::path& path) {
     if (path.empty()) {
         return ImageFormat::Raw;
@@ -166,6 +202,18 @@ Result<ImageInspectionReport> ImageInspector::inspect(
     report.sector_size = device->block_size();
     report.format = detect_format(path);
 
+    if (report.format == ImageFormat::VhdFixed) {
+        report.vhd_subtype = "Fixed VHD";
+    } else if (report.format == ImageFormat::VhdDynamic) {
+        report.vhd_subtype = "Dynamic VHD";
+    } else if (report.format == ImageFormat::VhdDifferencing) {
+        report.vhd_subtype = "Differencing VHD";
+    } else if (report.format == ImageFormat::Vhdx) {
+        report.vhd_subtype = "VHDX Virtual Hard Disk v2";
+    } else if (report.format == ImageFormat::Raw) {
+        report.vhd_subtype = "Raw Sector Image";
+    }
+
     if (device->size() < 512) {
         report.partition_scheme = PartitionScheme::Unknown;
         report.boot_mode = BootMode::Unknown;
@@ -212,6 +260,30 @@ Result<ImageInspectionReport> ImageInspector::inspect(
     determine_boot_mode(report);
 
     return report;
+}
+
+Result<ImageInspectionReport> ImageInspector::inspect(const std::filesystem::path& path) {
+    if (!std::filesystem::exists(path)) {
+        return Error(ErrorCode::StorageFailure, "Image file not found: " + path.string());
+    }
+    ImageFormat fmt = detect_format(path);
+    std::shared_ptr<BlockDevice> dev;
+    if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic || fmt == ImageFormat::VhdDifferencing) {
+        auto vhd_res = VhdImageBackend::open(path);
+        if (!vhd_res.is_ok()) return vhd_res.error();
+        dev = vhd_res.value();
+    } else if (fmt == ImageFormat::Vhdx) {
+        auto vhdx_res = VhdxImageBackend::open(path);
+        if (!vhdx_res.is_ok()) return vhdx_res.error();
+        dev = vhdx_res.value();
+    } else if (fmt == ImageFormat::Raw) {
+        auto raw_res = RawImageBackend::open(path);
+        if (!raw_res.is_ok()) return raw_res.error();
+        dev = raw_res.value();
+    } else {
+        return Error(ErrorCode::UnsupportedOperation, "Unsupported image container format: " + path.string());
+    }
+    return inspect(dev, path);
 }
 
 void ImageInspector::inspect_gpt(
@@ -355,36 +427,61 @@ void ImageInspector::detect_filesystems(
         // NTFS Signature at offset 3: "NTFS    "
         if (std::memcmp(vbr + 3, "NTFS    ", 8) == 0) {
             part.filesystem = FilesystemType::Ntfs;
-            continue;
-        }
-
-        // exFAT Signature at offset 3: "EXFAT   "
-        if (std::memcmp(vbr + 3, "EXFAT   ", 8) == 0) {
+            report.has_windows_partition = true;
+        } else if (std::memcmp(vbr + 3, "EXFAT   ", 8) == 0) {
             part.filesystem = FilesystemType::ExFat;
-            continue;
-        }
-
-        // FAT32 Signature at offset 82 (0x52): "FAT32   "
-        if (std::memcmp(vbr + 82, "FAT32   ", 8) == 0) {
+        } else if (std::memcmp(vbr + 82, "FAT32   ", 8) == 0) {
             part.filesystem = FilesystemType::Fat32;
-            continue;
-        }
-
-        // FAT16 Signature at offset 54 (0x36): "FAT16   "
-        if (std::memcmp(vbr + 54, "FAT16   ", 8) == 0) {
+        } else if (std::memcmp(vbr + 54, "FAT16   ", 8) == 0) {
             part.filesystem = FilesystemType::Fat16;
-            continue;
+        } else {
+            part.filesystem = FilesystemType::Unknown;
         }
 
-        part.filesystem = FilesystemType::Unknown;
+        // Deep inspection for Windows and EFI boot infrastructure
+        if (part.filesystem == FilesystemType::Ntfs) {
+            size_t probe_sectors = std::min<uint64_t>(part.sector_count, 4096);
+            std::vector<uint8_t> probe_buf(4096);
+            for (size_t sec = 0; sec < probe_sectors; sec += 8) {
+                uint64_t sec_offset = part.start_byte + sec * 512;
+                if (sec_offset + 4096 > device.size()) break;
+                auto r = device.read(sec_offset, std::span<std::byte>(reinterpret_cast<std::byte*>(probe_buf.data()), 4096));
+                if (!r.is_ok()) break;
+                std::string_view chunk(reinterpret_cast<const char*>(probe_buf.data()), 4096);
+                if (chunk.find("Windows") != std::string_view::npos || chunk.find("WINDOWS") != std::string_view::npos ||
+                    chunk.find("System32") != std::string_view::npos) {
+                    report.has_windows_dir = true;
+                }
+                if (chunk.find("BOOTMGR") != std::string_view::npos || chunk.find("bootmgr") != std::string_view::npos) {
+                    report.has_bios_bootmgr = true;
+                }
+            }
+        } else if (part.is_esp || part.filesystem == FilesystemType::Fat32 || part.filesystem == FilesystemType::Fat16) {
+            size_t probe_sectors = std::min<uint64_t>(part.sector_count, 4096);
+            std::vector<uint8_t> probe_buf(4096);
+            for (size_t sec = 0; sec < probe_sectors; sec += 8) {
+                uint64_t sec_offset = part.start_byte + sec * 512;
+                if (sec_offset + 4096 > device.size()) break;
+                auto r = device.read(sec_offset, std::span<std::byte>(reinterpret_cast<std::byte*>(probe_buf.data()), 4096));
+                if (!r.is_ok()) break;
+                std::string_view chunk(reinterpret_cast<const char*>(probe_buf.data()), 4096);
+                if (chunk.find("bootmgfw") != std::string_view::npos || chunk.find("BOOTMGFW") != std::string_view::npos ||
+                    chunk.find("Microsoft") != std::string_view::npos || chunk.find("MICROSOFT") != std::string_view::npos ||
+                    chunk.find("bootx64") != std::string_view::npos || chunk.find("BOOTX64") != std::string_view::npos ||
+                    chunk.find("EFI\\Microsoft\\Boot") != std::string_view::npos) {
+                    report.has_efi_boot_files = true;
+                    report.has_esp = true;
+                }
+            }
+        }
     }
 }
 
 void ImageInspector::determine_boot_mode(
     ImageInspectionReport& report
 ) {
-    bool has_uefi = report.has_esp;
-    bool has_bios = report.has_active_boot_partition ||
+    bool has_uefi = report.has_esp || report.has_efi_boot_files;
+    bool has_bios = report.has_bios_bootmgr || report.has_active_boot_partition ||
                    (report.partition_scheme == PartitionScheme::Mbr && report.has_mbr_bootstrap_code);
 
     if (has_uefi && has_bios) {

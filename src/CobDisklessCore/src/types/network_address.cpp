@@ -2,6 +2,12 @@
 #include <charconv>
 #include <sstream>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 namespace cobdiskless {
 
 std::string NetworkAddress::to_string() const {
@@ -61,6 +67,34 @@ NetworkAddress NetworkAddress::parse(std::string_view str, uint16_t default_port
         return NetworkAddress(octets[0], octets[1], octets[2], octets[3], port);
     }
     return NetworkAddress(0, 0, 0, 0, default_port);
+}
+
+NetworkAddress NetworkAddress::detect_local_ip(uint16_t port) {
+#if defined(_WIN32)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+        SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s != INVALID_SOCKET) {
+            sockaddr_in target{};
+            target.sin_family = AF_INET;
+            target.sin_port = htons(53);
+            target.sin_addr.s_addr = inet_addr("1.1.1.1");
+            if (connect(s, reinterpret_cast<const sockaddr*>(&target), sizeof(target)) == 0) {
+                sockaddr_in local{};
+                int len = sizeof(local);
+                if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+                    const uint8_t* b = reinterpret_cast<const uint8_t*>(&local.sin_addr.s_addr);
+                    closesocket(s);
+                    if (b[0] != 0 && b[0] != 127) {
+                        return NetworkAddress(b[0], b[1], b[2], b[3], port);
+                    }
+                }
+            }
+            closesocket(s);
+        }
+    }
+#endif
+    return NetworkAddress(192, 168, 1, 100, port);
 }
 
 } // namespace cobdiskless

@@ -1,10 +1,10 @@
 #pragma once
 
 #include <filesystem>
-#include <fstream>
+#include <shared_mutex>
 #include <vector>
-#include <mutex>
 #include "CobDisklessCore/storage/block_device.hpp"
+#include "CobDisklessCore/storage/random_access_file.hpp"
 #include "CobDisklessCore/image/image_format.hpp"
 
 namespace cobdiskless {
@@ -28,7 +28,19 @@ struct VhdMetadata {
 /**
  * @brief BlockDevice backend for Microsoft Virtual Hard Disk (VHD) format images.
  *
- * Implements block-level virtual sector translation for Fixed, Dynamic, and Differencing VHDs.
+ * Implements block-level virtual sector translation for Fixed, Dynamic, and
+ * Differencing VHDs.
+ *
+ * Concurrency: the underlying file is accessed through RandomAccessFile with
+ * positional (seek-free) I/O. Read-only opens share ONE strict Win32 handle
+ * (GENERIC_READ + FILE_SHARE_READ, never FILE_SHARE_WRITE) across every
+ * backend instance for the same path, so any number of client sessions can
+ * read the base image concurrently while the OS guarantees that no writer can
+ * modify it underneath them. Writers (Super Client maintenance) must suspend
+ * the shared read-only pool first -- handled inside RandomAccessFile.
+ *
+ * Locking: a shared_mutex guards metadata/BAT. Readers take shared access
+ * (parallel), writers take exclusive access.
  */
 class VhdImageBackend : public BlockDevice {
 public:
@@ -48,6 +60,10 @@ public:
 
     /**
      * @brief Opens and parses a VHD file, returning a ready BlockDevice.
+     *
+     * @param read_only true  -> strict shared read-only handle (normal boot path)
+     *                  false -> exclusive-writer handle (Super Client maintenance;
+     *                            suspends the shared read-only pool for this path)
      */
     [[nodiscard]] static Result<std::shared_ptr<VhdImageBackend>> open(
         const std::filesystem::path& path,
@@ -86,10 +102,17 @@ public:
         return path_;
     }
 
+    /**
+     * @brief True when this backend holds an exclusive-writer handle.
+     */
+    [[nodiscard]] bool is_exclusive_writer() const noexcept {
+        return !read_only_ && file_.access() == RandomAccessFile::Access::ReadWrite;
+    }
+
 private:
     std::filesystem::path path_;
-    mutable std::fstream stream_;
-    mutable std::mutex mutex_;
+    RandomAccessFile file_;
+    mutable std::shared_mutex mutex_;
     VhdMetadata metadata_;
     std::vector<uint32_t> bat_; // Block Allocation Table (sector offsets)
     uint32_t bitmap_sectors_{0};

@@ -1,5 +1,6 @@
 #include "CobDisklessCore/logging/logger.hpp"
 #include <iostream>
+#include <fstream>
 #include <chrono>
 #include <iomanip>
 #include <sstream>
@@ -30,6 +31,11 @@ void Logger::set_sink(LogSink sink) {
 void Logger::reset_to_default_sink() {
     sink_ = [](LogLevel /*level*/, std::string_view /*category*/, std::string_view /*message*/, std::string_view formatted) {
         std::clog << formatted << '\n';
+        static std::ofstream log_file("cobdiskless.log", std::ios::app);
+        if (log_file.is_open()) {
+            log_file << formatted << '\n';
+            log_file.flush();
+        }
     };
 }
 

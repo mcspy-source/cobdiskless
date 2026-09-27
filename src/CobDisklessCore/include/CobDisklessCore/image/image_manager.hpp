@@ -13,6 +13,8 @@
 
 namespace cobdiskless {
 
+class StorageManager;
+
 enum class ImageRole {
     OsImage,
     GameDisk,
@@ -85,6 +87,48 @@ public:
     void configure(const Configuration& config);
 
     /**
+     * @brief Attaches a storage manager for cache and disk role configuration.
+     */
+    void set_storage_manager(std::shared_ptr<StorageManager> storage_mgr);
+    [[nodiscard]] std::shared_ptr<StorageManager> storage_manager() const;
+
+    /**
+     * @brief Initializes ImageManager: ensures default "./images" directory exists,
+     * loads saved images from config.json, auto-scans "./images" and application root
+     * directory for .vhd and .vhdx images, and registers them.
+     */
+    Result<void> initialize(const std::filesystem::path& config_path = "config.json");
+
+    /**
+     * @brief Saves registered images to config.json under an "images" array.
+     */
+    Result<void> save_images_to_config(const std::filesystem::path& config_path = "config.json") const;
+
+    /**
+     * @brief Loads and registers images from config.json.
+     */
+    Result<void> load_images_from_config(const std::filesystem::path& config_path = "config.json");
+
+    /**
+     * @brief Gets the active/default OS image ID configured for clients.
+     */
+    [[nodiscard]] std::string default_os_image_id() const;
+
+    /**
+     * @brief Sets the active/default OS image ID and optionally persists to config.json.
+     */
+    void set_default_os_image_id(std::string id, bool persist = true);
+
+    void set_config_path(std::filesystem::path path) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        config_path_ = std::move(path);
+    }
+    [[nodiscard]] std::filesystem::path config_path() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return config_path_;
+    }
+
+    /**
      * @brief Scans OS images and games directories, registering discovered images.
      */
     Result<size_t> scan_directories();
@@ -94,8 +138,9 @@ public:
      */
     Result<ManagedImageInfo> import_image(
         const std::filesystem::path& file_path,
-        ImageRole role,
-        const ImageId& id
+        ImageRole role = ImageRole::OsImage,
+        const ImageId& id = ImageId{},
+        bool persist = true
     );
 
     /**
@@ -112,11 +157,33 @@ public:
      * @brief Increments client reference count for safe concurrent mounting.
      */
     Result<std::shared_ptr<GoldenImage>> acquire_image(const ImageId& id);
+    Result<std::shared_ptr<GoldenImage>> acquire_image(const std::string& image_id);
+
+    /**
+     * @brief Reloads an image in the registry/cache after modifications (e.g. Super Client commit).
+     * @return The freshly opened/registered GoldenImage (its BlockDevice may be
+     *         re-attached to a live session that previously held a stale handle).
+     */
+    Result<std::shared_ptr<GoldenImage>> reload_image(const ImageId& id);
+
+    /**
+     * @brief Drops the cached GoldenImage for an image from the registry without
+     *        touching the managed-image bookkeeping.
+     *
+     * Used before a Super Client exclusive commit: the cached read-only handle
+     * is released so the read-write base open starts from a clean sharing
+     * state. The image stays registered in managed_images_, so a subsequent
+     * reload_image()/acquire_image() re-opens it transparently.
+     *
+     * @return true when a cached image was found and evicted.
+     */
+    [[nodiscard]] bool evict_cached_image(const ImageId& id);
 
     /**
      * @brief Decrements client reference count upon client disconnect/release.
      */
     Result<void> release_image(const ImageId& id);
+    Result<void> release_image(const std::string& key);
 
     /**
      * @brief Queries detailed info for an image.
@@ -145,8 +212,15 @@ private:
     std::filesystem::path games_dir_{"./games"};
     std::filesystem::path writeback_dir_{"./writeback"};
     std::filesystem::path cache_dir_{"./cache"};
+    std::shared_ptr<StorageManager> storage_manager_;
 
     std::unordered_map<ImageId, ManagedImageInfo, ImageIdHash> managed_images_;
+    std::unordered_map<std::string, ManagedImageInfo> images_;
+    std::string default_os_image_id_;
+    std::filesystem::path config_path_{};
+
+    size_t scan_folder_locked(const std::filesystem::path& folder, ImageRole role);
+    Result<void> save_images_to_config_locked(const std::filesystem::path& config_path = "") const;
 };
 
 } // namespace cobdiskless

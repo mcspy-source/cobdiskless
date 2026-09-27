@@ -1,0 +1,56 @@
+{
+  "auto_arm_vhd_on_boot": true,
+  "default_os_image": "default",
+  "images": [
+    {
+      "id": "default_os",
+      "path": "../default_os.vhd",
+      "role": "OsImage",
+      "format": "VHD (Dynamic)",
+      "virtual_size_bytes": 53687091200,
+      "file_size_bytes": 4803755008,
+      "boot_mode": "Legacy BIOS",
+      "partition_scheme": "MBR"
+    },
+    {
+      "id": "default",
+      "path": "../default.vhd",
+      "role": "OsImage",
+      "format": "VHD (Dynamic)",
+      "virtual_size_bytes": 53687091200,
+      "file_size_bytes": 4803755008,
+      "boot_mode": "Legacy BIOS",
+      "partition_scheme": "MBR"
+    },
+    {
+      "id": "DESKTOP-Q96KJSR",
+      "path": "G:/DESKTOP-Q96KJSR.VHD",
+      "role": "OsImage",
+      "format": "VHD (Dynamic)",
+      "virtual_size_bytes": 256060514304,
+      "file_size_bytes": 11919417344,
+      "boot_mode": "BIOS + UEFI (Dual)",
+      "partition_scheme": "GPT"
+    },
+    {
+      "id": "w11",
+      "path": "G:/w11.VHD",
+      "role": "OsImage",
+      "format": "VHD (Dynamic)",
+      "virtual_size_bytes": 500107862016,
+      "file_size_bytes": 4378781184,
+      "boot_mode": "Legacy BIOS",
+      "partition_scheme": "MBR"
+    },
+    {
+      "id": "w10",
+      "path": "G:/w10.VHD",
+      "role": "OsImage",
+      "format": "VHD (Dynamic)",
+      "virtual_size_bytes": 500107862016,
+      "file_size_bytes": 4320046592,
+      "boot_mode": "Legacy BIOS",
+      "partition_scheme": "MBR"
+    }
+  ]
+}

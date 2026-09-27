@@ -40,6 +40,7 @@ public:
     }
 
     [[nodiscard]] static NetworkAddress parse(std::string_view str, uint16_t default_port = 0);
+    [[nodiscard]] static NetworkAddress detect_local_ip(uint16_t port = 0);
 
     constexpr auto operator<=>(const NetworkAddress&) const noexcept = default;
     constexpr bool operator==(const NetworkAddress&) const noexcept = default;

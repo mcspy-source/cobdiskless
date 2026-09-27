@@ -38,18 +38,28 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/storage/read_only_block_device.cpp
     src/CobDisklessCore/src/storage/raw_image_backend.cpp
     src/CobDisklessCore/src/storage/vhd_image_backend.cpp
+    src/CobDisklessCore/src/storage/vhdx_image_backend.cpp
     src/CobDisklessCore/src/storage/storage_tester.cpp
     src/CobDisklessCore/src/storage/block_cache.cpp
+    src/CobDisklessCore/src/storage/random_access_file.cpp
+    src/CobDisklessCore/src/storage/writeback_context.cpp
     src/CobDisklessCore/src/network/network_service.cpp
     src/CobDisklessCore/src/network/dhcp_server.cpp
     src/CobDisklessCore/src/network/tftp_server.cpp
     src/CobDisklessCore/src/network/iscsi_target.cpp
+    src/CobDisklessCore/src/network/host_network.cpp
+    src/CobDisklessCore/src/network/http_daemon.cpp
     src/CobDisklessCore/src/storage/cow_block_device.cpp
     src/CobDisklessCore/src/client/client_session.cpp
+    src/CobDisklessCore/src/client/client_manager.cpp
+    src/CobDisklessCore/src/client/client_database.cpp
+    src/CobDisklessCore/src/client/station_manager.cpp
+    src/CobDisklessCore/src/storage/storage_manager.cpp
     src/CobDisklessCore/src/image/image_inspector.cpp
     src/CobDisklessCore/src/image/golden_image.cpp
     src/CobDisklessCore/src/image/image_registry.cpp
     src/CobDisklessCore/src/image/image_manager.cpp
+    src/CobDisklessCore/src/image/pnp_driver_armer.cpp
 )
 
 target_include_directories(CobDisklessCore
@@ -59,7 +69,7 @@ target_include_directories(CobDisklessCore
 )
 
 if(CYGWIN OR MSYS OR WIN32)
-    target_link_libraries(CobDisklessCore PUBLIC ws2_32)
+    target_link_libraries(CobDisklessCore PUBLIC ws2_32 advapi32)
 endif()
 
 # ==============================================================================
@@ -84,9 +94,12 @@ if(CYGWIN OR MSYS OR WIN32)
     target_link_libraries(cobdiskless_app
         PRIVATE
             comctl32
+            comdlg32
             gdi32
             user32
             ws2_32
+            iphlpapi
+            virtdisk
     )
 
     if(EXISTS "C:/msys64/usr/bin/msys-2.0.dll")
@@ -97,6 +110,29 @@ if(CYGWIN OR MSYS OR WIN32)
             COMMENT "Copying MSYS2 runtime DLLs to output directory"
         )
     endif()
+endif()
+
+# ==============================================================================
+# cob-armer (standalone offline SYSTEM hive armer CLI)
+# ==============================================================================
+add_executable(cob_armer
+    src/tools/cob_armer_main.cpp
+)
+
+set_target_properties(cob_armer PROPERTIES OUTPUT_NAME "cob-armer")
+
+target_link_libraries(cob_armer
+    PRIVATE
+        CobDisklessCore
+)
+
+if(CYGWIN OR MSYS OR WIN32)
+    target_link_libraries(cob_armer
+        PRIVATE
+            ws2_32
+            iphlpapi
+            virtdisk
+    )
 endif()
 
 # ==============================================================================
@@ -120,6 +156,8 @@ if(BUILD_TESTING)
         target_link_libraries(cobdiskless_core_test
             PRIVATE
                 ws2_32
+                iphlpapi
+                virtdisk
         )
     endif()
 
@@ -127,4 +165,26 @@ if(BUILD_TESTING)
         NAME CoreLifecycleTest
         COMMAND cobdiskless_core_test
     )
+
+    # End-to-end coverage for the standalone armer CLI: generate a synthetic
+    # SYSTEM hive, arm it through the same entry point operators use, and make
+    # sure the JSON report claims BootFlags + iSCSI stack arming.
+    add_test(
+        NAME CobArmerSelfTest
+        COMMAND $<TARGET_FILE:cob_armer> --self-test
+    )
+
+    # A missing hive must be rejected loudly instead of being silently "armed".
+    add_test(
+        NAME CobArmerRejectsMissingHive
+        COMMAND $<TARGET_FILE:cob_armer> "${CMAKE_CURRENT_BINARY_DIR}/no_such_SYSTEM_hive"
+    )
+    set_tests_properties(CobArmerRejectsMissingHive PROPERTIES WILL_FAIL TRUE)
+
+    # Argument validation: no hive path -> usage error.
+    add_test(
+        NAME CobArmerRequiresHivePath
+        COMMAND $<TARGET_FILE:cob_armer>
+    )
+    set_tests_properties(CobArmerRequiresHivePath PROPERTIES WILL_FAIL TRUE)
 endif()

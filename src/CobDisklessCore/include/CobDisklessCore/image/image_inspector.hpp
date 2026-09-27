@@ -27,8 +27,14 @@ struct ImageInspectionReport {
     bool has_esp{false};
     bool has_active_boot_partition{false};
     bool has_mbr_bootstrap_code{false};
+    bool has_windows_partition{false};
+    bool has_windows_dir{false};
+    bool has_efi_boot_files{false};
+    bool has_bios_bootmgr{false};
+    std::string vhd_subtype;
 
     [[nodiscard]] std::string to_string() const;
+    [[nodiscard]] std::string detailed_inspection_summary() const;
 };
 
 /**
@@ -43,6 +49,13 @@ public:
     [[nodiscard]] static Result<ImageInspectionReport> inspect(
         const std::shared_ptr<BlockDevice>& device,
         const std::filesystem::path& path = {}
+    );
+
+    /**
+     * @brief Opens and inspects a disk image directly from disk.
+     */
+    [[nodiscard]] static Result<ImageInspectionReport> inspect(
+        const std::filesystem::path& path
     );
 
     /**

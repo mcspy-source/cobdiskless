@@ -1,0 +1,6 @@
+#!ipxe
+dhcp
+echo ========================================================
+echo CobDiskless Auto-Chain: Connecting to ${next-server}...
+echo ========================================================
+chain tftp://${next-server}/boot.ipxe || shell

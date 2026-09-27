@@ -1,0 +1,8 @@
+#!ipxe
+echo =========================================================
+echo CobDiskless Network Boot Initializing...
+echo =========================================================
+echo Connecting to CobDiskless SAN Target...
+dhcp
+set keep-san 1
+sanboot --no-describe iscsi:${next-server}::::iqn.2026-09.com.cobdiskless:storage

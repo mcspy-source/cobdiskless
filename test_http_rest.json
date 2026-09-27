@@ -1,0 +1,20 @@
+{
+  "stations": [
+    {
+      "mac": "AA:BB:CC:DD:EE:01",
+      "name": "WS-01",
+      "ip": "10.0.0.10",
+      "image": "m71e.vhd",
+      "boot_mode": "uefi",
+      "registered_at": "2026-09-26T16:08:26Z"
+    },
+    {
+      "mac": "AA:BB:CC:DD:EE:02",
+      "name": "WS-02",
+      "ip": "10.0.0.11",
+      "image": "m71e.vhd",
+      "boot_mode": "bios",
+      "registered_at": "2026-09-26T16:08:26Z"
+    }
+  ]
+}

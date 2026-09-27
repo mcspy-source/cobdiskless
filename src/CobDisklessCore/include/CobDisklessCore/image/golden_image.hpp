@@ -43,14 +43,22 @@ public:
      */
     [[nodiscard]] std::shared_ptr<BlockDevice> device() const noexcept { return read_only_device_; }
     [[nodiscard]] bool is_read_only() const noexcept { return true; }
+    [[nodiscard]] bool has_cache() const noexcept { return has_cache_; }
+    [[nodiscard]] size_t cache_size_bytes() const noexcept { return cache_size_bytes_; }
+    void set_cache_metadata(bool has_cache, size_t size_bytes) noexcept {
+        has_cache_ = has_cache;
+        cache_size_bytes_ = size_bytes;
+    }
 
     /**
      * @brief Factory method that opens, inspects, and binds a golden image file.
-     * Automatically detects whether the file is RAW or VHD.
+     * Automatically detects whether the file is RAW, VHD, or VHDX, and optionally
+     * decorates it with an attached RAM block cache.
      */
     [[nodiscard]] static Result<std::shared_ptr<GoldenImage>> open(
         const std::filesystem::path& path,
-        ImageId id = {}
+        ImageId id = {},
+        size_t ram_cache_bytes = 0
     );
 
 private:
@@ -58,6 +66,8 @@ private:
     std::filesystem::path path_;
     ImageInspectionReport inspection_;
     std::shared_ptr<ReadOnlyBlockDevice> read_only_device_;
+    bool has_cache_{false};
+    size_t cache_size_bytes_{0};
 };
 
 } // namespace cobdiskless

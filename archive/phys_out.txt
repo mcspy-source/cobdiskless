@@ -1,0 +1,33 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260924135717
+Username: DESKTOP-Q96KJSR\Admin
+RunAs User: DESKTOP-Q96KJSR\Admin
+Configuration Name: 
+Machine: DESKTOP-Q96KJSR (Microsoft Windows NT 10.0.26100.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -ExecutionPolicy Bypass -File C:\Users\Admin\Desktop\cobdiskless\inspect_physical.ps1
+Process ID: 8996
+PSVersion: 5.1.26100.2161
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.2161
+BuildVersion: 10.0.26100.2161
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\Admin\Desktop\cobdiskless\phys_out.txt
+PhysicalDrive3 MBR Sig: 0xAA55
+Part 0: Boot=0x80 Type=0x07 StartLBA=2048 Len=102400
+Part 1: Boot=0x00 Type=0x07 StartLBA=104448 Len=976666624
+Part 2: Boot=0x00 Type=0x00 StartLBA=0 Len=0
+Part 3: Boot=0x00 Type=0x00 StartLBA=0 Len=0
+
+LBA 2048: Sig=0xAA55 OEM='NTFS    ' BytesPerSec=512 SecPerClus=8 HiddenSec=2048
+LBA 16346: Sig=0x06F1 OEM=',??wt/??' BytesPerSec=30504 SecPerClus=35 HiddenSec=1145698292
+
+Volume H: VBR: Sig=0xAA55 OEM='NTFS    ' BytesPerSec=512 SecPerClus=8 HiddenSec=2048
+**********************
+Windows PowerShell transcript end
+End time: 20260924135717
+**********************

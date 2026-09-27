@@ -61,22 +61,40 @@ struct DhcpHeader {
 struct DhcpDiscoveredOptions {
     uint8_t message_type{0}; // 1 = Discover, 3 = Request
     NetworkAddress requested_ip;
-    ClientArch client_arch{ClientArch::Bios_x86};
+    ClientArch client_arch{ClientArch::Unknown};
     bool is_ipxe_client{false};
-    std::string client_mac;
-    std::string hostname;
+    bool is_pxe_client{false};
+    std::string client_mac;      // Stored as string for persistence
+    std::string_view hostname;   // Zero-copy view into packet buffer
+    std::string_view vendor_class; // Zero-copy view into packet buffer
+    uint32_t server_identifier{0};
+    std::string_view bootfile_name; // Zero-copy view into packet buffer
+    std::string_view tftp_server_name; // Zero-copy view into packet buffer
+};
+
+struct DhcpLease {
+    std::string pc_name;
+    std::string mac_address;
+    NetworkAddress ip_address;
+    std::string lease_status{"Active"}; // "Active", "Reserved", "Expired"
+    std::string first_seen;
+    std::string last_seen;
 };
 
 /**
  * @brief DHCP / PXE Server subsystem adapted from DHCPLite.
  * Detects client architecture (Option 93) and dynamically provisions BIOS/UEFI bootloaders.
  */
+class ClientManager;
+class ImageManager;
+class StationManager;
+
 class DhcpServer : public ISubsystem {
 public:
     DhcpServer(
         NetworkAddress server_ip,
         NetworkAddress subnet_mask = NetworkAddress(255, 255, 255, 0),
-        NetworkAddress ip_pool_start = NetworkAddress(192, 168, 1, 100),
+        NetworkAddress ip_pool_start = NetworkAddress(192, 168, 1, 101),
         NetworkAddress ip_pool_end = NetworkAddress(192, 168, 1, 200),
         uint16_t port = 67
     );
@@ -106,10 +124,95 @@ public:
         NetworkAddress assigned_ip
     );
 
-    void set_server_ip(NetworkAddress ip) noexcept { server_ip_ = ip; }
+    /**
+     * @brief Validates the IP pool range against server and gateway IPs, sanitizing collisions.
+     */
+    void validate_and_sanitize_pool();
+
+    void set_server_ip(NetworkAddress ip) {
+        server_ip_ = ip;
+        validate_and_sanitize_pool();
+    }
     [[nodiscard]] NetworkAddress server_ip() const noexcept { return server_ip_; }
     [[nodiscard]] uint16_t port() const noexcept { return port_; }
 
+    void set_client_manager(std::shared_ptr<ClientManager> mgr) {
+        client_manager_ = std::move(mgr);
+        validate_and_sanitize_pool();
+    }
+    [[nodiscard]] std::shared_ptr<ClientManager> client_manager() const noexcept { return client_manager_; }
+
+    void set_image_manager(std::shared_ptr<ImageManager> mgr) noexcept { image_manager_ = std::move(mgr); }
+    [[nodiscard]] std::shared_ptr<ImageManager> image_manager() const noexcept { return image_manager_; }
+
+    void set_station_manager(std::shared_ptr<StationManager> mgr) {
+        station_manager_ = std::move(mgr);
+        validate_and_sanitize_pool();
+    }
+    [[nodiscard]] std::shared_ptr<StationManager> station_manager() const noexcept { return station_manager_; }
+
+    void set_target_iqn(std::string iqn) noexcept { base_target_iqn_ = std::move(iqn); }
+
+    /**
+     * @brief Stage-2 boot script URL handed to an already-running iPXE client.
+     *
+     * When set (e.g. "http://192.168.1.10:8080/boot.ipxe") Option 67 points at
+     * the embedded HTTP daemon so the script can be personalized per MAC
+     * (enrollment prompt vs SANBoot). When empty the legacy TFTP "boot.ipxe"
+     * virtual file is used and behaviour is unchanged.
+     */
+    void set_boot_script_url(std::string url) noexcept {
+        std::lock_guard<std::mutex> lock(lease_mutex_);
+        boot_script_url_ = std::move(url);
+    }
+    [[nodiscard]] std::string boot_script_url() const noexcept {
+        std::lock_guard<std::mutex> lock(lease_mutex_);
+        return boot_script_url_;
+    }
+
+    void set_pool_range(NetworkAddress start, NetworkAddress end) {
+        {
+            std::lock_guard<std::mutex> lock(lease_mutex_);
+            ip_pool_start_ = start;
+            ip_pool_end_ = end;
+        }
+        validate_and_sanitize_pool();
+    }
+    [[nodiscard]] NetworkAddress ip_pool_start() const noexcept { return ip_pool_start_; }
+    [[nodiscard]] NetworkAddress ip_pool_end() const noexcept { return ip_pool_end_; }
+
+    void set_subnet_mask(NetworkAddress mask) noexcept { subnet_mask_ = mask; }
+    [[nodiscard]] NetworkAddress subnet_mask() const noexcept { return subnet_mask_; }
+
+    void set_gateway(NetworkAddress gw) {
+        gateway_ = gw;
+        validate_and_sanitize_pool();
+    }
+    [[nodiscard]] NetworkAddress gateway() const noexcept { return gateway_; }
+
+    void set_dns(NetworkAddress dns) noexcept { dns_ = dns; }
+    void set_dns_server(NetworkAddress dns) noexcept { set_dns(dns); }
+    [[nodiscard]] NetworkAddress dns() const noexcept { return dns_; }
+
+    // RFC 2131 Option 51 floor. A provisioning lease shorter than a day forces the guest
+    // to renew while it is still booting, and a renewal that races the iSCSI login surfaces
+    // as a dropped boot session instead of as a DHCP problem. Anything configured below
+    // this is clamped up rather than honoured.
+    static constexpr uint32_t kMinLeaseSeconds = 86400; // 24 hours
+
+    void set_lease_duration(uint32_t seconds) noexcept {
+        lease_duration_sec_ = (seconds < kMinLeaseSeconds) ? kMinLeaseSeconds : seconds;
+    }
+    void set_lease_duration_seconds(uint32_t seconds) noexcept { set_lease_duration(seconds); }
+    /// The lease actually advertised in Option 51 (never below kMinLeaseSeconds).
+    [[nodiscard]] uint32_t lease_duration() const noexcept {
+        return (lease_duration_sec_ < kMinLeaseSeconds) ? kMinLeaseSeconds : lease_duration_sec_;
+    }
+
+    void set_enabled(bool enabled) noexcept { enabled_ = enabled; }
+    [[nodiscard]] bool is_enabled() const noexcept { return enabled_; }
+
+    [[nodiscard]] std::vector<DhcpLease> list_leases() const;
     [[nodiscard]] size_t active_leases_count() const noexcept;
 
 private:
@@ -118,9 +221,20 @@ private:
     NetworkAddress subnet_mask_;
     NetworkAddress ip_pool_start_;
     NetworkAddress ip_pool_end_;
+    NetworkAddress gateway_{192, 168, 1, 1};
+    NetworkAddress dns_{192, 168, 1, 1};
+    uint32_t lease_duration_sec_{86400};
+    bool enabled_{true};
     uint16_t port_{67};
 
+    std::shared_ptr<ClientManager> client_manager_;
+    std::shared_ptr<ImageManager> image_manager_;
+    std::shared_ptr<StationManager> station_manager_;
+    std::string base_target_iqn_{"iqn.2026-09.com.cobdiskless:storage"};
+    std::string boot_script_url_;
+
     mutable std::mutex lease_mutex_;
+    std::unordered_map<std::string, DhcpLease> leases_by_mac_;
     std::unordered_map<std::string, NetworkAddress> mac_to_ip_leases_;
     uint32_t next_pool_offset_{0};
 

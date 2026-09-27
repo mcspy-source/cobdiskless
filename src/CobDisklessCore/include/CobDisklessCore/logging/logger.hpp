@@ -57,6 +57,11 @@ public:
         log(LogLevel::Fatal, category, message);
     }
 
+    static Logger& default_logger() {
+        static Logger instance;
+        return instance;
+    }
+
 private:
     mutable std::mutex mutex_;
     LogLevel min_level_{LogLevel::Info};
