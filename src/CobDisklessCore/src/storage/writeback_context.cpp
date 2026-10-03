@@ -1,6 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/storage/writeback_context.hpp"
+#include "CobDisklessCore/storage/file_attributes.hpp"
+#include "CobDisklessCore/logging/logger.hpp"
 
 #include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <system_error>
 #include <utility>
@@ -13,7 +20,18 @@ namespace {
 constexpr uint32_t kMinChunkSize = 512;
 constexpr uint32_t kMaxChunkSize = 64u * 1024u * 1024u;
 
+// Longest the worker sleeps while tier 0 holds deferred chunks: a bound on
+// both the age-trigger re-evaluation and the backpressure wake-up latency.
+constexpr uint64_t kMaxSpillWaitSliceMs = 50;
+
 } // namespace
+
+uint64_t WritebackContext::monotonic_ms() noexcept {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
 
 WritebackContext::WritebackContext(std::filesystem::path overlay_path, uint32_t chunk_size)
     : overlay_path_(std::move(overlay_path)),
@@ -40,17 +58,59 @@ Result<void> WritebackContext::open(std::shared_ptr<BlockDevice> base_device) {
         return res;
     }
 
+    // Start the worker before advertising the context as open: if thread
+    // creation fails, the exception propagates and is_open_ stays false, so a
+    // writer can never fill a ring nobody will ever drain.
+    start_worker_locked();
     is_open_ = true;
     return {};
 }
 
+void WritebackContext::start_worker_locked() {
+    if (worker_.joinable()) {
+        return;
+    }
+    stop_worker_ = false;
+    drain_failed_ = false;
+    drain_error_.clear();
+    worker_ = std::thread(&WritebackContext::worker_loop, this);
+}
+
 void WritebackContext::close() noexcept {
+    // Phase 1: reject new writes, drain, then hand the worker over to a local.
+    // A write holds mutex_ for its whole duration, so once we hold it no
+    // partially-enqueued write can exist -- everything accepted will reach
+    // disk before we stop. The handoff happens here, but the join must not:
+    // the worker needs mutex_ to observe the stop flag, so joining while
+    // holding it deadlocks.
+    std::thread worker;
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        is_open_ = false;
+        wait_ring_idle_locked(lock); // no-op when the worker never started
+        if (header_dirty_ && pending_.empty()) {
+            (void)persist_header_if_settled_locked();
+        }
+        if (worker_.joinable()) {
+            stop_worker_ = true;
+            ring_work_cv_.notify_all();
+            worker = std::move(worker_);
+        }
+    }
+
+    // Phase 2: join outside the lock. Safe because phase 1 left the ring idle
+    // and no writer can refill it: is_open_ is already false.
+    if (worker.joinable()) {
+        worker.join();
+    }
+
+    // Phase 3: shut the stream.
     std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> io(overlay_io_mutex_);
     if (overlay_.is_open()) {
         overlay_.flush();
         overlay_.close();
     }
-    is_open_ = false;
 }
 
 bool WritebackContext::is_open() const noexcept {
@@ -58,7 +118,11 @@ bool WritebackContext::is_open() const noexcept {
     return is_open_;
 }
 
+// Always taken without overlay_io_mutex_ held: it locks the stream itself, so
+// it is safe to call while the worker is alive but idle.
 Result<void> WritebackContext::persist_header_locked() {
+    std::lock_guard<std::mutex> io(overlay_io_mutex_);
+
     CowHeader header{};
     std::memcpy(header.magic, "COWB", 4);
     header.version = 1;
@@ -78,10 +142,328 @@ Result<void> WritebackContext::persist_header_locked() {
     return {};
 }
 
+Result<void> WritebackContext::persist_header_if_settled_locked() {
+    if (!header_dirty_ || !pending_.empty()) {
+        // A payload still waiting for the disk means its slot is not
+        // serviceable yet. Persisting now would advertise a slot that a crash
+        // could leave holding garbage, so wait for a later drain point.
+        return {};
+    }
+    auto res = persist_header_locked();
+    if (res.is_ok()) {
+        header_dirty_ = false;
+    }
+    return res;
+}
+
+void WritebackContext::wait_ring_idle_locked(std::unique_lock<std::mutex>& lock) {
+    // A drain point promises "everything the initiator was told is in memory
+    // has reached the disk", so tier 0 has to be promoted before we wait.
+    (void)promote_deferred_locked(/*force=*/true);
+    if (!worker_.joinable()) {
+        return; // no worker: nothing can ever be in flight
+    }
+    ring_work_cv_.notify_all(); // make sure the worker is awake
+    ring_idle_cv_.wait(lock, [this] { return drain_queue_.empty() && !worker_busy_; });
+}
+
+size_t WritebackContext::residency_limit_locked() const noexcept {
+    if (ring_explicit_) {
+        // An explicit operator cap always wins, however small.
+        return ring_limit_chunks_ == 0 ? 1 : ring_limit_chunks_;
+    }
+    const uint64_t by_budget =
+        chunk_size_ > 0 ? (ram_writeback_bytes_ / chunk_size_) : 0;
+    return static_cast<size_t>(
+        (std::max)(kMinAutoResidencyChunks, static_cast<size_t>(by_budget)));
+}
+
+size_t WritebackContext::high_water_chunks_locked() const noexcept {
+    return (std::max)(size_t{1}, residency_limit_locked() * 3 / 4);
+}
+
+size_t WritebackContext::low_water_chunks_locked() const noexcept {
+    return (std::max)(size_t{1}, residency_limit_locked() / 2);
+}
+
+void WritebackContext::prune_defer_queue_locked() {
+    while (!defer_queue_.empty()) {
+        auto it = pending_.find(defer_queue_.front());
+        if (it != pending_.end() && it->second.in_defer) {
+            break;
+        }
+        defer_queue_.pop_front();
+    }
+}
+
+bool WritebackContext::promote_deferred_locked(bool force) {
+    prune_defer_queue_locked();
+    if (defer_queue_.empty()) {
+        return false;
+    }
+
+    if (!force) {
+        // Backpressure (a writer parked on the residency ceiling) is the
+        // strongest tier-0 trigger: everything resident must spill so the
+        // producer can be unblocked even when the age trigger is disabled.
+        bool spill_all = pending_.size() >= residency_limit_locked();
+        bool watermark = defer_queue_.size() >= high_water_chunks_locked();
+        bool aged = false;
+        if (!spill_all && !watermark && spill_max_delay_ms_ > 0) {
+            const uint64_t front = defer_queue_.front();
+            auto it = pending_.find(front);
+            aged = it != pending_.end() &&
+                   (monotonic_ms() - it->second.defer_since_ms) >= spill_max_delay_ms_;
+        }
+        if (!spill_all && !watermark && !aged) {
+            return false;
+        }
+        force = spill_all; // spill everything only under backpressure
+    }
+
+    // Tier 0 -> tier 1. On a watermark/capacity trigger keep the lower half
+    // of the absorption budget resident, so the hottest, most recently
+    // written chunks keep coalescing while the cold ones spill. Force (a
+    // drain point) or an expired front drains everything that is due.
+    const size_t low_water = low_water_chunks_locked();
+    std::vector<uint64_t> batch;
+    while (!defer_queue_.empty()) {
+        const uint64_t front = defer_queue_.front();
+        auto it = pending_.find(front);
+        if (it == pending_.end() || !it->second.in_defer) {
+            defer_queue_.pop_front();
+            continue;
+        }
+        bool due = force;
+        if (!due) {
+            due = defer_queue_.size() > low_water;
+            if (!due && spill_max_delay_ms_ > 0) {
+                due = (monotonic_ms() - it->second.defer_since_ms) >= spill_max_delay_ms_;
+            }
+        }
+        if (!due) {
+            break;
+        }
+        defer_queue_.pop_front();
+        it->second.in_defer = false;
+        it->second.in_queue = true;
+        batch.push_back(front);
+    }
+
+    if (batch.empty()) {
+        return false;
+    }
+
+    // Spill in ascending slot order: slots are appended to the tail of the
+    // overlay file, so an ordered queue turns the spill into sequential
+    // writes instead of a random-4K storm on a mechanical disk.
+    std::sort(batch.begin(), batch.end(), [this](uint64_t a, uint64_t b) {
+        auto ia = chunk_table_.find(a);
+        auto ib = chunk_table_.find(b);
+        const uint64_t sa = (ia != chunk_table_.end()) ? ia->second : UINT64_MAX;
+        const uint64_t sb = (ib != chunk_table_.end()) ? ib->second : UINT64_MAX;
+        return sa < sb;
+    });
+    for (uint64_t chunk : batch) {
+        drain_queue_.push_back(chunk);
+    }
+    ring_work_cv_.notify_one();
+    return true;
+}
+
+void WritebackContext::place_entry_locked(uint64_t virtual_chunk, PendingWrite entry) {
+    // Tier decision: absorb in RAM while there is budget, otherwise queue for
+    // the disk. With deferral disabled (budget 0) this is always tier 1.
+    const bool defer_ok =
+        ram_writeback_bytes_ > 0 && pending_.size() < residency_limit_locked();
+    entry.in_queue = !defer_ok;
+    entry.in_defer = defer_ok;
+    entry.defer_since_ms = defer_ok ? monotonic_ms() : 0;
+
+    if (!defer_ok) {
+        pending_[virtual_chunk] = std::move(entry);
+        drain_queue_.push_back(virtual_chunk);
+        ring_work_cv_.notify_one();
+        return;
+    }
+
+    pending_[virtual_chunk] = std::move(entry);
+    defer_queue_.push_back(virtual_chunk);
+
+    // Wake the worker when it has something to decide: either the absorption
+    // budget is filling up (or a writer is parked), or this is the first
+    // deferred chunk and the worker is asleep with no timer running.
+    const bool first_defer = defer_queue_.size() == 1;
+    const bool trigger = defer_queue_.size() >= high_water_chunks_locked() ||
+                         pending_.size() >= residency_limit_locked();
+    if (first_defer || trigger) {
+        ring_work_cv_.notify_one();
+    }
+}
+
+void WritebackContext::enqueue_locked(uint64_t virtual_chunk, PendingWrite entry) {
+    entry.generation = next_generation_++;
+
+    auto it = pending_.find(virtual_chunk);
+    if (it == pending_.end()) {
+        place_entry_locked(virtual_chunk, std::move(entry));
+        return;
+    }
+
+    // Preserve tier membership so updating a hot chunk a thousand times does
+    // not queue it a thousand times, and preserve the slot-tag obligation: a
+    // chunk's slot is allocated exactly once, so the tag stays pending until
+    // the worker has actually discharged it.
+    const bool queued = it->second.in_queue;
+    const bool deferred = it->second.in_defer;
+    if (it->second.new_slot) {
+        entry.new_slot = true;
+    }
+    entry.in_queue = queued;
+    entry.in_defer = deferred;
+    entry.defer_since_ms = it->second.defer_since_ms;
+    it->second = std::move(entry);
+
+    if (queued) {
+        ring_work_cv_.notify_one();
+        return;
+    }
+    if (deferred) {
+        return; // already resident in tier 0; the age timer spills it
+    }
+
+    // Neither tier: the worker is mid-write on this chunk right now (it
+    // dropped queue membership when it popped the entry). Re-tier it from
+    // scratch as if it had just arrived.
+    PendingWrite fresh = std::move(it->second);
+    fresh.in_queue = false;
+    fresh.in_defer = false;
+    place_entry_locked(virtual_chunk, std::move(fresh));
+}
+
+// Drains the ring to the overlay file outside the logical lock so reads are
+// never blocked by writeback I/O, then re-checks under the lock whether the
+// image it pushed is still the newest one for that chunk.
+void WritebackContext::worker_loop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+        promote_deferred_locked(/*force=*/false);
+
+        if (drain_queue_.empty()) {
+            if (stop_worker_) {
+                return;
+            }
+            if (defer_queue_.empty() || spill_max_delay_ms_ == 0) {
+                // No time-based trigger: tier 0 only spills on a watermark,
+                // a parked writer or a drain point -- all of which notify.
+                ring_work_cv_.wait(lock, [this] {
+                    return stop_worker_ || !drain_queue_.empty() || !defer_queue_.empty();
+                });
+                continue;
+            }
+            // Tier 0 holds chunks: sleep only until the oldest one is due to
+            // spill (bounded by the slice so a wake-up for another reason is
+            // never delayed for long).
+            prune_defer_queue_locked();
+            uint64_t wait_ms = kMaxSpillWaitSliceMs;
+            if (!defer_queue_.empty()) {
+                auto it = pending_.find(defer_queue_.front());
+                if (it != pending_.end()) {
+                    const uint64_t deadline = it->second.defer_since_ms + spill_max_delay_ms_;
+                    const uint64_t now = monotonic_ms();
+                    wait_ms = deadline > now ? (std::min)(wait_ms, deadline - now) : 0;
+                }
+            }
+            if (wait_ms > 0) {
+                ring_work_cv_.wait_for(lock, std::chrono::milliseconds(wait_ms), [this] {
+                    return stop_worker_ || !drain_queue_.empty();
+                });
+            }
+            continue;
+        }
+
+        const uint64_t v_chunk = drain_queue_.front();
+        drain_queue_.pop_front();
+
+        auto it = pending_.find(v_chunk);
+        if (it == pending_.end()) {
+            continue; // discarded by reset()/purge() before we got to it
+        }
+        it->second.in_queue = false;
+
+        const uint64_t slot = it->second.slot;
+        const uint64_t generation = it->second.generation;
+        const bool new_slot = it->second.new_slot;
+        const uint64_t slot_size = sizeof(uint64_t) + chunk_size_;
+        std::vector<std::byte> image = it->second.image; // copy: stays readable
+        worker_busy_ = true;
+        lock.unlock();
+
+        Result<void> write_res;
+        {
+            std::lock_guard<std::mutex> io(overlay_io_mutex_);
+            if (!overlay_.is_open()) {
+                write_res = Error(ErrorCode::StorageFailure, "Writeback overlay not open");
+            } else {
+                overlay_.clear();
+                if (new_slot) {
+                    // The tag must land before the payload it describes: a
+                    // crash in between leaves a slot no reader will trust.
+                    overlay_.seekp(static_cast<std::streamoff>(
+                        sizeof(CowHeader) + slot * slot_size));
+                    overlay_.write(reinterpret_cast<const char*>(&v_chunk), sizeof(v_chunk));
+                }
+                overlay_.seekp(static_cast<std::streamoff>(
+                    sizeof(CowHeader) + slot * slot_size + sizeof(uint64_t)));
+                overlay_.write(reinterpret_cast<const char*>(image.data()),
+                               static_cast<std::streamsize>(image.size()));
+                overlay_.flush();
+                if (!overlay_) {
+                    write_res = Error(ErrorCode::StorageFailure,
+                                      "Failed to drain writeback chunk " +
+                                          std::to_string(v_chunk) + " to " +
+                                          overlay_path_.string());
+                }
+            }
+        }
+
+        lock.lock();
+        if (!write_res.is_ok()) {
+            // Keep the image resident so reads stay correct, but stop
+            // re-queueing it: the next write or flush surfaces this error
+            // instead of the ring spinning on a hole in the disk.
+            drain_failed_ = true;
+            drain_error_ = std::string(write_res.error().message());
+        } else {
+            auto still = pending_.find(v_chunk);
+            if (still != pending_.end()) {
+                if (still->second.generation == generation) {
+                    pending_.erase(still);
+                } else if (new_slot) {
+                    // A newer image superseded ours while we were on disk; the
+                    // tag we just wrote satisfies its obligation too.
+                    still->second.new_slot = false;
+                }
+            }
+            if (pending_.empty() && header_dirty_) {
+                (void)persist_header_if_settled_locked();
+            }
+        }
+        worker_busy_ = false;
+        ring_idle_cv_.notify_all();
+        ring_space_cv_.notify_all();
+    }
+}
+
 Result<void> WritebackContext::init_or_load_overlay_locked() {
     chunk_table_.clear();
     ram_cache_.clear();
     cache_order_.clear();
+    pending_.clear();
+    drain_queue_.clear();
+    defer_queue_.clear();
+    drain_failed_ = false;
+    drain_error_.clear();
 
     // Ensure parent directories exist
     if (overlay_path_.has_parent_path()) {
@@ -161,6 +543,9 @@ Result<void> WritebackContext::init_or_load_overlay_locked() {
             }
         }
         overlay_.clear();
+        Logger::default_logger().info("COW",
+            "[COW] Re-opened existing writeback overlay: " + overlay_path_.string() +
+            " (" + std::to_string(chunk_table_.size()) + " allocated chunks reloaded).");
     } else {
         overlay_.open(overlay_path_,
                       std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
@@ -174,7 +559,11 @@ Result<void> WritebackContext::init_or_load_overlay_locked() {
             overlay_.close();
             return res;
         }
+        Logger::default_logger().info("COW",
+            "[COW] Created fresh empty writeback overlay: " + overlay_path_.string());
     }
+
+    (void)mark_file_sparse(overlay_path_);
 
     return {};
 }
@@ -204,6 +593,18 @@ Result<size_t> WritebackContext::read(uint64_t offset, std::span<std::byte> dest
         uint64_t offset_in_chunk = cur_offset % chunk_size_;
         size_t to_read = std::min<size_t>(destination.size() - total_read,
                                           chunk_size_ - offset_in_chunk);
+
+        // An accepted-but-not-yet-drained write outranks everything: the ring
+        // is the source of truth for a chunk until its worker has put the
+        // bytes on the disk. Without this check a read that lands between
+        // enqueue and drain would serve the previous image.
+        auto pend = pending_.find(chunk_idx);
+        if (pend != pending_.end() && pend->second.image.size() == chunk_size_) {
+            std::memcpy(destination.data() + total_read,
+                        pend->second.image.data() + offset_in_chunk, to_read);
+            total_read += to_read;
+            continue;
+        }
 
         auto it = chunk_table_.find(chunk_idx);
         if (it == chunk_table_.end()) {
@@ -240,11 +641,19 @@ Result<size_t> WritebackContext::read(uint64_t offset, std::span<std::byte> dest
             std::vector<std::byte> full_chunk(chunk_size_);
             uint64_t file_offset = sizeof(CowHeader) + (it->second * slot_size) +
                                    sizeof(uint64_t);
-            overlay_.clear();
-            overlay_.seekg(static_cast<std::streamoff>(file_offset));
-            overlay_.read(reinterpret_cast<char*>(full_chunk.data()),
-                          static_cast<std::streamsize>(chunk_size_));
-            if (!overlay_) {
+            bool read_ok = true;
+            {
+                // The worker writes this stream concurrently, and std::fstream
+                // is not thread-safe: serialize with it even though this chunk
+                // itself is not in flight.
+                std::lock_guard<std::mutex> io(overlay_io_mutex_);
+                overlay_.clear();
+                overlay_.seekg(static_cast<std::streamoff>(file_offset));
+                overlay_.read(reinterpret_cast<char*>(full_chunk.data()),
+                              static_cast<std::streamsize>(chunk_size_));
+                read_ok = static_cast<bool>(overlay_);
+            }
+            if (!read_ok) {
                 return Error(ErrorCode::StorageFailure,
                              "Failed to read from writeback overlay");
             }
@@ -261,7 +670,7 @@ Result<size_t> WritebackContext::read(uint64_t offset, std::span<std::byte> dest
 }
 
 Result<size_t> WritebackContext::write(uint64_t offset, std::span<const std::byte> source) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (!is_open_) {
         return Error(ErrorCode::StorageFailure, "Device not open");
     }
@@ -275,11 +684,33 @@ Result<size_t> WritebackContext::write(uint64_t offset, std::span<const std::byt
     if (source.empty()) {
         return size_t{0};
     }
+    if (drain_failed_) {
+        return Error(ErrorCode::StorageFailure, drain_error_);
+    }
 
     const uint64_t slot_size = sizeof(uint64_t) + chunk_size_;
     size_t total_written = 0;
 
     while (total_written < source.size()) {
+        // Bounded residency: rather than let dirty chunks pile up without
+        // limit, apply backpressure and let the initiator wait for the worker
+        // (tier 0 spills into tier 1, tier 1 drains to disk). This is the
+        // SCSI-correct answer -- the write is not refused, it is slow.
+        ring_space_cv_.wait(lock, [this] {
+            return drain_failed_ ||
+                   pending_.size() < residency_limit_locked() ||
+                   !worker_.joinable();
+        });
+        if (drain_failed_) {
+            return Error(ErrorCode::StorageFailure, drain_error_);
+        }
+        if (pending_.size() >= residency_limit_locked()) {
+            return Error(ErrorCode::StorageFailure,
+                         "Writeback ring stalled with " +
+                             std::to_string(pending_.size()) +
+                             " chunks queued and no worker to drain them");
+        }
+
         uint64_t cur_offset = offset + total_written;
         uint64_t chunk_idx = cur_offset / chunk_size_;
         uint64_t offset_in_chunk = cur_offset % chunk_size_;
@@ -289,8 +720,23 @@ Result<size_t> WritebackContext::write(uint64_t offset, std::span<const std::byt
         auto it = chunk_table_.find(chunk_idx);
 
         if (direct_base_writes_) {
+            // Master image immutability assertion:
             // Super Client maintenance mode: the base image itself is writable,
-            // so push the bytes straight through (no overlay allocation).
+            // so push the bytes straight through (no ring involved).
+            if (!is_super_client_) {
+                // Hard panic guard: the only sanctioned direct-base write
+                // path is the super-client session. Anything else reaching
+                // here would mutate the master VHD served to every client --
+                // fail loudly and immediately rather than corrupt it.
+                Logger::default_logger().fatal(
+                    "storage",
+                    "CRITICAL INVARIANT VIOLATION: Attempted write to master VHD on "
+                    "non-superclient session!");
+                std::abort();
+            }
+            if (!base_device_ || base_device_->is_read_only()) {
+                return Error(ErrorCode::StorageFailure, "Master image is read-only; direct write rejected");
+            }
             auto base_write = base_device_->write(
                 cur_offset, source.subspan(total_written, to_write));
             if (!base_write.is_ok()) {
@@ -328,7 +774,6 @@ Result<size_t> WritebackContext::write(uint64_t offset, std::span<const std::byt
             }
 
             uint64_t slot = chunk_table_.size();
-            uint64_t slot_offset = sizeof(CowHeader) + (slot * slot_size);
 
             std::vector<std::byte> full_chunk(chunk_size_, std::byte{0});
             uint64_t base_chunk_offset = chunk_idx * chunk_size_;
@@ -345,51 +790,75 @@ Result<size_t> WritebackContext::write(uint64_t offset, std::span<const std::byt
             std::memcpy(full_chunk.data() + offset_in_chunk,
                         source.data() + total_written, to_write);
 
-            overlay_.clear();
-            overlay_.seekp(static_cast<std::streamoff>(slot_offset));
-            overlay_.write(reinterpret_cast<const char*>(&chunk_idx), sizeof(chunk_idx));
-            overlay_.write(reinterpret_cast<const char*>(full_chunk.data()),
-                           static_cast<std::streamsize>(full_chunk.size()));
-            overlay_.flush();
-            if (!overlay_) {
-                return Error(ErrorCode::StorageFailure,
-                             "Failed to allocate writeback slot for chunk " +
-                                 std::to_string(chunk_idx));
-            }
-
+            // Everything from here on is pure bookkeeping: the expensive parts
+            // (slot tag, payload, header) are handed to the ring.
             chunk_table_[chunk_idx] = slot;
-            auto header_res = persist_header_locked();
-            if (!header_res.is_ok()) {
-                return header_res.error();
-            }
-            put_cache_locked(chunk_idx, std::move(full_chunk));
+            header_dirty_ = true;
+            put_cache_locked(chunk_idx, full_chunk);
+
+            PendingWrite pw;
+            pw.image = std::move(full_chunk);
+            pw.slot = slot;
+            pw.new_slot = true;
+            enqueue_locked(chunk_idx, std::move(pw));
 
             total_written += to_write;
             continue;
         }
 
         // --- Overwrite the slice of an existing dirty slot ---
-        uint64_t slot = it->second;
-        uint64_t file_offset = sizeof(CowHeader) + (slot * slot_size) +
-                               sizeof(uint64_t) + offset_in_chunk;
-        overlay_.clear();
-        overlay_.seekp(static_cast<std::streamoff>(file_offset));
-        overlay_.write(reinterpret_cast<const char*>(source.data() + total_written),
-                       static_cast<std::streamsize>(to_write));
-        overlay_.flush();
-        if (!overlay_) {
-            return Error(ErrorCode::StorageFailure,
-                         "Failed to write to writeback overlay for chunk " +
-                             std::to_string(chunk_idx));
+        // Rebuild the authoritative full chunk first. The ring outranks the
+        // RAM cache, which outranks the file -- whichever still holds the
+        // newest image of this chunk.
+        std::vector<std::byte> full_chunk;
+        {
+            auto pend = pending_.find(chunk_idx);
+            if (pend != pending_.end() && pend->second.image.size() == chunk_size_) {
+                full_chunk = pend->second.image;
+            } else {
+                auto cached = ram_cache_.find(chunk_idx);
+                if (cached != ram_cache_.end() && cached->second.size() == chunk_size_) {
+                    full_chunk = cached->second;
+                } else {
+                    full_chunk.resize(chunk_size_);
+                    const uint64_t slot = it->second;
+                    const uint64_t file_offset = sizeof(CowHeader) + (slot * slot_size) +
+                                                 sizeof(uint64_t);
+                    bool read_ok = false;
+                    {
+                        std::lock_guard<std::mutex> io(overlay_io_mutex_);
+                        overlay_.clear();
+                        overlay_.seekg(static_cast<std::streamoff>(file_offset));
+                        overlay_.read(reinterpret_cast<char*>(full_chunk.data()),
+                                      static_cast<std::streamsize>(chunk_size_));
+                        read_ok = static_cast<bool>(overlay_);
+                    }
+                    if (!read_ok) {
+                        return Error(ErrorCode::StorageFailure,
+                                     "Failed to read writeback slot for chunk " +
+                                         std::to_string(chunk_idx));
+                    }
+                }
+            }
         }
 
-        // Write-through: keep a resident dirty chunk in sync with the file.
+        std::memcpy(full_chunk.data() + offset_in_chunk,
+                    source.data() + total_written, to_write);
+
+        // Keep a resident copy in lockstep with what the ring will write, so
+        // reads stay correct after the ring entry is retired.
         auto cached = ram_cache_.find(chunk_idx);
         if (cached != ram_cache_.end() && cached->second.size() == chunk_size_) {
-            std::memcpy(cached->second.data() + offset_in_chunk,
-                        source.data() + total_written, to_write);
+            cached->second = full_chunk;
             note_cache_hit_locked(chunk_idx);
         }
+
+        PendingWrite pw;
+        pw.image = std::move(full_chunk);
+        pw.slot = it->second;
+        // new_slot stays false here; enqueue_locked re-raises it if the slot
+        // tag for this chunk has not reached the disk yet.
+        enqueue_locked(chunk_idx, std::move(pw));
 
         total_written += to_write;
     }
@@ -398,7 +867,17 @@ Result<size_t> WritebackContext::write(uint64_t offset, std::span<const std::byt
 }
 
 Result<void> WritebackContext::flush() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    wait_ring_idle_locked(lock);
+    if (drain_failed_) {
+        return Error(ErrorCode::StorageFailure, drain_error_);
+    }
+    auto header_res = persist_header_if_settled_locked();
+    if (!header_res.is_ok()) {
+        return header_res.error();
+    }
+
+    std::lock_guard<std::mutex> io(overlay_io_mutex_);
     if (overlay_.is_open()) {
         overlay_.flush();
         if (!overlay_) {
@@ -410,7 +889,19 @@ Result<void> WritebackContext::flush() {
 }
 
 Result<void> WritebackContext::reset() noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    // Reset throws the client's dirty set away, so drain nothing: drop both
+    // tiers first, then let any I/O already on its way finish, because the
+    // worker must not be inside the stream while we recreate it below.
+    pending_.clear();
+    drain_queue_.clear();
+    defer_queue_.clear();
+    header_dirty_ = false;
+    drain_failed_ = false;
+    drain_error_.clear();
+    wait_ring_idle_locked(lock);
+
     chunk_table_.clear();
     ram_cache_.clear();
     cache_order_.clear();
@@ -438,16 +929,30 @@ Result<void> WritebackContext::reset() noexcept {
 }
 
 Result<void> WritebackContext::purge() noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (overlay_.is_open()) {
-        overlay_.flush();
-        overlay_.close();
-    }
-    overlay_.clear();
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    // Discard, do not drain -- the file is about to be deleted anyway.
+    pending_.clear();
+    drain_queue_.clear();
+    defer_queue_.clear();
+    header_dirty_ = false;
+    drain_failed_ = false;
+    drain_error_.clear();
+    wait_ring_idle_locked(lock);
+
     chunk_table_.clear();
     ram_cache_.clear();
     cache_order_.clear();
     is_open_ = false;
+
+    {
+        std::lock_guard<std::mutex> io(overlay_io_mutex_);
+        if (overlay_.is_open()) {
+            overlay_.flush();
+            overlay_.close();
+        }
+        overlay_.clear();
+    }
 
     if (overlay_path_.empty()) {
         return {};
@@ -468,9 +973,20 @@ Result<void> WritebackContext::merge_into(const std::shared_ptr<BlockDevice>& ta
         return Error(ErrorCode::StorageFailure, "Target block device cannot be null");
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (!is_open_) {
         return Error(ErrorCode::StorageFailure, "Device not open");
+    }
+
+    // merge_into reads the overlay file directly rather than going through
+    // read(), so every accepted write has to have reached the disk first.
+    wait_ring_idle_locked(lock);
+    if (drain_failed_) {
+        return Error(ErrorCode::StorageFailure, drain_error_);
+    }
+    auto header_res = persist_header_if_settled_locked();
+    if (!header_res.is_ok()) {
+        return header_res.error();
     }
 
     if (overlay_.is_open()) {
@@ -532,10 +1048,34 @@ std::shared_ptr<BlockDevice> WritebackContext::base_device() const {
     return base_device_;
 }
 
+void WritebackContext::set_super_client(bool enabled) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_super_client_ = enabled;
+    apply_direct_base_writes_locked();
+}
+
+bool WritebackContext::is_super_client() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return is_super_client_;
+}
+
 void WritebackContext::set_direct_base_writes(bool enabled) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    direct_base_writes_ = enabled;
-    if (enabled) {
+    // Direct base writes mutate the master image. The request is recorded but
+    // only honoured while this context belongs to a super-client session; for
+    // anyone else it stays refused and the hard abort guard in write() remains
+    // the last line of defense.
+    direct_base_writes_requested_ = enabled;
+    apply_direct_base_writes_locked();
+}
+
+void WritebackContext::apply_direct_base_writes_locked() {
+    const bool effective = direct_base_writes_requested_ && is_super_client_;
+    if (effective == direct_base_writes_) {
+        return;
+    }
+    direct_base_writes_ = effective;
+    if (effective) {
         // Base becomes authoritative; resident dirty copies are stale.
         ram_cache_.clear();
         cache_order_.clear();
@@ -572,6 +1112,54 @@ void WritebackContext::set_ram_cache_chunks(size_t count) noexcept {
     }
 }
 
+void WritebackContext::set_ram_writeback_bytes(uint64_t bytes) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ram_writeback_bytes_ = bytes;
+    // The residency ceiling derives from this budget unless the operator set
+    // an explicit cap; a wider ceiling may unblock a parked writer.
+    ring_space_cv_.notify_all();
+}
+
+uint64_t WritebackContext::ram_writeback_bytes() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ram_writeback_bytes_;
+}
+
+void WritebackContext::set_spill_max_delay_ms(uint32_t ms) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    spill_max_delay_ms_ = ms;
+    // A shorter delay may make the current sleep obsolete.
+    ring_work_cv_.notify_one();
+}
+
+uint32_t WritebackContext::spill_max_delay_ms() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return spill_max_delay_ms_;
+}
+
+size_t WritebackContext::deferred_chunks() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return defer_queue_.size();
+}
+
+void WritebackContext::set_writeback_ring_chunks(size_t count) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ring_limit_chunks_ = count == 0 ? 1 : count;
+    ring_explicit_ = true; // an explicit operator cap always wins
+    // Widening the limit may unblock writers parked on the old one.
+    ring_space_cv_.notify_all();
+}
+
+size_t WritebackContext::writeback_ring_chunks() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return residency_limit_locked();
+}
+
+size_t WritebackContext::pending_chunks() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pending_.size();
+}
+
 uint64_t WritebackContext::allocated_chunks() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return chunk_table_.size();
@@ -590,6 +1178,12 @@ uint32_t WritebackContext::chunk_size() const noexcept {
 uint64_t WritebackContext::virtual_capacity() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return virtual_capacity_;
+}
+
+bool WritebackContext::has_chunk(uint64_t virtual_chunk) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pending_.find(virtual_chunk) != pending_.end() ||
+           chunk_table_.find(virtual_chunk) != chunk_table_.end();
 }
 
 Result<void> WritebackContext::quarantine_corrupted_overlay(

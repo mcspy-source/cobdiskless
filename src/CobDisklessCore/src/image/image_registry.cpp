@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/image/image_registry.hpp"
 
 namespace cobdiskless {

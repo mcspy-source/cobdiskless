@@ -1,0 +1,92 @@
+﻿Boot drive with BCD: H:
+
+Windows Boot Manager
+--------------------
+identifier              {bootmgr}
+device                  partition=H:
+description             Windows Boot Manager
+locale                  en-US
+inherit                 {globalsettings}
+default                 {default}
+resumeobject            {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+displayorder            {default}
+toolsdisplayorder       {memdiag}
+timeout                 30
+
+Windows Boot Loader
+-------------------
+identifier              {default}
+device                  partition=I:
+path                    \Windows\system32\winload.exe
+description             Windows 10
+locale                  en-US
+inherit                 {bootloadersettings}
+allowedinmemorysettings 0x15000075
+osdevice                partition=I:
+systemroot              \Windows
+resumeobject            {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+nx                      OptIn
+bootmenupolicy          Standard
+
+Resume from Hibernate
+---------------------
+identifier              {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+device                  partition=I:
+path                    \Windows\system32\winresume.exe
+description             Windows Resume Application
+locale                  en-US
+inherit                 {resumeloadersettings}
+allowedinmemorysettings 0x15000075
+filedevice              partition=I:
+filepath                \hiberfil.sys
+bootmenupolicy          Standard
+debugoptionenabled      No
+
+Windows Memory Tester
+---------------------
+identifier              {memdiag}
+device                  partition=H:
+path                    \boot\memtest.exe
+description             Windows Memory Diagnostic
+locale                  en-US
+inherit                 {globalsettings}
+badmemoryaccess         Yes
+
+EMS Settings
+------------
+identifier              {emssettings}
+bootems                 No
+
+Debugger Settings
+-----------------
+identifier              {dbgsettings}
+debugtype               Local
+
+RAM Defects
+-----------
+identifier              {badmemory}
+
+Global Settings
+---------------
+identifier              {globalsettings}
+inherit                 {dbgsettings}
+                        {emssettings}
+                        {badmemory}
+
+Boot Loader Settings
+--------------------
+identifier              {bootloadersettings}
+inherit                 {globalsettings}
+                        {hypervisorsettings}
+
+Hypervisor Settings
+-------------------
+identifier              {hypervisorsettings}
+hypervisordebugtype     Serial
+hypervisordebugport     1
+hypervisorbaudrate      115200
+
+Resume Loader Settings
+----------------------
+identifier              {resumeloadersettings}
+inherit                 {globalsettings}

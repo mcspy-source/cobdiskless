@@ -1,0 +1,45 @@
+﻿=== Tcpip Parameters Interfaces ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Interfaces\{820c4568-d585-420e-94b3-aea0e0dc3402}
+    EnableDHCP    REG_DWORD    0x1
+    Domain    REG_SZ    
+    NameServer    REG_SZ    
+    DhcpIPAddress    REG_SZ    0.0.0.0
+    DhcpSubnetMask    REG_SZ    255.255.255.0
+    DhcpServer    REG_SZ    255.255.255.255
+    AddressType    REG_DWORD    0x0
+    IsServerNapAware    REG_DWORD    0x0
+    DhcpConnForceBroadcastFlag    REG_DWORD    0x0
+    DhcpNameServer    REG_SZ    1.1.1.1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Interfaces\{c07a0272-b875-11f1-91b8-806e6f6e6963}
+    DhcpIPAddress    REG_SZ    0.0.0.0
+    DhcpServer    REG_SZ    255.255.255.255
+    EnableDHCP    REG_DWORD    0x1
+
+=== Control Network ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\Descriptions
+    Realtek PCIe GbE Family Controller    REG_MULTI_SZ    1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{07374750-E68B-490E-9330-9FD785CD71B6}
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{07374750-E68B-490E-9330-9FD785CD71B6}\Connection
+    Name    REG_SZ    6to4 Adapter
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{2EE2C70C-A092-4D88-A654-98C8D7645CD5}
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{2EE2C70C-A092-4D88-A654-98C8D7645CD5}\Connection
+    Name    REG_SZ    Microsoft IP-HTTPS Platform Interface
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{820C4568-D585-420E-94B3-AEA0E0DC3402}
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{820C4568-D585-420E-94B3-AEA0E0DC3402}\Connection
+    Name    REG_SZ    Ethernet
+    PnPInstanceId    REG_SZ    PCI\VEN_10EC&DEV_8168&SUBSYS_307C17AA&REV_06\01000000684CE00000
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{93123211-9629-4E04-82F0-EA2E4F221468}
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}\{93123211-9629-4E04-82F0-EA2E4F221468}\Connection
+    Name    REG_SZ    Teredo Tunneling Pseudo-Interface
+

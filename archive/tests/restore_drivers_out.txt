@@ -1,0 +1,6 @@
+﻿Starting...
+Windows drive: I:
+Restored msiscsi.sys from I:\Windows\System32\DriverStore\FileRepository\iscsi.inf_amd64_a0af6a89760de7bd\msiscsi.sys (ver: 10.0.26100.1150 (WinBuild.160101.0800))
+Current ndis.sys ver: 10.0.17763.1 (WinBuild.160101.0800)
+Current tcpip.sys ver: 10.0.17763.1 (WinBuild.160101.0800)
+Done.

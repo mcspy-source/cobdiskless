@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/storage/storage_manager.hpp"
 #include "CobDisklessCore/logging/logger.hpp"
 #include <fstream>

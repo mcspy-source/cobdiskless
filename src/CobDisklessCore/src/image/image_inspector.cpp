@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
 #include "CobDisklessCore/storage/vhdx_image_backend.hpp"
@@ -481,8 +483,8 @@ void ImageInspector::determine_boot_mode(
     ImageInspectionReport& report
 ) {
     bool has_uefi = report.has_esp || report.has_efi_boot_files;
-    bool has_bios = report.has_bios_bootmgr || report.has_active_boot_partition ||
-                   (report.partition_scheme == PartitionScheme::Mbr && report.has_mbr_bootstrap_code);
+    bool has_bios = (report.partition_scheme == PartitionScheme::Mbr) &&
+                    (report.has_bios_bootmgr || report.has_active_boot_partition || report.has_mbr_bootstrap_code);
 
     if (has_uefi && has_bios) {
         report.boot_mode = BootMode::Dual;

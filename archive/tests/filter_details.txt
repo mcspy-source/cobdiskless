@@ -1,0 +1,18 @@
+﻿=== Filter GUID: {EA24CD6C-D17A-4348-9190-09F0D5BE83DD} ===
+
+End of search: 0 match(es) found.
+=== Filter GUID: {3BFD7820-D65C-4C1B-9FEA-983A019639EA} ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e974-e325-11ce-bfc1-08002be10318}\{3BFD7820-D65C-4C1B-9FEA-983A019639EA}
+
+End of search: 1 match(es) found.
+=== Filter GUID: {B70D6460-3635-4D42-B866-B8AB1A24454C} ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Network\{4d36e974-e325-11ce-bfc1-08002be10318}\{B70D6460-3635-4D42-B866-B8AB1A24454C}
+
+End of search: 1 match(es) found.
+=== Adapter 0000 UpperBind ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage
+    UpperBind    REG_MULTI_SZ    Ndisuio\0RasPppoe\0RDMANDK\0Tcpip\0Tcpip6
+

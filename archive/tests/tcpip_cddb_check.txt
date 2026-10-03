@@ -1,0 +1,118 @@
+﻿=== TCPIP PARAMETERS ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters
+    DataBasePath    REG_EXPAND_SZ    %SystemRoot%\System32\drivers\etc
+    Domain    REG_SZ    
+    ForwardBroadcasts    REG_DWORD    0x0
+    ICSDomain    REG_SZ    mshome.net
+    IPEnableRouter    REG_DWORD    0x0
+    NameServer    REG_SZ    
+    SyncDomainWithMembership    REG_DWORD    0x1
+    NV Hostname    REG_SZ    DESKTOP-E3GSP6V
+    DhcpNameServer    REG_SZ    1.1.1.1
+    Hostname    REG_SZ    DESKTOP-E3GSP6V
+    DisableTaskOffload    REG_DWORD    0x1
+    TcpMaxDataRetransmissions    REG_DWORD    0xa
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Adapters
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Adapters\{820c4568-d585-420e-94b3-aea0e0dc3402}
+    LLInterface    REG_SZ    
+    IpConfig    REG_MULTI_SZ    Tcpip\Parameters\Interfaces\{820C4568-D585-420E-94B3-AEA0E0DC3402}
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\DNSRegisteredAdapters
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Interfaces
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Interfaces\{820c4568-d585-420e-94b3-aea0e0dc3402}
+    EnableDHCP    REG_DWORD    0x1
+    Domain    REG_SZ    
+    NameServer    REG_SZ    
+    DhcpIPAddress    REG_SZ    192.168.1.5
+    DhcpSubnetMask    REG_SZ    255.255.255.0
+    DhcpServer    REG_SZ    192.168.1.100
+    Lease    REG_DWORD    0x15180
+    LeaseObtainedTime    REG_DWORD    0x6ab7eb21
+    T1    REG_DWORD    0x6ab893e1
+    T2    REG_DWORD    0x6ab91271
+    LeaseTerminatesTime    REG_DWORD    0x6ab93ca1
+    AddressType    REG_DWORD    0x0
+    IsServerNapAware    REG_DWORD    0x0
+    DhcpConnForceBroadcastFlag    REG_DWORD    0x0
+    DhcpNameServer    REG_SZ    1.1.1.1
+    DhcpDefaultGateway    REG_MULTI_SZ    192.168.1.1
+    DhcpSubnetMaskOpt    REG_MULTI_SZ    255.255.255.0
+    DhcpInterfaceOptions    REG_BINARY    FC000000000000000000000000000000CDA8000079000000000000000000000000000000CDA8000077000000000000000000000000000000CDA800002F000000000000000000000000000000CDA800002E000000000000000000000000000000CDA800002C000000000000000000000000000000CDA800002B000000000000000000000000000000CDA8000021000000000000000000000000000000CDA800001F000000000000000000000000000000CDA800000F000000000000000000000000000000CDA80000060000000000000004000000000000000D01518001010101030000000000000004000000000000000D015180C0A80101010000000000000004000000000000000D015180FFFFFF00330000000000000004000000000000000D01518000015180360000000000000004000000000000000D015180C0A80164350000000000000001000000000000000D015180050000002A0000000000000008000000000000000E015180D8EF2304C005292942000000000000000E000000000000000E015180746674703A2F2F302E302E302E300000780000000000000017000000000000000E0151800006716379736263046674746804706C6474036E657400007D0000000000000020000000000000000E01518000000DE91B0406303045303443050C50524C4E30434234393741310603494744010000000000000000000000010000000D0000003D0000000000000007000000000000000E015180018C89A591E8E1000C000000000000000F000000000000000E0151804445534B544F502D4533475350365600
+    DhcpGatewayHardware    REG_BINARY    C0A801010600000090610CB497A1
+    DhcpGatewayHardwareCount    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Interfaces\{c07a0272-b875-11f1-91b8-806e6f6e6963}
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\NsiObjectSecurity
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\PersistentRoutes
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Winsock
+    UseDelayedAcceptance    REG_DWORD    0x0
+    MaxSockAddrLength    REG_DWORD    0x10
+    MinSockAddrLength    REG_DWORD    0x10
+    HelperDllName    REG_EXPAND_SZ    %SystemRoot%\System32\wshtcpip.dll
+    ProviderGUID    REG_BINARY    A01A0FE78BABCF118CA300805F48A192
+    OfflineCapable    REG_DWORD    0x1
+    Mapping    REG_BINARY    08000000030000000200000001000000060000000200000001000000000000000200000000000000060000000200000002000000110000000200000002000000000000000200000000000000110000000200000003000000FF000000020000000300000000000000
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Winsock\0
+    Version    REG_DWORD    0x2
+    AddressFamily    REG_DWORD    0x2
+    MaxSockAddrLength    REG_DWORD    0x10
+    MinSockAddrLength    REG_DWORD    0x10
+    SocketType    REG_DWORD    0x1
+    Protocol    REG_DWORD    0x6
+    ProtocolMaxOffset    REG_DWORD    0x0
+    ByteOrder    REG_DWORD    0x0
+    MessageSize    REG_DWORD    0x0
+    szProtocol    REG_EXPAND_SZ    @%SystemRoot%\System32\mswsock.dll,-60100
+    ProviderFlags    REG_DWORD    0x8
+    ServiceFlags    REG_DWORD    0x20066
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Winsock\1
+    Version    REG_DWORD    0x2
+    AddressFamily    REG_DWORD    0x2
+    MaxSockAddrLength    REG_DWORD    0x10
+    MinSockAddrLength    REG_DWORD    0x10
+    SocketType    REG_DWORD    0x2
+    Protocol    REG_DWORD    0x11
+    ProtocolMaxOffset    REG_DWORD    0x0
+    ByteOrder    REG_DWORD    0x0
+    MessageSize    REG_DWORD    0xfff7
+    szProtocol    REG_EXPAND_SZ    @%SystemRoot%\System32\mswsock.dll,-60101
+    ProviderFlags    REG_DWORD    0x8
+    ServiceFlags    REG_DWORD    0x20609
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Winsock\2
+    Version    REG_DWORD    0x2
+    AddressFamily    REG_DWORD    0x2
+    MaxSockAddrLength    REG_DWORD    0x10
+    MinSockAddrLength    REG_DWORD    0x10
+    SocketType    REG_DWORD    0x3
+    Protocol    REG_DWORD    0x0
+    ProtocolMaxOffset    REG_DWORD    0xff
+    ByteOrder    REG_DWORD    0x0
+    MessageSize    REG_DWORD    0x8000
+    szProtocol    REG_EXPAND_SZ    @%SystemRoot%\System32\mswsock.dll,-60102
+    ProviderFlags    REG_DWORD    0xc
+    ServiceFlags    REG_DWORD    0x20609
+
+=== CRITICAL DEVICE DATABASE ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_tcpip_cddb.ps1:14 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Control\Critical ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== DISK TIMEOUT VALUE ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\disk
+    TimeOutValue    REG_DWORD    0x3c
+

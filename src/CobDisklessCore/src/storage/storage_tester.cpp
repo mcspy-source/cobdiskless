@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/storage/storage_tester.hpp"
 #include <fstream>
 #include <vector>

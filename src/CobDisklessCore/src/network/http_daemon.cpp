@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/network/http_daemon.hpp"
 
 #include <algorithm>
@@ -11,10 +13,13 @@
 
 #include "CobDisklessCore/logging/logger.hpp"
 #include "CobDisklessCore/config/simple_json.hpp"
+#include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/network/cob_rename_script.hpp"
 #include "CobDisklessCore/network/host_network.hpp"
 #include "CobDisklessCore/network/ipxe_script.hpp"
+#include "CobDisklessCore/types/common_types.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
+#include "CobDisklessCore/client/client_session.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -490,6 +495,16 @@ std::shared_ptr<StationManager> HttpDaemon::station_manager_copy() const {
     return station_mgr_;
 }
 
+void HttpDaemon::set_session_manager(std::shared_ptr<ClientSessionManager> manager) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    session_mgr_ = std::move(manager);
+}
+
+std::shared_ptr<ClientSessionManager> HttpDaemon::session_manager_copy() const {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    return session_mgr_;
+}
+
 void HttpDaemon::set_server_ip(NetworkAddress ip) {
     std::lock_guard<std::mutex> lock(config_mutex_);
     server_ip_ = ip;
@@ -508,6 +523,30 @@ void HttpDaemon::set_target_iqn(std::string iqn) {
 void HttpDaemon::set_initiator_prefix(std::string prefix) {
     std::lock_guard<std::mutex> lock(config_mutex_);
     initiator_prefix_ = std::move(prefix);
+}
+
+void HttpDaemon::set_image_boot_mode_resolver(ImageBootModeResolver fn) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    image_boot_mode_fn_ = std::move(fn);
+}
+
+void HttpDaemon::set_image_search_dirs(std::vector<std::filesystem::path> dirs) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    image_search_dirs_ = std::move(dirs);
+    // A new search root can point at a different copy of the same filename;
+    // the old memo would keep answering for the previous one.
+    std::lock_guard<std::mutex> cache_lock(image_cache_mutex_);
+    image_boot_mode_cache_.clear();
+}
+
+void HttpDaemon::set_image_path_aliases(
+    std::vector<std::pair<std::string, std::filesystem::path>> aliases) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    image_path_aliases_ = std::move(aliases);
+    // The memo keys on the resolved path; a different id -> path mapping can
+    // answer for the same image id, so it has to be re-probed.
+    std::lock_guard<std::mutex> cache_lock(image_cache_mutex_);
+    image_boot_mode_cache_.clear();
 }
 
 void HttpDaemon::set_http_port(uint16_t port) noexcept {
@@ -531,6 +570,176 @@ std::string HttpDaemon::sanboot_script_body() const {
         options.initiator_prefix = initiator_prefix_;
     }
     return ipxe::sanboot_script(options);
+}
+
+std::optional<std::string> HttpDaemon::station_boot_script_body(const std::string& peer_ip,
+                                                                const std::string& query_mac,
+                                                                std::optional<std::string> query_platform) const {
+    std::shared_ptr<StationManager> smgr = station_manager_copy();
+    if (!smgr) {
+        return std::nullopt;
+    }
+
+    // Dual key, in the order the hierarchy specifies. An explicit ?mac= is the
+    // client telling us who it is, so it outranks anything we could infer; the
+    // caller socket IP stays the fallback for a bare /boot.ipxe. Resolving by IP
+    // alone was the defect: a PC that had been handed another PC's address bound
+    // to that other record and booted someone else's OS image.
+    std::optional<StationEntry> st;
+    if (!query_mac.empty()) {
+        st = smgr->find_by_mac(query_mac); // normalizes + returns nullopt if unknown
+    }
+    if (!st.has_value() && !peer_ip.empty()) {
+        st = smgr->find_by_ip(peer_ip);
+    }
+    if (!st.has_value() || st->name.empty()) {
+        // Station not registered or unidentifiable: return nullopt so HttpDaemon can
+        // self-chain (hop 1) or present the interactive enrollment prompt (hop 2).
+        return std::nullopt;
+    }
+
+    if (st->image == "(None)" || st->image == "(None - Unassigned)" || st->image == "none") {
+        Logger::default_logger().warn(
+            "BOOT",
+            "[BOOT] Station [" + st->name + " | " + st->mac + "] has no OS image assigned. Serving unassigned station notice.");
+        std::string script;
+        script += "#!ipxe\n";
+        script += "colour --rgb 0xffaa00 0 ||\n";
+        script += "colour --rgb 0x000000 7 ||\n";
+        script += "clear\n";
+        script += "echo ===============================================================================\n";
+        script += "echo   CobDiskless Diskless Boot Engine\n";
+        script += "echo ===============================================================================\n";
+        script += "echo\n";
+        script += "echo   Station Name : " + st->name + "\n";
+        script += "echo   MAC Address  : " + st->mac + "\n";
+        script += "echo   Status       : No OS Image Assigned\n";
+        script += "echo\n";
+        script += "echo   NOTICE: This station is registered, but NO operating system image (VHD)\n";
+        script += "echo   has been assigned to it yet.\n";
+        script += "echo\n";
+        script += "echo   Please open the CobDiskless Management Console, edit this station to\n";
+        script += "echo   assign an OS image, or select a 'Default OS Image' under OS Images tab.\n";
+        script += "echo\n";
+        script += "echo ===============================================================================\n";
+        script += "prompt --key 0x02 --timeout 30000 Press Ctrl-B for shell or wait to reboot... || reboot\n";
+        script += "shell\n";
+        return script;
+    }
+
+    // --- Subsystem B: firmware/image mismatch guard ------------------------
+    //
+    // Judged before any script is built, because the whole point is that the
+    // blocked path never emits an attach command. The guard needs both halves:
+    // what the image demands (from its partition layout) and what the client
+    // actually is (from `${platform}`). The image half is resolved first so a
+    // station with no inspectable image skips the extra hop entirely.
+    const std::optional<ImageBootFacts> facts = resolve_image_boot_facts(st->image);
+    const bool decidable = facts.has_value() &&
+                           (facts->boot_mode == BootMode::Bios ||
+                            facts->boot_mode == BootMode::Uefi);
+    if (decidable) {
+        if (!query_platform.has_value() && st->last_arch.empty()) {
+            // DHCP handed out a bare URL and no Option 93 arch was recorded, so the
+            // firmware class is the only missing half. Ask for it exactly once;
+            // the chained request always carries the key, so this cannot recurse.
+            return platform_probe_script_body(st->mac);
+        }
+
+        std::optional<ipxe::ClientPlatform> client_platform;
+        std::string platform_token;
+        if (query_platform.has_value()) {
+            client_platform = ipxe::parse_client_platform(*query_platform);
+            platform_token = *query_platform;
+        } else if (!st->last_arch.empty()) {
+            client_platform = ipxe::parse_client_platform(st->last_arch);
+            platform_token = st->last_arch;
+        }
+
+        if (client_platform.has_value() &&
+            ipxe::is_platform_mismatch(*client_platform, facts->boot_mode, facts->scheme)) {
+            Logger::default_logger().error(
+                "HTTP",
+                "[HTTP] [BOOT GUARD] Boot blocked for " + st->name + " [" + st->mac + "]: client is " +
+                    std::string(ipxe::to_string(*client_platform)) + " but image '" + st->image +
+                    "' requires " + facts->describe());
+
+            Logger::default_logger().info(
+                "BOOT",
+                "[BOOT] Station [" + st->name + " | " + st->mac + "] BootMode: " +
+                std::string(ipxe::to_string(*client_platform)) + " | Image: '" + st->image +
+                "' (" + facts->describe() + ") | Verdict: BLOCKED (FIRMWARE_MISMATCH)");
+
+            ipxe::PlatformMismatchOptions options;
+            options.station_name = st->name;
+            options.station_mac = st->mac;
+            options.image_name = st->image;
+            options.client_platform = *client_platform;
+            options.platform_token = platform_token;
+            options.image_mode = facts->boot_mode;
+            options.image_format = facts->describe();
+            return ipxe::platform_mismatch_script(options);
+        }
+    }
+
+    NetworkAddress srv;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        srv = server_ip_;
+    }
+    const std::string server = srv.is_any() ? std::string("${next-server}") : srv.ip_string();
+
+    // The station's dedicated target IQN. The iSCSI target resolves this suffix
+    // back to the station's own assigned VHD, so a CSM image and a UEFI image
+    // served side by side can never be cross-wired by a fallback default.
+    const std::string iqn = "iqn.2026-09.com.cobdiskless:" + st->name;
+
+    std::string mode = normalize_boot_mode(st->boot_mode);
+
+    std::string boot_mode_str = mode.empty() ? "auto" : mode;
+    std::string img_desc = facts.has_value() ? facts->describe() : "Raw/Unknown";
+    Logger::default_logger().info(
+        "BOOT",
+        "[BOOT] Station [" + st->name + " | " + st->mac + "] BootMode: " +
+        boot_mode_str + " | Image: '" + st->image + "' (" + img_desc + ") | Verdict: PERMITTED");
+
+    // Cold physical reboot detected via /boot.ipxe: reset the station's writeback overlay
+    // so this fresh boot starts from a clean baseline.
+    if (auto smgr_sess = session_manager_copy()) {
+        (void)smgr_sess->reset_client(ClientId(st->mac));
+        Logger::default_logger().info(
+            "BOOT",
+            "[BOOT] Station [" + st->name + " | " + st->mac +
+            "] writeback overlay reset for cold physical reboot.");
+    }
+
+    const std::string iscsi_target = "iscsi:" + server + "::::" + iqn;
+
+    std::string script;
+    script += "#!ipxe\n";
+    script += "dhcp net0\n";
+    script += "set net0/gateway 0.0.0.0\n";
+    script += "set keep-san 1\n";
+    script += "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n";
+    if (mode == "bios") {
+        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
+        script += "sanboot --drive 0x80\n";
+    } else if (mode == "uefi") {
+        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
+        script += "sanboot --drive 0x80\n";
+    } else {
+        script += "# boot_mode=auto: the running firmware decides BIOS vs UEFI\n";
+        script += "iseq ${platform} pcbios && goto boot_bios || goto boot_uefi\n";
+        script += ":boot_uefi\n";
+        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
+        script += "sanboot --drive 0x80\n";
+        script += "goto boot_done\n";
+        script += ":boot_bios\n";
+        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
+        script += "sanboot --drive 0x80\n";
+        script += ":boot_done\n";
+    }
+    return script;
 }
 
 std::string HttpDaemon::enrollment_script_body() const {
@@ -560,6 +769,194 @@ std::string HttpDaemon::self_chain_script_body() const {
     }
     const std::string url = "http://" + host + ":" + std::to_string(port) + "/boot.ipxe";
     return ipxe::self_chain_script(url);
+}
+
+std::string HttpDaemon::platform_probe_script_body(const std::string& mac) const {
+    std::string host;
+    uint16_t port = 0;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        host = (server_ip_.is_any() || server_ip_.is_loopback())
+            ? std::string("${next-server}")
+            : server_ip_.ip_string();
+        port = (bound_port_.load() != 0) ? bound_port_.load() : http_port_.load();
+    }
+    std::string url = "http://" + host + ":" + std::to_string(port) + "/boot.ipxe";
+    // The MAC pins the second hop to this same station record, so the probe
+    // cannot drift onto a neighbour when the caller was resolved by IP.
+    const std::string safe_mac = ipxe::sanitize_script_value(mac, 32);
+    if (!safe_mac.empty()) {
+        url += "?mac=" + safe_mac;
+    }
+    return ipxe::platform_probe_script(url);
+}
+
+namespace {
+
+/// Case-insensitive ASCII comparison used when matching image ids to file names.
+[[nodiscard]] bool iequals_ascii(const std::string_view a, const std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        const auto lhs = static_cast<unsigned char>(a[i]);
+        const auto rhs = static_cast<unsigned char>(b[i]);
+        if (std::tolower(lhs) != std::tolower(rhs)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Container extensions the image pipeline can boot and inspect. Anything else
+/// sitting in a search directory (a hive backup, a `.txt` note) must never be
+/// resolved as the assigned OS image just because its stem happens to match.
+[[nodiscard]] bool is_image_container_extension(const std::string_view ext) {
+    return iequals_ascii(ext, ".vhd") || iequals_ascii(ext, ".vhdx") ||
+           iequals_ascii(ext, ".img") || iequals_ascii(ext, ".raw");
+}
+
+}  // namespace
+
+std::optional<std::filesystem::path> HttpDaemon::resolve_image_path(
+    const std::string& image_name,
+    const std::vector<std::filesystem::path>& search_dirs,
+    const std::vector<std::pair<std::string, std::filesystem::path>>& aliases) {
+    std::error_code ec;
+    const std::filesystem::path direct(image_name);
+    if (std::filesystem::is_regular_file(direct, ec)) {
+        return direct;
+    }
+
+    // config.json records the mapping explicitly:
+    //   { "id": "csmw10", "path": "./images/csmw10.VHD" }
+    // The station registry stores the id, so this is the authoritative answer.
+    for (const auto& [id, path] : aliases) {
+        if (iequals_ascii(id, image_name) && std::filesystem::is_regular_file(path, ec)) {
+            return path;
+        }
+    }
+
+    for (const auto& dir : search_dirs) {
+        if (dir.empty()) {
+            continue;
+        }
+        const std::filesystem::path candidate = dir / image_name;
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return candidate;
+        }
+    }
+
+    // Finally the case the station registry actually uses: an image *id*
+    // (`csmw10`) standing in for a file name (`csmw10.VHD`). Probing
+    // `dir / "csmw10"` alone can never match, and that miss is what used to
+    // leave the firmware guard permanently open -- so a UEFI client was
+    // served a Legacy-BIOS sanboot and died in iPXE's EFI block driver.
+    // Match on the stem so the id finds the file in any case and with any
+    // supported container extension.
+    for (const auto& dir : search_dirs) {
+        if (dir.empty()) {
+            continue;
+        }
+        std::error_code iter_ec;
+        std::filesystem::directory_iterator it(dir, iter_ec);
+        if (iter_ec) {
+            continue;
+        }
+        const std::filesystem::directory_iterator end;
+        for (; it != end; it.increment(iter_ec)) {
+            if (iter_ec) {
+                break;
+            }
+            std::error_code entry_ec;
+            const std::filesystem::path& p = it->path();
+            if (!it->is_regular_file(entry_ec)) {
+                continue;
+            }
+            if (!is_image_container_extension(p.extension().string())) {
+                continue;
+            }
+            if (iequals_ascii(p.stem().string(), image_name) ||
+                iequals_ascii(p.filename().string(), image_name)) {
+                return p;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ImageBootFacts> HttpDaemon::resolve_image_boot_facts(
+    const std::string& image_name) const {
+    if (image_name.empty()) {
+        return std::nullopt;
+    }
+
+    ImageBootModeResolver resolver;
+    std::vector<std::filesystem::path> search_dirs;
+    std::vector<std::pair<std::string, std::filesystem::path>> aliases;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        resolver = image_boot_mode_fn_;
+        search_dirs = image_search_dirs_;
+        aliases = image_path_aliases_;
+    }
+    if (resolver) {
+        return resolver(image_name);
+    }
+
+    const std::optional<std::filesystem::path> path =
+        resolve_image_path(image_name, search_dirs, aliases);
+    if (!path.has_value()) {
+        return std::nullopt;
+    }
+
+    // Validate the memo against the file itself rather than a TTL: an operator
+    // swapping a UEFI image in behind the same filename must be picked up on
+    // the very next boot, and an unchanged file must not be re-probed at all.
+    std::error_code ec;
+    const std::uintmax_t size = std::filesystem::file_size(*path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    const auto mtime = std::filesystem::last_write_time(*path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+
+    const std::string key = path->string();
+    {
+        std::lock_guard<std::mutex> lock(image_cache_mutex_);
+        const auto it = image_boot_mode_cache_.find(key);
+        if (it != image_boot_mode_cache_.end() &&
+            it->second.size == size && it->second.mtime == mtime) {
+            return it->second.facts;
+        }
+    }
+
+    const Result<ImageInspectionReport> report = ImageInspector::inspect(*path);
+    if (!report.is_ok()) {
+        // Fail open: a locked or unreadable image leaves the guard disabled for
+        // this request rather than turning a probing problem into a boot outage.
+        Logger::default_logger().warn(
+            "HTTP",
+            "[HTTP] Firmware guard could not inspect '" + image_name + "': " +
+                report.error().to_string());
+        return std::nullopt;
+    }
+
+    ImageBootFacts facts;
+    facts.boot_mode = report.value().boot_mode;
+    facts.scheme = report.value().partition_scheme;
+
+    {
+        std::lock_guard<std::mutex> lock(image_cache_mutex_);
+        // Bounded so a stream of one-off probe paths cannot grow this forever.
+        if (image_boot_mode_cache_.size() >= 256) {
+            image_boot_mode_cache_.clear();
+        }
+        image_boot_mode_cache_[key] = ImageBootModeCacheEntry{facts, size, mtime};
+    }
+    return facts;
 }
 
 std::string HttpDaemon::rename_script_body() const {
@@ -768,18 +1165,20 @@ HttpResponse HttpDaemon::staged_response(std::string_view body) const {
                              state->target_vhd_path.string());
     }
 
-    // 2. Arm the hive. This enforces Start=0, BootFlags=0x1, Group=NDIS and the
-    //    Realtek *EEE/PowerSavingMode suppression inside PnpDriverArmer.
+    // 2. Arm the hive. This enforces Start=0 for the boot services, BootFlags=0x1
+    //    on the network-facing ones, and Group (SCSI Miniport / NDIS / PNP_TDI)
+    //    wherever the image has none yet. Anything PnP-shaped lives in
+    //    archive/pnp_dccb/ and is no longer reachable from here.
     HiveArmingFunction arming;
     {
         std::lock_guard<std::mutex> lock(config_mutex_);
         arming = hive_arming_fn_;
     }
 
-    Result<PnpDriverArmReport> armed =
+    Result<BootStartArmReport> armed =
         arming ? arming(arm_target)
-               : (via_vhd_image ? PnpDriverArmer::arm_vhd_image(arm_target)
-                                : PnpDriverArmer::arm_offline_system_hive(arm_target));
+               : (via_vhd_image ? RegBootStart::arm_vhd_image(arm_target)
+                                : RegBootStart::arm_offline_system_hive(arm_target));
 
     if (armed.is_err()) {
         return fail_json(500, state->status,
@@ -787,7 +1186,7 @@ HttpResponse HttpDaemon::staged_response(std::string_view body) const {
                              std::string(armed.error().message()));
     }
 
-    const PnpDriverArmReport& report = armed.value();
+    const BootStartArmReport& report = armed.value();
     if (!report.success || !report.boot_flags_armed || !report.iscsi_stack_armed) {
         std::string details = report.message;
         for (const auto& warning : report.warnings) {
@@ -805,7 +1204,7 @@ HttpResponse HttpDaemon::staged_response(std::string_view body) const {
     }
 
     Logger::default_logger().info(
-        "PNP",
+        "BOOTSTART",
         "Staged client " + norm_mac + " armed from " + arm_target.string() +
             " (" + std::to_string(report.armed_services.size()) + " services)");
 
@@ -813,6 +1212,136 @@ HttpResponse HttpDaemon::staged_response(std::string_view body) const {
     payload["status"] = "READY";
     payload["armed"] = true;
     return HttpResponse::ok(payload.dump(0), "application/json; charset=utf-8");
+}
+
+HttpResponse HttpDaemon::enroll_client_response(std::string_view body) const {
+    auto parsed = JsonValue::parse(body);
+    if (!parsed || !parsed->is_object()) {
+        return HttpResponse::fail(400, "Invalid JSON body in enrollment request");
+    }
+    const auto& json_val = *parsed;
+
+    std::string mac_raw;
+    if (const JsonValue* v = json_val.find("mac")) mac_raw = v->as_string();
+    if (mac_raw.empty() || !ClientDatabase::is_valid_mac(mac_raw)) {
+        return HttpResponse::fail(400, "Missing or malformed required parameter: mac");
+    }
+    const std::string norm_mac = ClientDatabase::normalize_mac(mac_raw);
+
+    std::string uuid, hw_id, sub_id, rev, dev_inst, model_id, driver_name;
+    if (const JsonValue* v = json_val.find("uuid")) uuid = v->as_string();
+    if (const JsonValue* v = json_val.find("hardware_id")) hw_id = v->as_string();
+    if (const JsonValue* v = json_val.find("subsystem_id")) sub_id = v->as_string();
+    if (const JsonValue* v = json_val.find("revision")) rev = v->as_string();
+    if (const JsonValue* v = json_val.find("device_instance")) dev_inst = v->as_string();
+    if (const JsonValue* v = json_val.find("model_id")) model_id = v->as_string();
+    if (const JsonValue* v = json_val.find("driver_name")) driver_name = v->as_string();
+
+    if (model_id.empty()) {
+        if (!hw_id.empty()) {
+            model_id = hw_id;
+            for (auto& c : model_id) {
+                if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+            }
+        } else {
+            model_id = norm_mac;
+            for (auto& c : model_id) {
+                if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+            }
+        }
+    }
+
+    std::shared_ptr<ClientDatabase> db;
+    std::shared_ptr<StationManager> smgr;
+    std::shared_ptr<ClientManager> cmgr;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        db = client_db_;
+        smgr = station_mgr_;
+        cmgr = client_mgr_;
+    }
+
+    // 1. Resolve or create persistent hardware layer (Layer 1)
+    std::filesystem::path hw_dir = "hardware_profiles";
+    std::error_code ec_hw;
+    std::filesystem::create_directories(hw_dir, ec_hw);
+    std::filesystem::path hw_file = hw_dir / ("hw_" + model_id + ".vhdx");
+    if (!std::filesystem::exists(hw_file, ec_hw)) {
+        std::ofstream ofs(hw_file, std::ios::binary);
+        std::vector<uint8_t> dummy(65536, 0);
+        ofs.write(reinterpret_cast<const char*>(dummy.data()), static_cast<std::streamsize>(dummy.size()));
+        ofs.close();
+    }
+
+    std::string pc_name;
+    NetworkAddress assigned_ip;
+
+    // 2. Persist in ClientDatabase / MachineStore
+    if (db) {
+        auto existing = db->find_client_by_mac(norm_mac);
+        if (!existing.has_value()) {
+            std::string auto_name = "PC-" + (norm_mac.size() >= 5 ? norm_mac.substr(norm_mac.size() - 5) : "NEW");
+            auto_name.erase(std::remove(auto_name.begin(), auto_name.end(), ':'), auto_name.end());
+            auto reg_res = db->enroll_client(norm_mac, auto_name);
+            if (reg_res.is_ok()) {
+                pc_name = reg_res.value().hostname;
+                assigned_ip = reg_res.value().ip_address;
+            } else {
+                pc_name = auto_name;
+            }
+        } else {
+            pc_name = existing->hostname;
+            assigned_ip = existing->ip_address;
+        }
+
+        if (auto opt_rec = db->store()->find(norm_mac)) {
+            MachineRecord rec = *opt_rec;
+            rec.uuid = uuid;
+            rec.is_validated = true;
+            rec.provisioning = "READY";
+            rec.hardware_id = hw_id;
+            rec.subsystem_id = sub_id;
+            rec.revision = rev;
+            rec.device_instance = dev_inst;
+            rec.hardware_profile = "hw_" + model_id + ".vhdx";
+            rec.hardware_layer_path = hw_file.string();
+            if (rec.name.empty()) rec.name = pc_name;
+            db->store()->put(rec);
+        }
+    }
+
+    if (smgr) {
+        if (auto opt_st = smgr->find_by_mac(norm_mac)) {
+            pc_name = opt_st->name;
+        } else {
+            StationEntry se;
+            se.mac = norm_mac;
+            se.name = pc_name.empty() ? ("PC-" + norm_mac.substr(norm_mac.size() - 4)) : pc_name;
+            se.ip = assigned_ip;
+            se.status = "active";
+            se.image = "default";
+            se.boot_mode = "auto";
+            (void)smgr->add_or_update_station(se);
+            pc_name = se.name;
+        }
+    }
+
+    if (cmgr) {
+        (void)cmgr->complete_staging(norm_mac);
+    }
+
+    Logger::default_logger().info(
+        "ENROLL",
+        "[ENROLL] Client [" + norm_mac + " | " + pc_name + "] hardware profile registered & validated: Layer 1 = " + hw_file.string());
+
+    JsonValue resp = JsonValue::make_object();
+    resp["status"] = "OK";
+    resp["is_validated"] = true;
+    resp["mac"] = norm_mac;
+    resp["pc_name"] = pc_name;
+    resp["hardware_profile"] = "hw_" + model_id + ".vhdx";
+    resp["hardware_layer"] = hw_file.filename().string();
+    return HttpResponse::ok(resp.dump(0), "application/json; charset=utf-8");
 }
 
 HttpResponse HttpDaemon::static_file_response(const std::string& relative_path) const {
@@ -964,7 +1493,7 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
     // POST is accepted exclusively on the staging callback so every other route
     // keeps its historical 405 answer for anything that is not GET/HEAD/PUT/DELETE.
     constexpr const char* kStagedPath = "/api/client/staged";
-    if (path == kStagedPath) {
+    if (path == kStagedPath || path == "/api/v1/client/enroll" || path == "/api/client/enroll") {
         if (method != "POST") {
             return HttpResponse::fail(405, "Method Not Allowed");
         }
@@ -987,8 +1516,29 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
     const std::string req_mac = param("mac");
     const std::string req_name = param("name");
 
+    // Presence, not emptiness, is what matters here: a missing `platform` key
+    // means the client never told us its firmware (bare DHCP URL), while an
+    // empty value means it told us nothing useful. Only the former may buy
+    // another round trip; the latter must settle the request as-is, otherwise
+    // an odd client could be asked the same question forever.
+    const std::optional<std::string> req_platform =
+        params.find("platform") != params.end()
+            ? std::optional<std::string>{param("platform")}
+            : std::nullopt;
+
+    // Presence again, for the same reason. /boot.ipxe re-chains itself with
+    // `?mac=${net0/mac}` when the first hop arrives bare, and that expansion
+    // can come back empty. An empty-but-present `mac` key still has to count
+    // as an answer, or the very branch doing the chaining would fire again on
+    // the second hop and loop forever.
+    const bool mac_param_present = params.find("mac") != params.end();
+
     if (path == kStagedPath) {
         return staged_response(body);
+    }
+
+    if (path == "/api/v1/client/enroll" || path == "/api/client/enroll") {
+        return enroll_client_response(body);
     }
 
     if (path == "/api/boot-script") {
@@ -1006,22 +1556,152 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         return static_file_response(path.substr(std::string_view("/static/").size()));
     }
 
+    if (path.rfind("/boot/", 0) == 0) {
+        std::string asset_name = std::string(path.substr(6));
+        while (!asset_name.empty() && (asset_name.front() == '/' || asset_name.front() == '\\')) {
+            asset_name.erase(asset_name.begin());
+        }
+        std::vector<std::string> candidates = {
+            "boot/" + asset_name,
+            "wim/" + asset_name,
+            asset_name
+        };
+        if (asset_name == "cob_pe.wim") {
+            candidates.push_back("boot/boot.wim");
+            candidates.push_back("wim/boot.wim");
+            candidates.push_back("boot.wim");
+        } else if (asset_name == "BCD" || asset_name == "bcd") {
+            candidates.push_back("boot/BCD");
+            candidates.push_back("wim/BCD");
+            candidates.push_back("BCD");
+            candidates.push_back("boot/bcd");
+            candidates.push_back("wim/bcd");
+            candidates.push_back("bcd");
+        }
+        for (const auto& cand : candidates) {
+            auto res = static_file_response(cand);
+            if (res.status == 200) {
+                return res;
+            }
+        }
+        return HttpResponse::fail(404, "Not Found: " + asset_name);
+    }
+
     if (path == "/boot.ipxe" || path == "/boot.ipxe/") {
         std::shared_ptr<ClientDatabase> db;
+        std::shared_ptr<StationManager> smgr;
+        std::shared_ptr<ClientManager> cmgr;
         {
             std::lock_guard<std::mutex> lock(config_mutex_);
             db = client_db_;
+            smgr = station_mgr_;
+            cmgr = client_mgr_;
         }
 
-        // If a specific client MAC query parameter is provided and that MAC is
-        // not yet enrolled in the database, present the interactive enrollment prompt.
-        // In all other cases (bare /boot.ipxe or registered client), immediately serve
-        // the minimal and clean SANBoot script.
-        if (!req_mac.empty() && (!db || !db->find_client_by_mac(req_mac).has_value())) {
+        // 1. Station lookup: explicit assignment in StationManager first
+        if (auto station_script =
+                station_boot_script_body(std::string(peer_ip), req_mac, req_platform);
+            station_script.has_value()) {
+            return HttpResponse::ok(*station_script, ipxe::kScriptContentType);
+        }
+
+        // 2. Bare first hop (no MAC specified) -> self-chain with MAC, UUID, and platform
+        if (!mac_param_present) {
+            return HttpResponse::ok(self_chain_script_body(), ipxe::kScriptContentType);
+        }
+
+        // Empty MAC (e.g. ?mac=) -> fall through to enrollment prompt
+        if (req_mac.empty()) {
             return HttpResponse::ok(enrollment_script_body(), ipxe::kScriptContentType);
         }
 
-        return HttpResponse::ok(sanboot_script_body(), ipxe::kScriptContentType);
+        std::string norm_mac = ClientDatabase::normalize_mac(req_mac);
+
+        // 3. If no uuid is present in the request (legacy interactive enrollment flow)
+        if (params.find("uuid") == params.end()) {
+            if (db && db->find_client_by_mac(norm_mac).has_value()) {
+                return HttpResponse::ok(sanboot_script_body(), ipxe::kScriptContentType);
+            }
+            return HttpResponse::ok(enrollment_script_body(), ipxe::kScriptContentType);
+        }
+
+        // 4. Zero-Touch Onboarding flow (with UUID / automated enrollment)
+        std::string req_uuid = param("uuid");
+
+        bool has_validated_hardware = false;
+        std::string target_iqn_str;
+
+        if (cmgr) {
+            auto cst = cmgr->find_boot_state(norm_mac);
+            if (cst.has_value() && cst->status == ClientBootStatus::Ready) {
+                has_validated_hardware = true;
+                if (!cst->target_iqn.empty()) target_iqn_str = cst->target_iqn;
+            }
+        }
+        if (!has_validated_hardware && db) {
+            auto client_opt = db->find_client_by_mac(norm_mac);
+            if (client_opt.has_value()) {
+                if (auto rec = db->store()->find(norm_mac)) {
+                    if (rec->is_validated || rec->provisioning == "READY") {
+                        has_validated_hardware = true;
+                    }
+                    if (!rec->target_iqn.empty()) target_iqn_str = rec->target_iqn;
+                }
+            }
+        }
+
+        std::string host;
+        uint16_t port;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            host = (server_ip_.is_any() || server_ip_.is_loopback())
+                ? std::string("${next-server}")
+                : server_ip_.ip_string();
+            port = (bound_port_.load() != 0) ? bound_port_.load() : http_port_.load();
+            if (target_iqn_str.empty()) {
+                target_iqn_str = target_iqn_.empty()
+                    ? ("iqn.2026-10.local.cobdiskless:client-" + norm_mac)
+                    : target_iqn_;
+            }
+        }
+
+        if (has_validated_hardware) {
+            // Case A: Validated Hardware Profile Exists -> Native iSCSI Boot Script
+            Logger::default_logger().info("BOOT",
+                "[BOOT] Validated hardware profile found for [" + norm_mac +
+                "] -> Serving native iSCSI boot script");
+
+            if (auto smgr_sess = session_manager_copy()) {
+                (void)smgr_sess->reset_client(ClientId(norm_mac));
+            }
+
+            return HttpResponse::ok(
+                ipxe::native_iscsi_boot_script(host, norm_mac, target_iqn_str),
+                ipxe::kScriptContentType
+            );
+        }
+
+        // Case B: Unknown Client OR Unvalidated Hardware -> WinPE bootstrap environment
+        Logger::default_logger().info("BOOT",
+            "[BOOT] Unknown/Unvalidated client [" + norm_mac + " | UUID: " + req_uuid +
+            "] -> Diverting into in-RAM WinPE bootstrap environment (wimboot)");
+
+        if (db && !db->find_client_by_mac(norm_mac).has_value()) {
+            MachineRecord new_rec;
+            new_rec.mac = norm_mac;
+            new_rec.uuid = req_uuid;
+            new_rec.is_validated = false;
+            new_rec.provisioning = "UNPROFILED";
+            std::string auto_name = "PC-" + (norm_mac.size() >= 5 ? norm_mac.substr(norm_mac.size() - 5) : "NEW");
+            auto_name.erase(std::remove(auto_name.begin(), auto_name.end(), ':'), auto_name.end());
+            new_rec.name = auto_name;
+            db->store()->put(new_rec);
+        }
+
+        return HttpResponse::ok(
+            ipxe::winpe_bootstrap_script(host, port),
+            ipxe::kScriptContentType
+        );
     }
 
     if (path == "/api/enroll") {
@@ -1041,9 +1721,13 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         }
 
         std::shared_ptr<ClientDatabase> db;
+        std::shared_ptr<StationManager> smgr;
+        std::shared_ptr<ClientManager> cmgr;
         {
             std::lock_guard<std::mutex> lock(config_mutex_);
             db = client_db_;
+            smgr = station_mgr_;
+            cmgr = client_mgr_;
         }
         if (!db) {
             return HttpResponse::fail(503, "Client database unavailable");
@@ -1052,10 +1736,17 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         const std::string norm_mac = ClientDatabase::normalize_mac(req_mac);
         const std::string norm_hostname = hostname_check.value();
 
-        // Idempotent re-enrollment: the same MAC asking for the same name it
-        // already owns simply replays the boot script (no power cycle needed).
+        // Idempotent re-enrollment: if this MAC is already enrolled with the
+        // identical hostname, return the boot script rather than an error so a
+        // rebooting client can simply proceed without being stuck.
         if (const auto existing = db->find_client_by_mac(norm_mac)) {
             if (norm_hostname == existing->hostname) {
+                if (smgr) {
+                    if (auto st_script = station_boot_script_body(std::string(peer_ip), norm_mac, req_platform);
+                        st_script.has_value()) {
+                        return HttpResponse::ok(*st_script, ipxe::kScriptContentType);
+                    }
+                }
                 return HttpResponse::ok(sanboot_script_body(), ipxe::kScriptContentType);
             }
             return HttpResponse::fail(
@@ -1069,13 +1760,51 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
             return HttpResponse::fail(status, std::string(enrolled.error().message()));
         }
 
+        NetworkAddress enrolled_ip = enrolled.value().ip_address;
+        if ((enrolled_ip.is_any() || enrolled_ip.octet(0) == 0) && !peer_ip.empty()) {
+            enrolled_ip = NetworkAddress::parse(std::string(peer_ip));
+        }
+
+        if (smgr) {
+            StationEntry new_station;
+            new_station.name = norm_hostname;
+            new_station.mac = norm_mac;
+            new_station.ip = enrolled_ip;
+            new_station.image = smgr->default_image();
+            new_station.boot_mode = "auto";
+            new_station.status = "active";
+            if (req_platform.has_value()) {
+                auto p = ipxe::parse_client_platform(*req_platform);
+                if (p == ipxe::ClientPlatform::LegacyBios) new_station.last_arch = "bios";
+                else if (p == ipxe::ClientPlatform::NativeUefi) new_station.last_arch = "uefi";
+            }
+            (void)smgr->add_or_update_station(new_station);
+        }
+
+        if (cmgr) {
+            ClientRecord cr;
+            cr.mac_address = norm_mac;
+            cr.pc_name = norm_hostname;
+            cr.ip_address = enrolled_ip;
+            cr.os_image_id = smgr ? smgr->default_image() : "";
+            cr.enabled = true;
+            cr.group = "Default";
+            (void)cmgr->add_or_update_client(cr);
+        }
+
         Logger::default_logger().info(
             "ENROLL",
             "Enrolled " + enrolled.value().hostname + " [" + norm_mac + "] at " +
-                enrolled.value().ip_address.ip_string() + " (image: " +
-                (enrolled.value().base_image.empty() ? std::string("<unassigned>")
-                                                     : enrolled.value().base_image) +
+                enrolled_ip.ip_string() + " (image: " +
+                (smgr && !smgr->default_image().empty() ? smgr->default_image() : (enrolled.value().base_image.empty() ? std::string("<unassigned>") : enrolled.value().base_image)) +
                 ")");
+
+        if (smgr) {
+            if (auto st_script = station_boot_script_body(std::string(peer_ip), norm_mac, req_platform);
+                st_script.has_value()) {
+                return HttpResponse::ok(*st_script, ipxe::kScriptContentType);
+            }
+        }
 
         return HttpResponse::ok(sanboot_script_body(), ipxe::kScriptContentType);
     }
@@ -1251,9 +1980,13 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         }
 
         std::shared_ptr<StationManager> smgr;
+        std::shared_ptr<ClientDatabase> db;
+        std::shared_ptr<ClientManager> cmgr;
         {
             std::lock_guard<std::mutex> lock(config_mutex_);
             smgr = station_mgr_;
+            db = client_db_;
+            cmgr = client_mgr_;
         }
         if (!smgr) {
             return HttpResponse::fail(503, "Station manager unavailable");
@@ -1264,21 +1997,95 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         if (!existing.has_value()) {
             return HttpResponse::fail(404, "Station not found: " + req_mac);
         }
+        StationEntry updated = existing.value();
 
         // Parse the JSON body for fields to update
         auto parsed = JsonValue::parse(std::string(body));
-        StationEntry updated = existing.value();
         if (parsed.has_value() && parsed->is_object()) {
             if (const JsonValue* v = parsed->find("name"))           updated.name = v->as_string();
-            if (const JsonValue* v = parsed->find("image"))          updated.image = v->as_string();
+            if (const JsonValue* v = parsed->find("image")) {
+                updated.image = v->as_string();
+                if (updated.image == "(None)" || updated.image == "(None - Unassigned)" || updated.image == "none" || updated.image == "(Default)") {
+                    updated.image = "";
+                }
+            }
             if (const JsonValue* v = parsed->find("boot_mode"))      updated.boot_mode = v->as_string();
             if (const JsonValue* v = parsed->find("uefi_bootloader"))updated.uefi_bootloader = v->as_string();
             if (const JsonValue* v = parsed->find("status"))         updated.status = v->as_string();
         }
 
+        // Check for duplicate station name assigned to a different MAC
+        if (!updated.name.empty()) {
+            if (auto other_st = smgr->find_by_name(updated.name); other_st.has_value() && other_st->mac != norm_mac) {
+                return HttpResponse::fail(400, "PC Name '" + updated.name + "' is already assigned to MAC " + other_st->mac);
+            }
+            if (cmgr) {
+                if (auto other_cm = cmgr->find_by_name(updated.name); other_cm.has_value() && other_cm->mac_address != norm_mac) {
+                    return HttpResponse::fail(400, "PC Name '" + updated.name + "' is already assigned to MAC " + other_cm->mac_address);
+                }
+            }
+            if (db) {
+                if (auto other_db = db->find_client_by_hostname(updated.name); other_db.has_value() && other_db->mac_address != norm_mac) {
+                    return HttpResponse::fail(400, "PC Name '" + updated.name + "' is already assigned to MAC " + other_db->mac_address);
+                }
+            }
+        }
+
+        // Firmware & Partition Validation: prevent silent 0x80 boot hangs
+        const std::string nmode = normalize_boot_mode(updated.boot_mode);
+        if (nmode != "auto" && !updated.image.empty()) {
+            const auto facts = resolve_image_boot_facts(updated.image);
+            if (facts.has_value()) {
+                std::string err_msg;
+                if (nmode == "bios" && (facts->scheme == PartitionScheme::Gpt || facts->boot_mode == BootMode::Uefi)) {
+                    err_msg = "Firmware mismatch: Client '" + updated.name + "' (" + norm_mac +
+                              ") is configured for CSM/BIOS boot, but assigned image '" + updated.image +
+                              "' has a GPT partition table (UEFI). Booting this image on BIOS will hang (0x80).";
+                } else if (nmode == "uefi" && facts->scheme == PartitionScheme::Mbr &&
+                           facts->boot_mode != BootMode::Dual && facts->boot_mode != BootMode::Uefi) {
+                    err_msg = "Firmware mismatch: Client '" + updated.name + "' (" + norm_mac +
+                              ") is configured for UEFI boot, but assigned image '" + updated.image +
+                              "' has an MBR-only partition table (BIOS). Booting this image on UEFI will hang (0x80).";
+                }
+
+                if (!err_msg.empty()) {
+                    Logger::default_logger().error("HTTP", "[PUT /station] " + err_msg);
+                    JsonValue err_payload = JsonValue::make_object();
+                    err_payload["error"] = "Firmware and partition scheme mismatch";
+                    err_payload["message"] = err_msg;
+                    err_payload["warning"] = "FIRMWARE_MISMATCH";
+                    err_payload["details"] = err_msg;
+                    err_payload["mac"] = norm_mac;
+                    err_payload["boot_mode"] = nmode;
+                    err_payload["image"] = updated.image;
+                    err_payload["partition_scheme"] = std::string(to_string(facts->scheme));
+                    err_payload["image_boot_mode"] = std::string(to_string(facts->boot_mode));
+                    HttpResponse resp = HttpResponse::ok(err_payload.dump(0), "application/json; charset=utf-8");
+                    resp.status = 400;
+                    return resp;
+                }
+            }
+        }
+
         auto res = smgr->add_or_update_station(updated);
         if (!res.is_ok()) {
             return HttpResponse::fail(500, std::string(res.error().message()));
+        }
+        (void)smgr->save();
+
+        // Synchronize with client_database_ and client_manager_
+        if (db) {
+            (void)db->enroll_client(norm_mac, updated.name, updated.image);
+            (void)db->save();
+        }
+        if (cmgr) {
+            if (auto rec = cmgr->find_by_mac(norm_mac); rec.has_value()) {
+                ClientRecord cr = *rec;
+                cr.pc_name = updated.name;
+                cr.os_image_id = updated.image;
+                (void)cmgr->add_or_update_client(cr);
+                (void)cmgr->save_to_file();
+            }
         }
 
         JsonValue payload = JsonValue::make_object();
@@ -1299,9 +2106,13 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         }
 
         std::shared_ptr<StationManager> smgr;
+        std::shared_ptr<ClientDatabase> db;
+        std::shared_ptr<ClientManager> cmgr;
         {
             std::lock_guard<std::mutex> lock(config_mutex_);
             smgr = station_mgr_;
+            db = client_db_;
+            cmgr = client_mgr_;
         }
         if (!smgr) {
             return HttpResponse::fail(503, "Station manager unavailable");
@@ -1309,8 +2120,17 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
 
         const std::string norm_mac = StationManager::normalize_mac(req_mac);
         auto res = smgr->remove_station(norm_mac);
-        if (!res.is_ok()) {
-            return HttpResponse::fail(404, std::string(res.error().message()));
+        if (res.is_err()) {
+            return HttpResponse::fail(404, "Station not found: " + req_mac);
+        }
+        (void)smgr->save();
+        if (db) {
+            (void)db->remove_client(norm_mac);
+            (void)db->save();
+        }
+        if (cmgr) {
+            (void)cmgr->remove_client(norm_mac);
+            (void)cmgr->save_to_file();
         }
 
         JsonValue payload = JsonValue::make_object();

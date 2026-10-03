@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
 #include <cstring>
 #include <system_error>
@@ -109,7 +111,8 @@ bool VhdImageBackend::is_vhd(const std::filesystem::path& path) {
 
 Result<std::shared_ptr<VhdImageBackend>> VhdImageBackend::open(
     const std::filesystem::path& path,
-    bool read_only
+    bool read_only,
+    ReadOnlyAttributePolicy attribute_policy
 ) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec) {
@@ -127,7 +130,8 @@ Result<std::shared_ptr<VhdImageBackend>> VhdImageBackend::open(
     backend->read_only_ = read_only;
 
     auto open_res = backend->file_.open(path, read_only ? RandomAccessFile::Access::ReadOnly
-                                                        : RandomAccessFile::Access::ReadWrite);
+                                                        : RandomAccessFile::Access::ReadWrite,
+                                        attribute_policy);
     if (!open_res.is_ok()) {
         return open_res.error();
     }
@@ -413,6 +417,17 @@ Result<void> VhdImageBackend::flush() {
         return file_.flush();
     }
     return {};
+}
+
+bool VhdImageBackend::has_block(uint64_t offset) const noexcept {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (metadata_.format == ImageFormat::VhdFixed) {
+        return offset < metadata_.virtual_size;
+    }
+    if (metadata_.block_size == 0) return false;
+    uint64_t block_index = offset / metadata_.block_size;
+    if (block_index >= bat_.size()) return false;
+    return bat_[block_index] != 0xFFFFFFFF;
 }
 
 } // namespace cobdiskless

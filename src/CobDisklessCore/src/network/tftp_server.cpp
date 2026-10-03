@@ -1,4 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/network/tftp_server.hpp"
+#include "CobDisklessCore/config/configuration.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/logging/logger.hpp"
@@ -215,17 +218,18 @@ Result<std::vector<uint8_t>> TftpServer::get_file_content(const std::string& fil
         }
     }
 
-    std::vector<std::filesystem::path> search_paths = {
-        root_dir_ / filename,
-        std::filesystem::path("./tftp_boot") / filename,
-        std::filesystem::path("./tftp") / filename,
-        std::filesystem::path("../tftp_boot") / filename,
-        std::filesystem::current_path() / "tftp_boot" / filename,
-        std::filesystem::current_path() / "tftp" / filename
-    };
+    auto search_dirs = Configuration::candidate_tftp_boot_paths(root_dir_);
+    if (!root_dir_.empty()) {
+        bool has_root = false;
+        for (const auto& d : search_dirs) {
+            if (d == root_dir_) { has_root = true; break; }
+        }
+        if (!has_root) search_dirs.insert(search_dirs.begin(), root_dir_);
+    }
 
     std::error_code ec;
-    for (const auto& path : search_paths) {
+    for (const auto& dir : search_dirs) {
+        std::filesystem::path path = dir / filename;
         if (std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec)) {
             std::ifstream in(path, std::ios::binary);
             if (in.is_open()) {
@@ -236,18 +240,18 @@ Result<std::vector<uint8_t>> TftpServer::get_file_content(const std::string& fil
         }
     }
 
-    // Case-insensitive lookup in tftp_boot and root_dir_
+    // Case-insensitive lookup across all candidate boot directories
     auto try_ci_lookup = [&](const std::filesystem::path& dir) -> std::optional<std::vector<uint8_t>> {
         if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) {
             return std::nullopt;
         }
         std::string lower_fn = filename;
-        for (auto& c : lower_fn) c = static_cast<char>(std::tolower(c));
+        for (auto& c : lower_fn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
             if (entry.is_regular_file(ec)) {
                 std::string ename = entry.path().filename().string();
                 std::string lower_en = ename;
-                for (auto& c : lower_en) c = static_cast<char>(std::tolower(c));
+                for (auto& c : lower_en) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (lower_en == lower_fn) {
                     std::ifstream in(entry.path(), std::ios::binary);
                     if (in.is_open()) {
@@ -260,9 +264,11 @@ Result<std::vector<uint8_t>> TftpServer::get_file_content(const std::string& fil
         return std::nullopt;
     };
 
-    if (auto c1 = try_ci_lookup(root_dir_)) return *c1;
-    if (auto c2 = try_ci_lookup("./tftp_boot")) return *c2;
-    if (auto c3 = try_ci_lookup(std::filesystem::current_path() / "tftp_boot")) return *c3;
+    for (const auto& dir : search_dirs) {
+        if (auto ci_match = try_ci_lookup(dir)) {
+            return *ci_match;
+        }
+    }
 
     return Error(ErrorCode::StorageFailure, "File not found: " + filename);
 }
@@ -407,7 +413,7 @@ Result<TftpReadRequest> TftpServer::parse_rrq(std::span<const uint8_t> packet) {
                 uint64_t requested = 0;
                 if (parse_u64(value, requested) && requested >= kMinBlockSize) {
                     // Clamp, never reject: RFC 2347 lets the server return a smaller value
-                    // and the client must accept it. 1468 -> 1428 keeps every DATA packet
+                    // and the client must accept it. 1468 -> 1432 keeps every DATA packet
                     // below the standard MTU instead of relying on IP fragmentation.
                     const uint64_t clamped = (requested > kMaxBlockSize) ? kMaxBlockSize : requested;
                     request.options.has_blksize = true;
@@ -735,10 +741,17 @@ void TftpServer::run_server_loop() {
                 if (options.has_blksize) opt_desc += " blksize=" + std::to_string(options.blksize);
                 if (options.has_tsize) opt_desc += " tsize=" + std::to_string(options.tsize);
                 if (options.has_timeout) opt_desc += " timeout=" + std::to_string(options.timeout);
+                // This is the line PXE-E32 is diagnosed from, so it must describe what
+                // the reply will ACTUALLY do -- announcing an OACK that never goes out
+                // is the very misreading this trace exists to prevent.
                 Logger::default_logger().info(
                     "TFTP",
                     "[TFTP] RRQ '" + filename + "' from " + src_endpoint + " requested options:" + opt_desc +
-                        "; answering with OACK (opcode 6) then DATA block 1, local IP " + dest_ip_buf);
+                        (options.requires_oack()
+                             ? "; answering with OACK (opcode 6) then DATA block 1, local IP "
+                             : "; tsize-only request, OACK bypassed for broken Option ROMs, answering "
+                               "with immediate DATA block 1, local IP ") +
+                        dest_ip_buf);
             }
 
             Logger::default_logger().info("BOOT", "[BOOT STAGE 6] TFTP request received: Client=" + client_ip + ":" + std::to_string(ntohs(client_addr.sin_port)) + " File='" + filename + "'");
@@ -926,7 +939,7 @@ void TftpServer::run_server_loop() {
                 // it report a truncated download after a perfectly complete transfer.
                 if (options.has_tsize) options.tsize = total_size;
 
-                // Compact option summary for the session trace ("blksize=1428 tsize=2000 ->
+                // Compact option summary for the session trace ("blksize=1432 tsize=2000 ->
                 // OACK", or "none (RFC 1350)").
                 std::string option_desc;
                 if (options.empty()) {
@@ -941,7 +954,9 @@ void TftpServer::run_server_loop() {
                         if (!option_desc.empty()) option_desc += " ";
                         option_desc += "timeout=" + std::to_string(options.timeout);
                     }
-                    option_desc += " -> OACK";
+                    option_desc += options.requires_oack()
+                                       ? " -> OACK"
+                                       : " -> immediate DATA block 1 (tsize-only, OACK bypassed)";
                 }
                 Logger::default_logger().info(
                     "TFTP",
@@ -1121,12 +1136,23 @@ void TftpServer::run_server_loop() {
                     return 0;
                 };
 
-                // RFC 2347: the client asked for options, so an OACK MUST precede any DATA
-                // and the transfer waits here for ACK block 0. Answering with DATA block 1
-                // is precisely what left ROMs that understood their own RRQ sitting in
-                // PXE-E32 "TFTP open timeout" -- the server and the client were waiting on
-                // each other forever.
-                if (!options.empty()) {
+                // RFC 2347: when the client asked for an option that actually negotiates
+                // the transfer, an OACK MUST precede any DATA and the transfer waits here
+                // for ACK block 0. Answering with DATA block 1 in that case is precisely
+                // what left ROMs that understood their own RRQ sitting in PXE-E32 "TFTP
+                // open timeout" -- the server and the client were waiting on each other
+                // forever.
+                //
+                // A `tsize`-only RRQ is the inverse trap and is why this is gated on
+                // requires_oack() rather than "the client sent any option". Those requests
+                // come from broken Lenovo/Realtek Option ROMs that never answer an OACK,
+                // so negotiating here deadlocks exactly the same way: we block on ACK
+                // block 0 while the ROM waits for DATA that never comes. They do consume
+                // plain DATA, so skip the OACK entirely. No intermediate session state is
+                // needed to do that -- block_num=1 and offset=0 below already mean "data
+                // streaming", so control falls straight through to DATA block 1. The file
+                // size simply never gets echoed, which is the cost of a boot that finishes.
+                if (options.requires_oack()) {
                     const std::vector<uint8_t> oack = TftpServer::create_oack_packet(options);
                     Logger::default_logger().info("TFTP", "Dispatching OACK for '" + filename + "' (" +
                                                    std::to_string(oack.size()) + " bytes) from TID " +

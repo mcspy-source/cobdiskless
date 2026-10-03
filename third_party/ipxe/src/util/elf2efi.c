@@ -219,6 +219,9 @@
 #ifndef R_X86_64_REX_GOTPCRELX
 #define R_X86_64_REX_GOTPCRELX 42
 #endif
+#ifndef R_X86_64_RELATIVE
+#define R_X86_64_RELATIVE 8
+#endif
 
 /**
  * Alignment of raw data of sections in the image file
@@ -657,6 +660,53 @@ static void set_machine ( struct elf_file *elf, struct pe_header *pe_header ) {
 }
 
 /**
+ * Check whether section belongs in the output image
+ *
+ * @v shdr		ELF section header
+ * @ret is_image	Section contents form part of the image
+ *
+ * Only allocated, non-relocation sections form part of the image.  When
+ * linking as a position independent executable, the linker additionally
+ * allocates the dynamic relocation records and dynamic linking metadata
+ * within the image.  Neither has any consumer within an EFI image, which
+ * has no dynamic loader, and neither has recognisable PE section
+ * characteristics.  Relocation records must still fall through to be
+ * processed as relocations; the dynamic metadata is dropped entirely.
+ *
+ * A plain static link allocates none of these sections, and so is
+ * unaffected.
+ */
+static int is_image_section ( const Elf_Shdr *shdr ) {
+
+	if ( ! ( shdr->sh_flags & SHF_ALLOC ) )
+		return 0;
+
+	switch ( shdr->sh_type ) {
+	case SHT_REL:
+	case SHT_RELA:
+	case SHT_HASH:
+	case SHT_DYNAMIC:
+	case SHT_DYNSYM:
+	case SHT_STRTAB:
+#ifdef SHT_GNU_HASH
+	case SHT_GNU_HASH:
+#endif
+#ifdef SHT_GNU_verdef
+	case SHT_GNU_verdef:
+#endif
+#ifdef SHT_GNU_verneed
+	case SHT_GNU_verneed:
+#endif
+#ifdef SHT_GNU_versym
+	case SHT_GNU_versym:
+#endif
+		return 0;
+	default:
+		return 1;
+	}
+}
+
+/**
  * Process section
  *
  * @v elf		ELF file
@@ -946,6 +996,17 @@ static void process_reloc ( struct elf_file *elf, const Elf_Shdr *shdr,
 			/* Ignore label difference relocations since
 			 * we do not perform any relocations that can
 			 * result in altered label differences.
+			 */
+			break;
+		case ELF_MREL ( EM_X86_64, R_X86_64_RELATIVE ) :
+			/* Ignore dynamic relocations.  These are
+			 * generated only when linking as a position
+			 * independent executable, and duplicate,
+			 * address for address, the coverage already
+			 * provided by the static relocation records
+			 * retained via --emit-relocs.  An EFI image
+			 * has no dynamic loader, and emitting both
+			 * would add the load address twice.
 			 */
 			break;
 		case ELF_MREL ( EM_X86_64, R_X86_64_32 ) :
@@ -1254,7 +1315,7 @@ static void elf2pe ( const char *elf_name, const char *pe_name,
 		shdr = ( elf.data + offset );
 
 		/* Process section */
-		if ( shdr->sh_flags & SHF_ALLOC ) {
+		if ( is_image_section ( shdr ) ) {
 
 			/* Create output section */
 			*(next_pe_section) = process_section ( &elf, shdr,

@@ -393,6 +393,55 @@ static int realtek_phy_speed ( struct realtek_nic *rtl ) {
 }
 
 /**
+ * Disable Energy Efficient Ethernet (EEE / 802.3az) advertisement
+ *
+ * @v rtl		Realtek device
+ *
+ * Access MMD device 7 (Auto-Negotiation), register 0x003c, and
+ * advertise no EEE modes at all (0 Mbps), so that the PHY never
+ * enters a low-power LPI state in the middle of a boot transfer.
+ *
+ * Failures are ignored, since these registers are absent on some
+ * PHYs (e.g. RTL8101), in the same manner as the MMD_DATA errata
+ * write in realtek_phy_reset().
+ */
+static void realtek_disable_eee ( struct realtek_nic *rtl ) {
+
+	mii_write ( &rtl->mii, MII_MMD_CTRL, 0x0007 );
+	mii_write ( &rtl->mii, MII_MMD_DATA, 0x003c );
+	mii_write ( &rtl->mii, MII_MMD_CTRL, 0x4007 );
+	mii_write ( &rtl->mii, MII_MMD_DATA, 0x0000 );
+	mii_write ( &rtl->mii, MII_MMD_CTRL, 0x0000 );
+}
+
+/**
+ * Clear Advanced Link Down Power Saving (ALDPS) while preserving MII page 0
+ *
+ * @v rtl		Realtek device
+ *
+ * Page 0 is selected explicitly before and after the update, since
+ * the page register (0x1f) is sticky and would otherwise leave
+ * subsequent MII operations (e.g. mii_restart()) addressing the
+ * wrong page.
+ *
+ * Failures are ignored, since the register is absent on some PHYs.
+ */
+static void realtek_disable_aldps ( struct realtek_nic *rtl ) {
+	int val;
+
+	/* Ensure page 0 is selected */
+	mii_write ( &rtl->mii, 0x1f, 0x0000 );
+
+	/* Read register 0x15 and clear bit 12 (ALDPS enable) */
+	val = mii_read ( &rtl->mii, 0x15 );
+	if ( ( val >= 0 ) && ( val & 0x1000 ) )
+		mii_write ( &rtl->mii, 0x15, ( val & ~0x1000 ) );
+
+	/* Explicitly restore page 0 so subsequent MII operations succeed */
+	mii_write ( &rtl->mii, 0x1f, 0x0000 );
+}
+
+/**
  * Reset PHY
  *
  * @v rtl		Realtek device
@@ -430,6 +479,14 @@ static int realtek_phy_reset ( struct realtek_nic *rtl ) {
 		 * present on all PHYs.
 		 */
 	}
+
+	/* Disable green/low-power modes that drop link during
+	 * preboot transfers.  These must be cleared before restarting
+	 * autonegotiation, so that the new negotiation round does not
+	 * re-advertise EEE.
+	 */
+	realtek_disable_eee ( rtl );
+	realtek_disable_aldps ( rtl );
 
 	/* Restart autonegotiation */
 	if ( ( rc = mii_restart ( &rtl->mii ) ) != 0 ) {
@@ -681,6 +738,8 @@ static int realtek_open ( struct net_device *netdev ) {
 	struct realtek_nic *rtl = netdev->priv;
 	uint32_t tcr;
 	uint32_t rcr;
+	unsigned int link_wait;
+	int bmsr;
 	int rc;
 
 	/* Create transmit descriptor ring */
@@ -722,7 +781,30 @@ static int realtek_open ( struct net_device *netdev ) {
 	/* Fill receive ring */
 	realtek_refill_rx ( rtl );
 
-	/* Update link state */
+	/* Wait up to 2500ms for PHY autonegotiation to settle and
+	 * link-up, rather than returning instantaneously.  Sample the
+	 * link only once both the link status bit and the autoneg
+	 * completion bit are valid, since a partially negotiated link
+	 * would drop frames during the subsequent boot transfer.
+	 * Skip the wait on devices without PHY register access (e.g.
+	 * RTL8139), where mii_read() would fail immediately.
+	 */
+	if ( rtl->have_phy_regs ) {
+		for ( link_wait = 0 ; link_wait < 2500 ; link_wait++ ) {
+			bmsr = mii_read ( &rtl->mii, MII_BMSR );
+			if ( bmsr < 0 )
+				break;
+			if ( ( bmsr & BMSR_LSTATUS ) &&
+			     ( bmsr & BMSR_ANEGCOMPLETE ) ) {
+				DBGC ( rtl, "REALTEK %p: Link established in "
+				       "%d ms\n", rtl, link_wait );
+				break;
+			}
+			mdelay ( 1 );
+		}
+	}
+
+	/* Refresh operational link state */
 	realtek_check_link ( netdev );
 
 	return 0;
@@ -1086,6 +1168,13 @@ static void realtek_detect ( struct realtek_nic *rtl ) {
 		rtl->have_phy_regs = 1;
 		rtl->tppoll = RTL_TPPOLL_8169;
 		dma_set_mask_64bit ( rtl->dma );
+
+		/* Prevent unintended 160us packet delivery delays on
+		 * 8168/8169 silicon by disabling interrupt mitigation.
+		 * This must happen after realtek_reset(), which would
+		 * otherwise restore the hardware default.
+		 */
+		writew ( 0, rtl->regs + RTL_INTRMITIGATE );
 	} else {
 		if ( ( check_cpcr == cpcr ) && ( cpcr != 0xffff ) ) {
 			DBGC ( rtl, "REALTEK %p appears to be an RTL8139C+\n",

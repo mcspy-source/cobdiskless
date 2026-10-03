@@ -1,0 +1,100 @@
+﻿cob-armer.exe : [INFO] Arming offline VHD image: G:\csmw10.VHD
+At line:1 char:1
++ & 'C:\Users\Admin\Desktop\cobdiskless\build\cob-armer.exe' --arm 'G:\ ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([INFO] Arming o...: G:\csmw10.VHD:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[2026-09-29 09:09:45.053] [INFO] [PNP] [PNP] Volume root for OS/arch detection: I:
+[2026-09-29 09:09:45.277] [INFO] [PNP] [PNP] Guest OS family: modern (informational only -- this pass injects nothing)
+[2026-09-29 09:09:45.277] [INFO] [PNP] [PNP] Armed iScsiPrt: Start = 0, BootFlags = 0x1
+[2026-09-29 09:09:45.277] [INFO] [PNP] [PNP] Armed msiscsi: Start = 0, BootFlags = 0x1
+[2026-09-29 09:09:45.277] [INFO] [PNP] [PNP] Armed Tcpip: Start = 0
+[2026-09-29 09:09:45.277] [INFO] [PNP] [PNP] Armed ndis: Start = 0
+[2026-09-29 09:09:45.337] [INFO] [PNP] [PNP] Cleanly armed offline hive: I:\/Windows/System32/config/SYSTEM (4 
+services armed in ControlSet001)
+[2026-09-29 09:09:45.337] [INFO] [PNP] [PNP] Guest OS architecture: x64 for I:\/Windows
+[2026-09-29 09:09:45.337] [INFO] [PNP] [PNP] Armed existing boot services (4) in ControlSet001: iScsiPrt, msiscsi, 
+Tcpip, ndis
+[2026-09-29 09:09:45.337] [INFO] [PNP] [PNP] Network boot-critical flags armed in ControlSet001 (BootFlags = 0x1 / 
+CM_SERVICE_NETWORK_BOOT_LOAD on every armed NIC service)
+[2026-09-29 09:09:45.337] [INFO] [PNP] [PNP] Core iSCSI boot stack armed in ControlSet001 (msiscsi Start=0 
+BootFlags=0x1, Tcpip Start=0, ndis Start=0)
+[2026-09-29 09:09:45.337] [INFO] [PNP] [PNP] Boot Stage 15 neutralised in ControlSet001 (CrashControl dump stack off, 
+boot paging file cleared, Tcpip task offload killed)
+[2026-09-29 09:09:45.337] [INFO] [PNP] [PNP] disk TimeOutValue = 60s in ControlSet001 (ride out STP/retransmit stalls 
+instead of bugchecking 0x7A/0x7B)
+[2026-09-29 09:09:45.572] [INFO] [PNP] [PNP] MountedDevices: Bound \DosDevices\C: to boot volume signature (offset 
+576716800)
+[PNP] MountedDevices: Bound \DosDevices\C: to boot volume signature (offset 576716800)
+[2026-09-29 09:09:45.750] [INFO] [PNP] [PNP] CriticalDeviceDatabase: injected 15 NIC hardware ID entries
+[PNP] CriticalDeviceDatabase: injected 15 NIC hardware ID entries
+[INFO] Auto-armed offline SYSTEM hive for image: G:\csmw10.VHD
+[2026-09-29 09:09:45.783] [INFO] [PNP] [INFO] Auto-armed offline SYSTEM hive for image: G:\csmw10.VHD
+[INFO] === CobDiskless Native Image Arming Report ===
+Target Path:       G:\csmw10.VHD
+Status:            SUCCESS
+Active ControlSet: ControlSet001
+Network BootFlags: ARMED (0x1)
+iSCSI Boot Stack:  ARMED (Start=0)
+Stage 15 Crash Control: DISABLED (CrashDumpEnabled=0)
+Stage 15 Paging File:   CLEARED (PagingFiles empty)
+Stage 15 Tcpip Offload: KILLED (DisableTaskOffload=1)
+Disk I/O Timeout:       EXTENDED (TimeOutValue=60)
+Armed Services (4): iScsiPrt, msiscsi, Tcpip, ndis
+Modified Keys (4): iScsiPrt, msiscsi, Tcpip, ndis
+Guest Arch:        x64
+Guest OS Family:   modern
+  [WARN] No adapter Service value bound under Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}; no native NIC 
+service could be armed
+Message:           Armed 4 existing boot service(s) in ControlSet001 (4 modified, 0 missing, OS family modern, network 
+BootFlags armed, iSCSI boot stack armed, Stage 15 crash dump/paging file/offload neutralised, disk timeout 
+TimeOutValue=60) (via VirtDisk mounted volume I:\/Windows/System32/config/SYSTEM)
+
+[INFO] Armed services (4): iScsiPrt msiscsi Tcpip ndis
+[INFO] Missing services (0): <none>
+[INFO] Guest OS family: modern, arch: x64 (informational only -- this pass injects nothing)
+[INFO] boot_flags_armed=true iscsi_stack_armed=true stage15(crash_dump=true, paging_files=true, tcpip_offload=true) 
+disk_timeout=true
+[WARN] No adapter Service value bound under Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}; no native NIC 
+service could be armed
+{
+  "success": true,
+  "target": "G:\\csmw10.VHD",
+  "control_set": "ControlSet001",
+  "boot_flags_armed": true,
+  "iscsi_stack_armed": true,
+  "armed_services": [
+    "iScsiPrt",
+    "msiscsi",
+    "Tcpip",
+    "ndis"
+  ],
+  "updated_services": [
+    "iScsiPrt",
+    "msiscsi",
+    "Tcpip",
+    "ndis"
+  ],
+  "modified_services": [
+    "iScsiPrt",
+    "msiscsi",
+    "Tcpip",
+    "ndis"
+  ],
+  "missing_services": [],
+  "crash_dump_disabled": true,
+  "paging_files_cleared": true,
+  "tcpip_offload_disabled": true,
+  "disk_timeout_armed": true,
+  "hive_dirty_on_entry": false,
+  "hive_cleaned_on_exit": false,
+  "guest_arch": "x64",
+  "guest_os_family": "modern",
+  "warnings": [
+    "No adapter Service value bound under Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}; no native NIC service could be armed"
+  ],
+  "message": "Armed 4 existing boot service(s) in ControlSet001 (4 modified, 0 missing, OS family modern, network BootFlags armed, iSCSI boot stack armed, Stage 15 crash dump/paging file/offload neutralised, disk timeout TimeOutValue=60) (via VirtDisk mounted volume I:\\/Windows/System32/config/SYSTEM)",
+  "summary": "=== CobDiskless Native Image Arming Report ===\nTarget Path:       G:\\csmw10.VHD\nStatus:            SUCCESS\nActive ControlSet: ControlSet001\nNetwork BootFlags: ARMED (0x1)\niSCSI Boot Stack:  ARMED (Start=0)\nStage 15 Crash Control: DISABLED (CrashDumpEnabled=0)\nStage 15 Paging File:   CLEARED (PagingFiles empty)\nStage 15 Tcpip Offload: KILLED (DisableTaskOffload=1)\nDisk I/O Timeout:       EXTENDED (TimeOutValue=60)\nArmed Services (4): iScsiPrt, msiscsi, Tcpip, ndis\nModified Keys (4): iScsiPrt, msiscsi, Tcpip, ndis\nGuest Arch:        x64\nGuest OS Family:   modern\n  [WARN] No adapter Service value bound under Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}; no native NIC service could be armed\nMessage:           Armed 4 existing boot service(s) in ControlSet001 (4 modified, 0 missing, OS family modern, network BootFlags armed, iSCSI boot stack armed, Stage 15 crash dump/paging file/offload neutralised, disk timeout TimeOutValue=60) (via VirtDisk mounted volume I:\\/Windows/System32/config/SYSTEM)\n"
+}
+[INFO] VHD image armed and verified.

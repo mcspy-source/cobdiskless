@@ -91,7 +91,7 @@ enum realtek_legacy_status {
  *
  * This is a hardware limit when using legacy mode.
  */
-#define RTL_NUM_TX_DESC 4
+#define RTL_NUM_TX_DESC 16
 
 /** Receive Buffer Start Address (dword, 8139 only) */
 #define RTL_RBSTART 0x30
@@ -235,11 +235,14 @@ enum realtek_legacy_status {
 #define RTL_CPCR_CPRX		0x0002	/**< C+ receive enable */
 #define RTL_CPCR_CPTX		0x0001	/**< C+ transmit enable */
 
+/** Interrupt Mitigation Register (word, 8169/8168/810x only) */
+#define RTL_INTRMITIGATE 0xe2
+
 /** Receive Descriptor Start Address Register (qword) */
 #define RTL_RDSAR 0xe4
 
 /** Number of receive descriptors */
-#define RTL_NUM_RX_DESC 4
+#define RTL_NUM_RX_DESC 32
 
 /** Receive buffer length */
 #define RTL_RX_MAX_LEN \

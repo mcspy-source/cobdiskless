@@ -1,0 +1,29 @@
+﻿Mounting VHD...
+Boot drive with BCD: H:
+The operation completed successfully.
+The operation completed successfully.
+The operation completed successfully.
+The operation completed successfully.
+The operation completed successfully.
+The operation completed successfully.
+Checking updated BCD:
+
+Windows Boot Loader
+-------------------
+identifier              {default}
+device                  partition=I:
+path                    \Windows\system32\winload.exe
+description             Windows 10
+locale                  en-US
+inherit                 {bootloadersettings}
+recoveryenabled         No
+nointegritychecks       Yes
+testsigning             Yes
+allowedinmemorysettings 0x15000075
+osdevice                partition=I:
+systemroot              \Windows
+resumeobject            {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+nx                      OptIn
+bootmenupolicy          Standard
+bootstatuspolicy        IgnoreAllFailures
+Done.

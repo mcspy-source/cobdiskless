@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/storage/random_access_file.hpp"
 
 #include <algorithm>
@@ -123,28 +125,43 @@ std::string last_error_text(const char* what) {
     return std::string(what) + ": " + detail;
 }
 
-// Strict read-only handle: allows concurrent readers, forbids all writers.
+// Strict read-only handle: allows concurrent readers and maintenance tools (e.g. VirtDisk
+// image arming), forbids uncoordinated file deletion/renaming while open.
 HANDLE open_ro_handle(const std::wstring& wpath) {
     return ::CreateFileW(
         wpath.c_str(),
         GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
         nullptr);
 }
 
-// Exclusive-writer handle: forbids other writers, tolerates readers.
+// Exclusive-writer handle: forbids other writers and deleters, tolerates readers.
+//
+// This helper NEVER touches FILE_ATTRIBUTE_READONLY. If the file carries the
+// attribute, CreateFileW(GENERIC_WRITE) fails with ERROR_ACCESS_DENIED -- by
+// design: the immutability contract of RandomAccessFile::open() is that a
+// read-write open of an attributed file only ever succeeds after an explicit
+// ReadOnlyAttributePolicy::Lift, which open() performs before calling here.
 HANDLE open_rw_handle(const std::wstring& wpath) {
     return ::CreateFileW(
         wpath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
         nullptr);
+}
+
+// Re-applies FILE_ATTRIBUTE_READONLY after a maintenance writer is finished.
+void restore_attribute(const std::wstring& wpath) {
+    const DWORD attrs = ::GetFileAttributesW(wpath.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) == 0) {
+        ::SetFileAttributesW(wpath.c_str(), attrs | FILE_ATTRIBUTE_READONLY);
+    }
 }
 
 // Positional read via OVERLAPPED with a per-call event: safe to run
@@ -278,12 +295,14 @@ RandomAccessFile::RandomAccessFile(RandomAccessFile&& other) noexcept {
     posix_fd_ = other.posix_fd_;
     win32_native_ = other.win32_native_;
     owns_rw_ = other.owns_rw_;
+    restore_readonly_ = other.restore_readonly_;
     other.size_ = 0;
     other.access_ = Access::ReadOnly;
     other.win_handle_ = nullptr;
     other.posix_fd_ = -1;
     other.win32_native_ = false;
     other.owns_rw_ = false;
+    other.restore_readonly_ = false;
     other.path_.clear();
 }
 
@@ -298,21 +317,25 @@ RandomAccessFile& RandomAccessFile::operator=(RandomAccessFile&& other) noexcept
         posix_fd_ = other.posix_fd_;
         win32_native_ = other.win32_native_;
         owns_rw_ = other.owns_rw_;
+        restore_readonly_ = other.restore_readonly_;
         other.size_ = 0;
         other.access_ = Access::ReadOnly;
         other.win_handle_ = nullptr;
         other.posix_fd_ = -1;
         other.win32_native_ = false;
         other.owns_rw_ = false;
+        other.restore_readonly_ = false;
         other.path_.clear();
     }
     return *this;
 }
 
-Result<void> RandomAccessFile::open(const std::filesystem::path& path, Access access) {
+Result<void> RandomAccessFile::open(const std::filesystem::path& path, Access access,
+                                    ReadOnlyAttributePolicy attribute_policy) {
     release();
     path_ = path;
     access_ = access;
+    restore_readonly_ = false;
 
 #if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
     win32_native_ = true;
@@ -327,6 +350,26 @@ Result<void> RandomAccessFile::open(const std::filesystem::path& path, Access ac
     PoolState& p = pool();
 
     if (access == Access::ReadWrite) {
+        // IMMUTABILITY GUARD: refuse before any pool state is touched when the
+        // file carries FILE_ATTRIBUTE_READONLY and the caller did not opt into
+        // the Super Client lift. Nothing ever clears the attribute implicitly,
+        // so an attributed master image stays unwritable for every ordinary
+        // code path -- standard clients, image tooling, anything with just the
+        // path to the file.
+        const DWORD attrs = ::GetFileAttributesW(wpath.c_str());
+        const bool attr_locked =
+            attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) != 0;
+        if (attr_locked && attribute_policy != ReadOnlyAttributePolicy::Lift) {
+            path_.clear();
+            access_ = Access::ReadOnly;
+            return Error(ErrorCode::StorageFailure,
+                         "Access Denied: '" + path.string() + "' carries "
+                         "FILE_ATTRIBUTE_READONLY (immutable master image) and was "
+                         "opened read-write. Refusing: the attribute may only be lifted "
+                         "explicitly by an authenticated Super Client maintenance "
+                         "session (ReadOnlyAttributePolicy::Lift).");
+        }
+
         // Exclusive writer: wait for any in-flight writer on this path, then
         // suspend the read-only pool entry (drain active I/O, close the
         // shared handle) so the strict sharing matrix permits our open.
@@ -355,10 +398,9 @@ Result<void> RandomAccessFile::open(const std::filesystem::path& path, Access ac
 
         p.rw_holders[wpath] += 1;
 
-        std::string err;
-        HANDLE handle = open_rw_handle(wpath);
-        if (handle == INVALID_HANDLE_VALUE) {
-            err = last_error_text("open(read-write) failed");
+        // Shared backout for a writer open that never happened: give the pool
+        // entry back, release the writer slot and reset this object.
+        auto backout_writer_slot = [&]() {
             {
                 std::lock_guard<std::mutex> elock(entry->mutex);
                 entry->suspended = false;
@@ -371,6 +413,28 @@ Result<void> RandomAccessFile::open(const std::filesystem::path& path, Access ac
             shared_.reset();
             path_.clear();
             access_ = Access::ReadOnly;
+        };
+
+        // Explicit Super Client lift: clear the attribute for this writer and
+        // re-apply it in release() the moment the maintenance write ends.
+        if (attr_locked) {
+            if (!::SetFileAttributesW(wpath.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY)) {
+                const std::string err = last_error_text("lifting FILE_ATTRIBUTE_READONLY failed");
+                backout_writer_slot();
+                return Error(ErrorCode::StorageFailure, err);
+            }
+            restore_readonly_ = true;
+        }
+
+        std::string err;
+        HANDLE handle = open_rw_handle(wpath);
+        if (handle == INVALID_HANDLE_VALUE) {
+            err = last_error_text("open(read-write) failed");
+            if (restore_readonly_) {
+                restore_attribute(wpath);
+                restore_readonly_ = false;
+            }
+            backout_writer_slot();
             return Error(ErrorCode::StorageFailure, err);
         }
 
@@ -418,11 +482,43 @@ Result<void> RandomAccessFile::open(const std::filesystem::path& path, Access ac
     return {};
 #else
     win32_native_ = false;
+    if (access == Access::ReadWrite) {
+        struct stat st {};
+        if (::stat(path.c_str(), &st) == 0 && (st.st_mode & S_IWUSR) == 0) {
+            // IMMUTABILITY GUARD (POSIX twin): a master image without the
+            // owner write bit is never opened read-write implicitly -- refuse,
+            // unless the caller explicitly asked for the Super Client lift.
+            if (attribute_policy != ReadOnlyAttributePolicy::Lift) {
+                path_.clear();
+                access_ = Access::ReadOnly;
+                return Error(ErrorCode::StorageFailure,
+                             "Access Denied: '" + path.string() + "' has no owner write bit "
+                             "(immutable master image) and was opened read-write. Refusing: "
+                             "the mode may only be lifted explicitly by an authenticated "
+                             "Super Client maintenance session "
+                             "(ReadOnlyAttributePolicy::Lift).");
+            }
+            if (::chmod(path.c_str(), st.st_mode | S_IWUSR) != 0) {
+                const std::string err = errno_text("lifting read-only mode failed");
+                path_.clear();
+                access_ = Access::ReadOnly;
+                return Error(ErrorCode::StorageFailure, err);
+            }
+            restore_readonly_ = true;
+        }
+    }
     const int flags = (access == Access::ReadWrite) ? O_RDWR : O_RDONLY;
     const int fd = ::open(path.c_str(), flags);
     if (fd < 0) {
         const std::string err = errno_text(
             (access == Access::ReadWrite) ? "open(read-write) failed" : "open(read-only) failed");
+        if (restore_readonly_) {
+            struct stat st {};
+            if (::stat(path.c_str(), &st) == 0) {
+                ::chmod(path.c_str(), st.st_mode & ~static_cast<mode_t>(S_IWUSR));
+            }
+            restore_readonly_ = false;
+        }
         path_.clear();
         access_ = Access::ReadOnly;
         return Error(ErrorCode::StorageFailure, err);
@@ -452,6 +548,14 @@ void RandomAccessFile::release() noexcept {
         ::CloseHandle(static_cast<HANDLE>(win_handle_));
         win_handle_ = nullptr;
         owns_rw_ = false;
+
+        // Re-lock the master image before anyone else can grab the path: the
+        // read-only attribute cleared for this maintenance write goes back on
+        // while we still own the writer slot.
+        if (restore_readonly_) {
+            restore_attribute(shared_ ? shared_->wpath : to_win_path(path_.string()));
+            restore_readonly_ = false;
+        }
 
         // Resume the read-only pool entry we suspended for this writer.
         if (shared_) {
@@ -500,6 +604,14 @@ void RandomAccessFile::release() noexcept {
     if (posix_fd_ >= 0) {
         ::close(posix_fd_);
         posix_fd_ = -1;
+    }
+    if (restore_readonly_) {
+        // Re-lock the image now that the maintenance writer is gone.
+        struct stat st {};
+        if (::stat(path_.c_str(), &st) == 0) {
+            ::chmod(path_.c_str(), st.st_mode & ~static_cast<mode_t>(S_IWUSR));
+        }
+        restore_readonly_ = false;
     }
     owns_rw_ = false;
     shared_.reset();

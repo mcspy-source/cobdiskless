@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/config/configuration.hpp"
 #include <fstream>
 #include <sstream>
@@ -90,11 +92,13 @@ Result<void> Configuration::save_to_file(const std::filesystem::path& file_path)
     out << "games_dir=" << games_dir_.string() << "\n";
     out << "writeback_dir=" << writeback_dir_.string() << "\n";
     out << "cache_dir=" << cache_dir_.string() << "\n";
+    out << "tftp_boot_dir=" << tftp_boot_dir_.string() << "\n";
     out << "default_cache_size_bytes=" << default_cache_size_.bytes() << "\n";
     out << "log_level=" << static_cast<int>(log_level_) << "\n";
     out << "max_clients=" << max_clients_ << "\n";
     out << "first_run_completed=" << (first_run_completed_ ? "1" : "0") << "\n";
     out << "writeback_quota_mb=" << writeback_quota_mb_ << "\n";
+    out << "writeback_ram_mb=" << writeback_ram_mb_ << "\n";
     out << "http_port=" << http_port_ << "\n";
     out << "auto_arm_vhd_on_boot=" << (auto_arm_vhd_on_boot_ ? "1" : "0") << "\n";
     out << "network_auto_detect=" << (network_auto_detect_ ? "1" : "0") << "\n";
@@ -171,6 +175,8 @@ Result<void> Configuration::load_from_file(const std::filesystem::path& file_pat
             writeback_dir_ = val;
         } else if (key == "cache_dir") {
             cache_dir_ = val;
+        } else if (key == "tftp_boot_dir") {
+            tftp_boot_dir_ = val;
         } else if (key == "default_cache_size_bytes") {
             default_cache_size_ = ByteSize(std::stoull(val));
         } else if (key == "log_level") {
@@ -181,6 +187,8 @@ Result<void> Configuration::load_from_file(const std::filesystem::path& file_pat
             first_run_completed_ = (val == "1" || val == "true");
         } else if (key == "writeback_quota_mb") {
             writeback_quota_mb_ = std::stoull(val);
+        } else if (key == "writeback_ram_mb") {
+            writeback_ram_mb_ = std::stoull(val);
         } else if (key == "http_port") {
             http_port_ = static_cast<uint16_t>(std::stoul(val));
         } else if (key == "auto_arm_vhd_on_boot") {
@@ -297,6 +305,99 @@ std::filesystem::path Configuration::resolve_config_path(
     }
 
     return candidates.empty() ? filename : candidates.front();
+}
+
+std::vector<std::filesystem::path> Configuration::candidate_tftp_boot_paths(
+    const std::filesystem::path& configured_dir,
+    const std::filesystem::path& working_dir,
+    const std::filesystem::path& exe_dir) {
+    std::vector<std::filesystem::path> candidates;
+
+    auto add_unique = [&](const std::filesystem::path& p) {
+        if (p.empty()) return;
+        for (const auto& existing : candidates) {
+            if (existing == p) return;
+        }
+        candidates.push_back(p);
+    };
+
+    // 1. Explicitly configured directory
+    if (!configured_dir.empty()) {
+        add_unique(configured_dir);
+    }
+
+    const std::filesystem::path effective_exe_dir = exe_dir.empty() ? get_executable_directory() : exe_dir;
+    const std::filesystem::path effective_cwd = working_dir.empty() ? std::filesystem::current_path() : working_dir;
+
+    // 2. Executable-relative hierarchies
+    if (!effective_exe_dir.empty()) {
+        add_unique(effective_exe_dir / "tftp_boot");
+        add_unique(effective_exe_dir / "tftp");
+        add_unique(effective_exe_dir / ".." / "tftp_boot");
+        add_unique(effective_exe_dir / ".." / "tftp");
+        add_unique(effective_exe_dir / ".." / ".." / "tftp_boot");
+        add_unique(effective_exe_dir / ".." / ".." / "tftp");
+    }
+
+    // 3. Working directory hierarchies
+    add_unique(effective_cwd / "tftp_boot");
+    add_unique(effective_cwd / "tftp");
+    add_unique(effective_cwd / ".." / "tftp_boot");
+    add_unique(effective_cwd / ".." / ".." / "tftp_boot");
+    add_unique(std::filesystem::path("tftp_boot"));
+    add_unique(std::filesystem::path("tftp"));
+
+    return candidates;
+}
+
+std::filesystem::path Configuration::resolve_tftp_boot_directory(
+    const std::filesystem::path& configured_dir,
+    const std::filesystem::path& working_dir,
+    const std::filesystem::path& exe_dir) {
+    if (!configured_dir.empty() && configured_dir.is_absolute()) {
+        std::error_code ec;
+        if (std::filesystem::exists(configured_dir, ec) && std::filesystem::is_directory(configured_dir, ec)) {
+            return configured_dir;
+        }
+    }
+
+    auto candidates = candidate_tftp_boot_paths(configured_dir, working_dir, exe_dir);
+    std::error_code ec;
+
+    // Pass 1: Look for a candidate directory that contains core bootloader files
+    for (const auto& cand : candidates) {
+        if (std::filesystem::exists(cand, ec) && std::filesystem::is_directory(cand, ec)) {
+            if (std::filesystem::exists(cand / "undionly.kpxe", ec) ||
+                std::filesystem::exists(cand / "ipxe.efi", ec) ||
+                std::filesystem::exists(cand / "snponly.efi", ec)) {
+                return cand;
+            }
+        }
+    }
+
+    // Pass 2: Look for any candidate that exists as a non-empty directory
+    for (const auto& cand : candidates) {
+        if (std::filesystem::exists(cand, ec) && std::filesystem::is_directory(cand, ec)) {
+            auto it = std::filesystem::directory_iterator(cand, ec);
+            if (!ec && it != std::filesystem::directory_iterator()) {
+                return cand;
+            }
+        }
+    }
+
+    // Pass 3: Look for any candidate directory that simply exists
+    for (const auto& cand : candidates) {
+        if (std::filesystem::exists(cand, ec) && std::filesystem::is_directory(cand, ec)) {
+            return cand;
+        }
+    }
+
+    // Fallback: preferred default location (alongside exe or cwd)
+    const std::filesystem::path effective_exe_dir = exe_dir.empty() ? get_executable_directory() : exe_dir;
+    if (!effective_exe_dir.empty()) {
+        return effective_exe_dir / "tftp_boot";
+    }
+    return !configured_dir.empty() ? configured_dir : std::filesystem::path("tftp_boot");
 }
 
 Configuration Configuration::create_default() {

@@ -1,0 +1,15 @@
+﻿sysPath: I:\Windows\System32\config\SYSTEM, exists: False
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\test_mount.ps1:11 char:10
++ $res += (& reg load HKLM\OFFLINE_SYS "$sysPath" 2>&1)
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\test_mount.ps1:12 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Control" /v "Sys ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

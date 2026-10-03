@@ -1,0 +1,3 @@
+﻿Searching WinSxS properly...
+Windows drive: I:
+Done.

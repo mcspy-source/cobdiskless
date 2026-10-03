@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/logging/logger.hpp"
 #include <iostream>
 #include <fstream>

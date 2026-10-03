@@ -1,0 +1,9 @@
+﻿=== Query msiscsi root ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\msiscsi\Parameters
+=== Query msiscsi all ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\msiscsi\Parameters
+    LinkDownTime    REG_DWORD    0x3c
+    MaxRequestHoldTime    REG_DWORD    0x3c
+

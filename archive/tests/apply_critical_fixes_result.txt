@@ -1,0 +1,13 @@
+﻿Starting fixes on G:\csmw10.VHD at 09/29/2026 08:09:58
+OS Partition is I: (I:\Windows\System32\config\SYSTEM)
+Adapter 0000 Linkage updated: FilterList cleared, UpperBind set to Tcpip, Tcpip6
+Tcpip Parameters updated: DisableDHCPMediaSense=1, DisableTaskOffload=1, TcpMaxDataRetransmissions=10
+Services\msiscsi fully configured with Start=0, BootFlags=1
+Services\iScsiPrt fully configured
+Enum\ROOT\ISCSIPRT\0000 configured with MultiString HardwareID
+SCSI Class 0000 configured
+CDDB root#iscsiprt configured
+SUCCESS: All registry modifications applied successfully!
+Cleaned log: SYSTEM.LOG1
+Cleaned log: SYSTEM.LOG2
+Dismounted VHD.

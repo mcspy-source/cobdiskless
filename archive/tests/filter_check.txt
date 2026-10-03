@@ -1,0 +1,58 @@
+﻿=== Adapter 0000 Linkage ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage
+    RootDevice    REG_MULTI_SZ    {820C4568-D585-420E-94B3-AEA0E0DC3402}
+    Export    REG_MULTI_SZ    \Device\{820C4568-D585-420E-94B3-AEA0E0DC3402}
+    UpperBind    REG_MULTI_SZ    Ndisuio\0RasPppoe\0RDMANDK\0Tcpip\0Tcpip6
+    FilterList    REG_MULTI_SZ    {820C4568-D585-420E-94B3-AEA0E0DC3402}-{EA24CD6C-D17A-4348-9190-09F0D5BE83DD}-0000\0{820C4568-D585-420E-94B3-AEA0E0DC3402}-{3BFD7820-D65C-4C1B-9FEA-983A019639EA}-0000\0{820C4568-D585-420E-94B3-AEA0E0DC3402}-{EA24CD6C-D17A-4348-9190-09F0D5BE83DD}-0001\0{820C4568-D585-420E-94B3-AEA0E0DC3402}-{B70D6460-3635-4D42-B866-B8AB1A24454C}-0000\0{820C4568-D585-420E-94B3-AEA0E0DC3402}-{EA24CD6C-D17A-4348-9190-09F0D5BE83DD}-0002
+
+=== All Linkage under Net Class ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage
+
+End of search: 1 match(es) found.
+=== Services ms_wfplwf ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_filters.ps1:15 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\ms_wfpl ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== Services wfplwfs ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\wfplwfs
+    BootFlags    REG_DWORD    0x1
+    DependOnService    REG_MULTI_SZ    ndis
+    Description    REG_SZ    @%SystemRoot%\System32\drivers\wfplwfs.sys,-6000
+    DisplayName    REG_SZ    @%SystemRoot%\System32\drivers\wfplwfs.sys,-6000
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    PNP_TDI
+    ImagePath    REG_EXPAND_SZ    System32\drivers\wfplwfs.sys
+    Start    REG_DWORD    0x0
+    Type    REG_DWORD    0x1
+    NdisMajorVersion    REG_DWORD    0x6
+    NdisMinorVersion    REG_DWORD    0x32
+    DriverMajorVersion    REG_DWORD    0x1
+    DriverMinorVersion    REG_DWORD    0x0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\wfplwfs\Parameters
+    DefaultFilterSettings    REG_DWORD    0x1
+    SkipNdisAdaptersKeyGeneration    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\wfplwfs\Parameters\Adapters
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\wfplwfs\Parameters\Adapters\{820C4568-D585-420E-94B3-AEA0E0DC3402}
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\wfplwfs\Parameters\Adapters\{820C4568-D585-420E-94B3-AEA0E0DC3402}\{3BFD7820-D65C-4C1B-9FEA-983A019639EA}-0000
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\wfplwfs\Parameters\Adapters\{820C4568-D585-420E-94B3-AEA0E0DC3402}\{B70D6460-3635-4D42-B866-B8AB1A24454C}-0000
+
+=== Services WfpLwf ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_filters.ps1:21 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\WfpLwf" ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

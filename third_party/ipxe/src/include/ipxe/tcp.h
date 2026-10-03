@@ -360,7 +360,7 @@ struct tcp_options {
  *
  * We therefore choose a (rounded up) maximum window size of 2048kB.
  */
-#define TCP_MAX_WINDOW_SIZE	( 2048 * 1024 )
+#define TCP_MAX_WINDOW_SIZE	( 64 * 1024 )
 
 /**
  * Path MTU

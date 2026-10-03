@@ -1,0 +1,11 @@
+﻿=== APPLYING SANBOOT & SERVICEGROUPORDER FIXES TO I:\Windows\System32\config\SYSTEM ===
+Updated ServiceGroupOrder\List successfully.
+Sanitized interface: {820c4568-d585-420e-94b3-aea0e0dc3402}
+Sanitized interface: {c07a0272-b875-11f1-91b8-806e6f6e6963}
+Cleared BootExecute to prevent chkdsk hang.
+=== VERIFY SERVICEGROUPORDER ===
+System Reserved, EMS, WdfLoadGroup, Boot Bus Extender, System Bus Extender, NDIS Wrapper, NDIS, Base, PNP_TDI, CCiSCSI, SCSI miniport, Port, Primary Disk, SCSI Class, SCSI CDROM Class, FSFilter Infrastructure, FSFilter System, FSFilter Bottom, FSFilter Copy Protection, FSFilter Security Enhancer, FSFilter Open File, FSFilter Physical Quota Management, FSFilter Virtualization, FSFilter Encryption, FSFilter Compression, FSFilter Imaging, FSFilter HSM, FSFilter Cluster File System, FSFilter System Recovery, FSFilter Quota Management, FSFilter Content Screener, FSFilter Continuous Backup, FSFilter Replication, FSFilter Anti-Virus, FSFilter Undelete, FSFilter Activity Monitor, FSFilter Top, Filter, Boot File System, Pointer Port, Keyboard Port, Pointer Class, Keyboard Class, Video Init, Video, Video Save, File System, Streams Drivers, COM Infrastructure, Event Log, PerceptionGroup, ProfSvc_Group, AudioGroup, UIGroup, MS_WindowsLocalValidation, PlugPlay, Cryptography, TDI, iSCSI, NetBIOSGroup, ShellSvcGroup, SchedulerGroup, SpoolerGroup, SmartCardGroup, NetworkProvider, MS_WindowsRemoteValidation, NetDDEGroup, Parallel arbitrator, Extended Base, PCI Configuration, MS Transactions
+=== VERIFY BOOTEXECUTE ===
+BootExecute count: 0
+Removed dirty log: SYSTEM.LOG1
+Removed dirty log: SYSTEM.LOG2

@@ -16,7 +16,7 @@ FILE_SECBOOT ( PERMITTED );
 #define DEFAULT_MIN_TIMEOUT ( TICKS_PER_SEC / 4 )
 
 /** Default maximum timeout value (in ticks) */
-#define DEFAULT_MAX_TIMEOUT ( 10 * TICKS_PER_SEC )
+#define DEFAULT_MAX_TIMEOUT ( 60 * TICKS_PER_SEC )
 
 /** A retry timer */
 struct retry_timer {

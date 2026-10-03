@@ -1,0 +1,4 @@
+﻿New volumes mounted from VHD:
+
+Partitions on VHD disk:
+

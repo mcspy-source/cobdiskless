@@ -1,0 +1,5 @@
+﻿Folder: I:\Windows\System32\DriverStore\FileRepository\iscsi.inf_amd64_a0af6a89760de7bd
+  -> iscsi.inf (7162 bytes)
+  -> iscsilog.dll (16896 bytes)
+  -> msiscsi.sys (329032 bytes)
+  DriverVer line: DriverVer = 06/21/2006,10.0.17763.1554

@@ -1,0 +1,49 @@
+﻿Mount path: I:\Windows\System32\config\SYSTEM
+=== rt640x64 Parameters ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64\Parameters
+    DrvOption    REG_DWORD    0x0
+    DrvMode    REG_DWORD    0x0
+    DmaRemappingCompatible    REG_DWORD    0x0
+    WppRecorder_TraceGuid    REG_SZ    {88c289a9-e366-45a1-b478-feb5157fdb8c}
+    WaitAutoNegComplete    REG_DWORD    0x0
+    *EEE    REG_SZ    0
+    AutoPowerSave    REG_SZ    0
+    GigaLite    REG_SZ    0
+    *FlowControl    REG_SZ    0
+    Diskless    REG_DWORD    0x1
+    DisklessOption    REG_DWORD    0x1
+    PowerSavingMode    REG_SZ    0
+    EnableGreenEthernet    REG_SZ    0
+    AutoDisableGigabit    REG_SZ    0
+    PowerDownPll    REG_DWORD    0x0
+    S5NicKeepOverrideMacAddr    REG_DWORD    0x1
+    S5NicKeepOverrideMacAddrV2    REG_DWORD    0x1
+    *SpeedDuplex    REG_SZ    0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64\Parameters\Wdf
+    WdfMajorVersion    REG_DWORD    0x1
+    WdfMinorVersion    REG_DWORD    0xf
+
+=== Net Class 0000 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000
+    WaitAutoNegComplete    REG_DWORD    0x0
+
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000
+    Diskless    REG_DWORD    0x1
+
+=== MSI Supported ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Enum\PCI\VEN_10EC&DEV_8168&SUBSYS_307C17AA&REV_06\01000000684CE00000\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties
+    MSISupported    REG_DWORD    0x0
+
+=== SCSI 0000 Parameters ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e97b-e325-11ce-bfc1-08002be10318}\0000\Parameters
+    LinkDownTime    REG_DWORD    0x3c
+    MaxRequestHoldTime    REG_DWORD    0x3c
+
+Cleaned log: SYSTEM.LOG1
+Cleaned log: SYSTEM.LOG2

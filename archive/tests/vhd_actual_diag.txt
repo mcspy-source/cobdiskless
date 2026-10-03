@@ -1,0 +1,49 @@
+﻿sysPath: Z:\Windows\System32\config\SYSTEM, exists: False
+=== ControlSet001 Services rt640x64 ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\run_full_diag.ps1:19 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\rt640x6 ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== ControlSet001 Services iScsiPrt ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\run_full_diag.ps1:22 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\iScsiPr ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== ControlSet001 Control ServiceGroupOrder ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\run_full_diag.ps1:25 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Control\ServiceG ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== ControlSet001 Control CriticalDeviceDatabase ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\run_full_diag.ps1:28 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Control\Critical ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== MountedDevices ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\run_full_diag.ps1:31 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\MountedDevices" 2>&1)
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== Tcpip Parameters Interfaces ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\run_full_diag.ps1:34 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\Tcpip\P ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

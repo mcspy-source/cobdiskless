@@ -1,0 +1,4 @@
+﻿Searching recently modified in WinSxS...
+Windows drive: I:\
+Recent: I:\Windows\WinSxS\Temp\InFlight
+Done.

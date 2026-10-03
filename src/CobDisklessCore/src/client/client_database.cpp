@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "CobDisklessCore/client/client_database.hpp"
 
 #include <algorithm>
@@ -28,14 +30,100 @@ bool is_reserved_dos_name(const std::string& name) {
     return kReserved.count(head) > 0;
 }
 
+// --- projection between the unified record and the enrollment view ----------
+
+ClientEntry to_client(const MachineRecord& rec) {
+    ClientEntry entry;
+    entry.mac_address = rec.mac;
+    entry.hostname = rec.name;
+    entry.ip_address = rec.ip;
+    // Before the merge this view called the field base_image and the station
+    // view called it image; they are the same thing on the unified row.
+    entry.base_image = rec.image;
+    entry.super_client = rec.super_client;
+    return entry;
+}
+
+/** Fills the enrollment-owned fields, leaving everything else on the row alone. */
+void apply_client(MachineRecord& rec, const ClientEntry& entry) {
+    rec.mac = entry.mac_address;
+    rec.name = entry.hostname;
+    rec.ip = entry.ip_address;
+    rec.image = entry.base_image;
+    rec.super_client = entry.super_client;
+}
+
+struct PoolConfig {
+    NetworkAddress start{0, 0, 0, 0};
+    NetworkAddress end{0, 0, 0, 0};
+    std::vector<NetworkAddress> reserved;
+    std::string default_image;
+};
+
+bool ip_in_use(const MachineMap& all, const NetworkAddress& addr) {
+    for (const auto& [_, rec] : all) {
+        if (rec.ip.ip_string() == addr.ip_string()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ip_reserved(const std::vector<NetworkAddress>& reserved, const NetworkAddress& addr) {
+    const std::string wanted = addr.ip_string();
+    for (const NetworkAddress& deny : reserved) {
+        // Compared as text: NetworkAddress::operator== also weighs the port,
+        // and a reserved entry with a port would otherwise slip through.
+        if (!deny.is_any() && deny.ip_string() == wanted) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * First address in the configured pool that is neither reserved nor already
+ * handed out. `all` is passed explicitly rather than read back from the store
+ * so allocation happens inside the same lock that inserts the result -- two
+ * simultaneous enrollments must not be offered the same lease.
+ */
+NetworkAddress allocate_ip(const MachineMap& all, const PoolConfig& pool) {
+    if (pool.start.is_any() || pool.end.is_any()) {
+        return NetworkAddress(0, 0, 0, 0);
+    }
+    const uint32_t begin = ipv4_to_u32(pool.start);
+    const uint32_t finish = ipv4_to_u32(pool.end);
+    if (begin > finish) {
+        return NetworkAddress(0, 0, 0, 0);
+    }
+
+    uint32_t probes = 0;
+    for (uint32_t candidate = begin; candidate <= finish && probes < kMaxPoolProbes;
+         ++candidate, ++probes) {
+        const NetworkAddress addr = u32_to_ipv4(candidate);
+        if (ip_reserved(pool.reserved, addr)) {
+            continue;
+        }
+        if (!ip_in_use(all, addr)) {
+            return addr;
+        }
+    }
+    // Second chance: the caller may have configured a pool outside the
+    // conventional range but left the derived range empty.
+    return NetworkAddress(0, 0, 0, 0);
+}
+
 } // namespace
 
-ClientDatabase::ClientDatabase(std::filesystem::path db_file)
-    : db_file_(std::move(db_file)) {
-    if (std::filesystem::exists(db_file_)) {
+ClientDatabase::ClientDatabase(std::shared_ptr<MachineStore> store)
+    : store_(std::move(store)) {
+    if (store_) {
         (void)load();
     }
 }
+
+ClientDatabase::ClientDatabase(std::filesystem::path db_file)
+    : ClientDatabase(std::make_shared<MachineStore>(std::move(db_file))) {}
 
 // --- identity helpers -------------------------------------------------------
 
@@ -158,38 +246,41 @@ void ClientDatabase::add_reserved_address(NetworkAddress address) {
 }
 
 size_t ClientDatabase::sanitize_records() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    bool pool_adjusted = false;
-    for (const NetworkAddress& deny : reserved_) {
-        if (!deny.is_any() && same_ip(pool_start_, deny)) {
-            pool_start_ = NetworkAddress(pool_start_.octet(0), pool_start_.octet(1),
-                                         pool_start_.octet(2), static_cast<uint8_t>(pool_start_.octet(3) + 1));
-            pool_adjusted = true;
-            break;
-        }
-    }
-
-    size_t sanitized_count = 0;
-    for (ClientEntry& entry : clients_) {
-        bool collides = false;
+    PoolConfig pool;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
         for (const NetworkAddress& deny : reserved_) {
-            if (!deny.is_any() && same_ip(entry.ip_address, deny)) {
-                collides = true;
+            if (!deny.is_any() && same_ip(pool_start_, deny)) {
+                pool_start_ = NetworkAddress(pool_start_.octet(0), pool_start_.octet(1),
+                                             pool_start_.octet(2),
+                                             static_cast<uint8_t>(pool_start_.octet(3) + 1));
                 break;
             }
         }
-        if (collides) {
-            entry.ip_address = NetworkAddress(0, 0, 0, 0);
-            NetworkAddress fresh_ip = allocate_ip_locked();
-            if (!fresh_ip.is_any()) {
-                entry.ip_address = fresh_ip;
-                ++sanitized_count;
-            }
-        }
+        pool.start = pool_start_;
+        pool.end = pool_end_;
+        pool.reserved = reserved_;
+        pool.default_image = default_base_image_;
     }
 
-    if (sanitized_count > 0 || pool_adjusted) {
-        (void)persist_unlocked();
+    size_t sanitized_count = 0;
+    const auto res = store_->mutate([&](MachineMap& all) -> Result<void> {
+        for (auto& [_, rec] : all) {
+            if (!ip_reserved(pool.reserved, rec.ip)) {
+                continue;
+            }
+            rec.ip = NetworkAddress(0, 0, 0, 0);
+            NetworkAddress fresh_ip = allocate_ip(all, pool);
+            if (fresh_ip.is_any()) {
+                continue; // pool exhausted: leave it zeroed rather than reuse a bad lease
+            }
+            rec.ip = fresh_ip;
+            ++sanitized_count;
+        }
+        return {};
+    });
+    if (res.is_err()) {
+        return 0;
     }
     return sanitized_count;
 }
@@ -202,12 +293,8 @@ void ClientDatabase::set_default_base_image(std::string image) {
 // --- lookups ----------------------------------------------------------------
 
 std::optional<ClientEntry> ClientDatabase::find_client_by_mac(std::string_view mac) const {
-    const std::string normalized = normalize_mac(mac);
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const ClientEntry& entry : clients_) {
-        if (entry.mac_address == normalized) {
-            return entry;
-        }
+    if (const auto rec = store_->find(mac)) {
+        return to_client(*rec);
     }
     return std::nullopt;
 }
@@ -218,10 +305,9 @@ std::optional<ClientEntry> ClientDatabase::find_client_by_hostname(std::string_v
         return std::nullopt;
     }
     const std::string& wanted = clean.value();
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const ClientEntry& entry : clients_) {
-        if (entry.hostname == wanted) {
-            return entry;
+    for (const auto& rec : store_->list()) {
+        if (rec.name == wanted) {
+            return to_client(rec);
         }
     }
     return std::nullopt;
@@ -253,66 +339,63 @@ Result<ClientEntry> ClientDatabase::enroll_client(std::string_view mac,
     }
     const std::string norm_hostname = clean.value();
 
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    std::string image(base_image);
-    if (image.empty()) {
-        image = default_base_image_;
+    // Snapshot the pool before entering the store: mutex_ must never be held
+    // alongside the store's lock.
+    PoolConfig pool;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pool.start = pool_start_;
+        pool.end = pool_end_;
+        pool.reserved = reserved_;
+        pool.default_image = default_base_image_;
     }
 
-    const ClientEntry* clash = nullptr;
-    for (const ClientEntry& entry : clients_) {
-        if (entry.hostname == norm_hostname && entry.mac_address != norm_mac) {
-            clash = &entry;
-            break;
-        }
-    }
-    if (clash != nullptr) {
-        return Error(ErrorCode::InvalidConfiguration,
-                     "Hostname '" + norm_hostname + "' is already assigned to " +
-                         clash->mac_address);
-    }
-
-    const ClientEntry* prior = nullptr;
-    for (const ClientEntry& entry : clients_) {
-        if (entry.mac_address == norm_mac) {
-            prior = &entry;
-            break;
-        }
-    }
-
+    const std::string explicit_image(base_image);
     ClientEntry stored;
-    stored.mac_address = norm_mac;
-    stored.hostname = norm_hostname;
-    stored.base_image = image;
-    if (prior != nullptr) {
-        // Re-enrolling a known MAC is idempotent: keep its existing lease so a
-        // retry never fails on an exhausted pool and a rename does not silently
-        // move the machine to a different address.
-        stored.ip_address = prior->ip_address;
-        stored.super_client = prior->super_client;
-    }
-    if (stored.ip_address.is_any()) {
-        stored.ip_address = allocate_ip_locked();
-    }
-    if (stored.ip_address.is_any()) {
-        return Error(ErrorCode::NetworkFailure,
-                     "IP pool " + pool_start_.ip_string() + "-" + pool_end_.ip_string() +
-                         " exhausted: cannot enroll " + norm_mac);
-    }
+    const auto res = store_->mutate([&](MachineMap& all) -> Result<void> {
+        for (const auto& [candidate, rec] : all) {
+            if (rec.name == norm_hostname && candidate != norm_mac) {
+                return Error(ErrorCode::InvalidConfiguration,
+                             "Hostname '" + norm_hostname + "' is already assigned to " + candidate);
+            }
+        }
 
-    const std::vector<ClientEntry> previous = clients_;
+        const auto it = all.find(norm_mac);
+        const bool prior = it != all.end();
+        MachineRecord rec = prior ? it->second : MachineRecord{};
 
-    if (prior != nullptr) {
-        clients_[static_cast<size_t>(prior - clients_.data())] = stored;
-    } else {
-        clients_.push_back(stored);
-    }
+        stored = to_client(rec);
+        stored.mac_address = norm_mac;
+        stored.hostname = norm_hostname;
+        if (!prior) {
+            stored.base_image = explicit_image.empty() ? pool.default_image : explicit_image;
+        } else if (!explicit_image.empty()) {
+            // An explicit request always wins. An implicit one must not: the
+            // row is shared with the station view, and re-enrolling would
+            // otherwise silently reassign the image a station is booted from,
+            // which is exactly the precedence the merge decided against.
+            stored.base_image = explicit_image;
+        }
+        if (stored.ip_address.is_any()) {
+            // Re-enrolling a known MAC is idempotent: keep its existing lease so a
+            // retry never fails on an exhausted pool and a rename does not silently
+            // move the machine to a different address.
+            stored.ip_address = allocate_ip(all, pool);
+        }
+        if (stored.ip_address.is_any()) {
+            return Error(ErrorCode::NetworkFailure,
+                         "IP pool " + pool.start.ip_string() + "-" + pool.end.ip_string() +
+                             " exhausted: cannot enroll " + norm_mac);
+        }
 
-    if (auto saved = persist_unlocked(); !saved.is_ok()) {
-        clients_ = previous;
-        return saved.error();
+        apply_client(rec, stored);
+        all[norm_mac] = std::move(rec);
+        return {};
+    });
+    if (res.is_err()) {
+        return res.error();
     }
+    (void)save();
 
     return stored;
 }
@@ -324,26 +407,18 @@ Result<void> ClientDatabase::set_super_client(std::string_view mac, bool super_c
     }
     const std::string norm_mac = normalize_mac(mac);
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    const std::vector<ClientEntry> previous = clients_;
-
-    bool found = false;
-    for (ClientEntry& entry : clients_) {
-        if (entry.mac_address == norm_mac) {
-            entry.super_client = super_client;
-            found = true;
-            break;
+    auto res = store_->mutate([&](MachineMap& all) -> Result<void> {
+        const auto it = all.find(norm_mac);
+        if (it == all.end()) {
+            return Error(ErrorCode::StorageFailure, "Client with MAC " + norm_mac + " not found");
         }
+        it->second.super_client = super_client;
+        return {};
+    });
+    if (res.is_ok()) {
+        (void)save();
     }
-    if (!found) {
-        return Error(ErrorCode::StorageFailure, "Client with MAC " + norm_mac + " not found");
-    }
-
-    if (auto saved = persist_unlocked(); !saved.is_ok()) {
-        clients_ = previous;
-        return saved.error();
-    }
-    return {};
+    return res;
 }
 
 Result<void> ClientDatabase::remove_client(std::string_view mac) {
@@ -353,28 +428,27 @@ Result<void> ClientDatabase::remove_client(std::string_view mac) {
     }
     const std::string norm_mac = normalize_mac(mac);
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    const std::vector<ClientEntry> previous = clients_;
-
-    const auto it = std::find_if(clients_.begin(), clients_.end(),
-                                 [&](const ClientEntry& e) { return e.mac_address == norm_mac; });
-    if (it == clients_.end()) {
-        return Error(ErrorCode::StorageFailure, "Client with MAC " + norm_mac + " not found");
+    auto res = store_->mutate([&](MachineMap& all) -> Result<void> {
+        auto it = all.find(norm_mac);
+        if (it == all.end()) {
+            return Error(ErrorCode::StorageFailure, "Client with MAC " + norm_mac + " not found");
+        }
+        all.erase(it);
+        return {};
+    });
+    if (res.is_ok()) {
+        (void)save();
     }
-    clients_.erase(it);
-
-    if (auto saved = persist_unlocked(); !saved.is_ok()) {
-        clients_ = previous;
-        return saved.error();
-    }
-    return {};
+    return res;
 }
 
 // --- snapshots --------------------------------------------------------------
 
 std::vector<ClientEntry> ClientDatabase::list_clients() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<ClientEntry> snapshot = clients_;
+    std::vector<ClientEntry> snapshot;
+    for (const auto& rec : store_->list()) {
+        snapshot.push_back(to_client(rec));
+    }
     std::sort(snapshot.begin(), snapshot.end(),
               [](const ClientEntry& a, const ClientEntry& b) {
                   return a.hostname < b.hostname;
@@ -383,8 +457,7 @@ std::vector<ClientEntry> ClientDatabase::list_clients() const {
 }
 
 size_t ClientDatabase::client_count() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return clients_.size();
+    return store_->size();
 }
 
 NetworkAddress ClientDatabase::pool_start() const {
@@ -409,132 +482,77 @@ std::string ClientDatabase::default_base_image() const {
 
 // --- persistence ------------------------------------------------------------
 
-Result<void> ClientDatabase::persist_unlocked() const {
-    JsonValue root = JsonValue::make_object();
-    root["version"] = 1;
-    root["pool_start"] = pool_start_.ip_string();
-    root["pool_end"] = pool_end_.ip_string();
-    root["default_base_image"] = default_base_image_;
-
-    JsonValue reserved = JsonValue::make_array();
-    for (const NetworkAddress& addr : reserved_) {
-        reserved.push_back(JsonValue(addr.ip_string()));
+Result<void> ClientDatabase::save() const {
+    auto res = store_->save();
+    if (!res.is_ok()) {
+        return res;
     }
-    root["reserved"] = reserved;
-
-    JsonValue clients = JsonValue::make_array();
-    for (const ClientEntry& entry : clients_) {
-        JsonValue obj = JsonValue::make_object();
-        obj["mac"] = entry.mac_address;
-        obj["hostname"] = entry.hostname;
-        obj["ip"] = entry.ip_address.ip_string();
-        obj["base_image"] = entry.base_image;
-        obj["super_client"] = entry.super_client;
-        clients.push_back(obj);
-    }
-    root["clients"] = clients;
-
-    std::ofstream out(db_file_, std::ios::trunc);
-    if (!out.is_open()) {
-        return Error(ErrorCode::StorageFailure,
-                     "Failed to open client database for writing: " + db_file_.string());
-    }
-    out << root.dump(2);
-    out.flush();
-    if (!out.good()) {
-        return Error(ErrorCode::StorageFailure,
-                     "Failed to write client database: " + db_file_.string());
-    }
-    return {};
-}
-
-Result<void> ClientDatabase::load() {
-    if (!std::filesystem::exists(db_file_)) {
-        return {};
-    }
-    std::ifstream in(db_file_, std::ios::binary);
-    if (!in.is_open()) {
-        return Error(ErrorCode::StorageFailure,
-                     "Failed to open client database for reading: " + db_file_.string());
-    }
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-
-    auto parsed = JsonValue::parse(buffer.str());
-    if (!parsed.has_value() || !parsed->is_object()) {
-        return Error(ErrorCode::StorageFailure,
-                     "Malformed client database: " + db_file_.string());
-    }
-
-    std::vector<ClientEntry> loaded;
-    std::vector<NetworkAddress> loaded_reserved;
-    NetworkAddress loaded_start{0, 0, 0, 0};
-    NetworkAddress loaded_end{0, 0, 0, 0};
-    std::string loaded_image;
-
-    if (const JsonValue* s = parsed->find("pool_start")) {
-        loaded_start = NetworkAddress::parse(s->as_string());
-    }
-    if (const JsonValue* e = parsed->find("pool_end")) {
-        loaded_end = NetworkAddress::parse(e->as_string());
-    }
-    if (const JsonValue* image = parsed->find("default_base_image")) {
-        loaded_image = image->as_string();
-    }
-    if (const JsonValue* reserved = parsed->find("reserved"); reserved && reserved->is_array()) {
-        for (const JsonValue& item : reserved->as_array()) {
-            if (item.is_string()) {
-                NetworkAddress addr = NetworkAddress::parse(item.as_string());
-                if (!addr.is_any()) {
-                    loaded_reserved.push_back(addr);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!pool_start_.is_any() || !pool_end_.is_any() || !default_base_image_.empty() || !reserved_.empty()) {
+        const auto& path = store_->store_file();
+        std::ifstream in(path, std::ios::binary);
+        if (in.is_open()) {
+            std::ostringstream buf;
+            buf << in.rdbuf();
+            in.close();
+            auto parsed = JsonValue::parse(buf.str());
+            if (parsed.has_value() && parsed->is_object()) {
+                JsonValue root = std::move(parsed.value());
+                if (!pool_start_.is_any()) root["pool_start"] = pool_start_.ip_string();
+                if (!pool_end_.is_any()) root["pool_end"] = pool_end_.ip_string();
+                if (!default_base_image_.empty()) root["default_base_image"] = default_base_image_;
+                if (!reserved_.empty()) {
+                    JsonValue res_arr = JsonValue::make_array();
+                    for (const auto& a : reserved_) {
+                        res_arr.push_back(JsonValue(a.ip_string()));
+                    }
+                    root["reserved"] = std::move(res_arr);
+                }
+                std::ofstream out(path, std::ios::trunc | std::ios::binary);
+                if (out.is_open()) {
+                    out << root.dump(2);
                 }
             }
         }
     }
-    if (const JsonValue* clients = parsed->find("clients"); clients && clients->is_array()) {
-        for (const JsonValue& item : clients->as_array()) {
-            if (!item.is_object()) {
-                continue;
-            }
-            ClientEntry entry;
-            if (const JsonValue* mac = item.find("mac")) {
-                entry.mac_address = mac->as_string();
-            }
-            if (entry.mac_address.empty()) {
-                continue;
-            }
-            if (const JsonValue* host = item.find("hostname")) {
-                entry.hostname = host->as_string();
-            }
-            if (const JsonValue* ip = item.find("ip")) {
-                entry.ip_address = NetworkAddress::parse(ip->as_string());
-            }
-            if (const JsonValue* image = item.find("base_image")) {
-                entry.base_image = image->as_string();
-            }
-            if (const JsonValue* super = item.find("super_client")) {
-                entry.super_client = super->as_bool(false);
-            }
-            loaded.push_back(std::move(entry));
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        clients_ = std::move(loaded);
-        pool_start_ = loaded_start;
-        pool_end_ = loaded_end;
-        default_base_image_ = std::move(loaded_image);
-        if (!loaded_reserved.empty()) {
-            reserved_ = std::move(loaded_reserved);
-        }
-    }
-    return {};
+    return res;
 }
 
-Result<void> ClientDatabase::save() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return persist_unlocked();
+Result<void> ClientDatabase::load() {
+    auto res = store_->load();
+    if (std::filesystem::exists(store_->store_file())) {
+        std::ifstream in(store_->store_file(), std::ios::binary);
+        if (in.is_open()) {
+            std::ostringstream buf;
+            buf << in.rdbuf();
+            auto parsed = JsonValue::parse(buf.str());
+            if (parsed.has_value() && parsed->is_object()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (const JsonValue* s = parsed->find("pool_start")) {
+                    NetworkAddress na = NetworkAddress::parse(s->as_string());
+                    if (!na.is_any()) pool_start_ = na;
+                }
+                if (const JsonValue* e = parsed->find("pool_end")) {
+                    NetworkAddress na = NetworkAddress::parse(e->as_string());
+                    if (!na.is_any()) pool_end_ = na;
+                }
+                if (const JsonValue* image = parsed->find("default_base_image")) {
+                    default_base_image_ = image->as_string();
+                }
+                if (const JsonValue* r = parsed->find("reserved"); r && r->is_array()) {
+                    std::vector<NetworkAddress> loaded_reserved;
+                    for (const auto& item : r->as_array()) {
+                        if (item.is_string()) {
+                            NetworkAddress na = NetworkAddress::parse(item.as_string());
+                            if (!na.is_any()) loaded_reserved.push_back(na);
+                        }
+                    }
+                    if (!loaded_reserved.empty()) reserved_ = std::move(loaded_reserved);
+                }
+            }
+        }
+    }
+    return res;
 }
 
 // --- internals --------------------------------------------------------------
@@ -542,47 +560,6 @@ Result<void> ClientDatabase::save() const {
 bool ClientDatabase::same_ip(const NetworkAddress& a, const NetworkAddress& b) noexcept {
     return a.octet(0) == b.octet(0) && a.octet(1) == b.octet(1) &&
            a.octet(2) == b.octet(2) && a.octet(3) == b.octet(3);
-}
-
-NetworkAddress ClientDatabase::allocate_ip_locked() const {
-    if (!pool_start_.is_any() && !pool_end_.is_any()) {
-        const uint32_t begin = ipv4_to_u32(pool_start_);
-        const uint32_t finish = ipv4_to_u32(pool_end_);
-        if (begin <= finish) {
-            uint32_t probes = 0;
-            for (uint32_t candidate = begin;
-                 candidate <= finish && probes < kMaxPoolProbes;
-                 ++candidate, ++probes) {
-                const NetworkAddress addr = u32_to_ipv4(candidate);
-
-                bool reserved = false;
-                for (const NetworkAddress& deny : reserved_) {
-                    if (same_ip(deny, addr)) {
-                        reserved = true;
-                        break;
-                    }
-                }
-                if (reserved) {
-                    continue;
-                }
-
-                bool used = false;
-                for (const ClientEntry& entry : clients_) {
-                    if (same_ip(entry.ip_address, addr)) {
-                        used = true;
-                        break;
-                    }
-                }
-                if (!used) {
-                    return addr;
-                }
-            }
-        }
-    }
-
-    // Second chance: the caller may have configured a pool outside the
-    // conventional range but left the derived range empty.
-    return NetworkAddress(0, 0, 0, 0);
 }
 
 } // namespace cobdiskless
