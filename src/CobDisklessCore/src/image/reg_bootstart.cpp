@@ -2871,18 +2871,55 @@ Result<BootStartArmReport> RegBootStart::arm_image_offline_pipeline(
         if (!validate_vhd_compact_os(win_vol_root)) {
             report.warnings.push_back("CompactOS / WOF compression detected on bootres.dll.mui; neutralizing automatically...");
             std::cout << "[INFO] Neutralizing CompactOS / WOF compression on boot path binaries..." << std::endl;
-            // Decompress boot-critical binaries so iSCSI client does not hang at Phase 0/1 LBA
-            std::string decompress_cmds[] = {
-                "compact.exe /u /f /exe:none \"" + (win_vol_root / "Windows" / "Boot" / "Resources" / "*.*").string() + "\" >nul 2>&1",
-                "compact.exe /u /f /exe:none \"" + (win_vol_root / "Windows" / "Boot" / "Resources" / "en-US" / "*.*").string() + "\" >nul 2>&1",
-                "compact.exe /u /f /exe:none \"" + (win_vol_root / "Windows" / "System32" / "bootres.dll").string() + "\" >nul 2>&1",
-                "compact.exe /u /f /exe:none \"" + (win_vol_root / "Windows" / "System32" / "bootvid.dll").string() + "\" >nul 2>&1"
+            // Decompress boot-critical binaries so iSCSI client does not hang at Phase 0/1 LBA.
+            //
+            // compact.exe accepts only /EXE:<algorithm> (XPRESS4K, XPRESS8K,
+            // XPRESS16K, LZX); "/EXE:none" is a syntax error that makes it
+            // print its usage and change nothing. These commands used to pass
+            // exactly that, with stdout discarded and the return value ignored,
+            // so nothing was ever decompressed and only the success message --
+            // never a failure -- could ever be printed.
+            //
+            // WOF / CompactOS binaries are "EXE compressed", and /U without
+            // /EXE only touches NTFS-compressed files, so every target is run
+            // both ways: /EXE recovers the WOF case, bare /U the NTFS one.
+            static const char* const kDecompressSwitches[] = { "/u /f /exe", "/u /f" };
+            const std::filesystem::path decompress_targets[] = {
+                win_vol_root / "Windows" / "Boot" / "Resources" / "*.*",
+                win_vol_root / "Windows" / "Boot" / "Resources" / "en-US" / "*.*",
+                win_vol_root / "Windows" / "System32" / "bootres.dll",
+                win_vol_root / "Windows" / "System32" / "bootvid.dll"
             };
-            for (const auto& cmd : decompress_cmds) {
-                (void)std::system(cmd.c_str());
+
+            int decompress_failures = 0;
+            for (const char* switches : kDecompressSwitches) {
+                for (const auto& target : decompress_targets) {
+                    const std::string tgt = target.string();
+                    // Wildcards are left for compact.exe to expand; only concrete
+                    // paths are checked, because a file that is simply absent is
+                    // nothing to decompress rather than an error.
+                    if (tgt.find('*') == std::string::npos && !std::filesystem::exists(target)) {
+                        continue;
+                    }
+                    const std::string cmd =
+                        std::string("compact.exe ") + switches + " \"" + tgt + "\" >nul 2>&1";
+                    if (std::system(cmd.c_str()) != 0) {
+                        ++decompress_failures;
+                        std::cout << "[WARN] compact.exe " << switches << " \"" << tgt
+                                  << "\" did not succeed." << std::endl;
+                    }
+                }
             }
+
             if (validate_vhd_compact_os(win_vol_root)) {
                 std::cout << "[INFO] Boot path binaries decompressed successfully." << std::endl;
+            } else {
+                std::cout << "[WARN] CompactOS / WOF compression is still present on the boot path";
+                if (decompress_failures > 0) {
+                    std::cout << " (" << decompress_failures
+                              << " compact.exe invocation(s) did not succeed)";
+                }
+                std::cout << "; iSCSI clients may stall at Phase 0/1 LBA." << std::endl;
             }
         }
 
@@ -3280,7 +3317,7 @@ bool RegBootStart::validate_vhd_compact_os(const std::filesystem::path& vhd_path
         std::cerr << "  Impact:        Deterministic client boot freeze / TX ring dead during PnP handover" << std::endl;
         std::cerr << "                 (BSOD 0x0000007B)." << std::endl;
         std::cerr << "  Remediation:   Strip CompactOS / WOF compression immediately:" << std::endl;
-        std::cerr << "                 compact /u /f /exe:none <Drive>:\\Windows\\Boot\\Resources\\en-US\\*.*" << std::endl;
+        std::cerr << "                 compact /u /f /exe <Drive>:\\Windows\\Boot\\Resources\\en-US\\*.*" << std::endl;
         std::cerr << "                 or run tools/fix_vhd_payload.ps1" << std::endl;
         std::cerr << "================================================================================\n" << std::endl;
 

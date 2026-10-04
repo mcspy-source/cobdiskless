@@ -97,20 +97,61 @@ if (-not $osDrive) {
 # 5. Completely Strip CompactOS / WOF Compression from Boot Path
 Write-Host "[5] Completely stripping CompactOS / WOF compression from boot-critical path..." -ForegroundColor Yellow
 
-Write-Host "    -> Decompressing $osDrive\Windows\Boot\Resources\*.*"
-& compact.exe /u /f /exe:none "$osDrive\Windows\Boot\Resources\*.*"
+# compact.exe accepts only /EXE:<algorithm> (XPRESS4K, XPRESS8K, XPRESS16K,
+# LZX), so "/EXE:none" is a syntax error: it prints usage and changes nothing,
+# which is what every /EXE:none call below used to do while looking like it
+# worked. WOF / CompactOS binaries are "EXE compressed" and plain /U only
+# touches NTFS-compressed files, so every target is run both ways -- /EXE for
+# the WOF case, bare /U for the NTFS one. Returns how many of those
+# invocations failed, so the caller can report them instead of dropping them.
+function Invoke-CompactDecompress {
+    param([string[]]$Arguments)
 
-Write-Host "    -> Decompressing $osDrive\Windows\Boot\Resources\en-US\*.*"
-& compact.exe /u /f /exe:none "$osDrive\Windows\Boot\Resources\en-US\*.*"
+    $failures = 0
+    foreach ($swap in @(@('/u', '/f', '/exe'), @('/u', '/f'))) {
+        $label   = $swap -join ' '
+        $argList = $swap + $Arguments
+        # No 2>&1: compact.exe writes its usage and results to stdout, and
+        # redirecting the error stream here would make PowerShell wrap its
+        # stderr in a NativeCommandError stack block instead of letting the
+        # reason through as plain text. The exit code below is what is checked.
+        $out     = (& compact.exe @argList | Out-String)
 
-Write-Host "    -> Decompressing $osDrive\Windows\System32\bootres.dll"
-& compact.exe /u /f /exe:none "$osDrive\Windows\System32\bootres.dll"
+        if ($out -match 'Displays or alters the compression') {
+            Write-Host "       [!] $label rejected (usage printed) for $($Arguments -join ' ')" -ForegroundColor Red
+            $failures++
+        }
+        elseif ($LASTEXITCODE -ne 0) {
+            Write-Host "       [!] $label exited with code ${LASTEXITCODE} for $($Arguments -join ' ')" -ForegroundColor Red
+            $trimmed = $out.Trim()
+            if ($trimmed) { Write-Host ('          ' + $trimmed) }
+            $failures++
+        }
+        else {
+            Write-Host "       [$label] ok"
+        }
+    }
+    return $failures
+}
 
-Write-Host "    -> Decompressing $osDrive\Windows\System32\bootvid.dll"
-& compact.exe /u /f /exe:none "$osDrive\Windows\System32\bootvid.dll"
+$compactFailures = 0
+$bootPathTargets = @(
+    "$osDrive\Windows\Boot\Resources\*.*",
+    "$osDrive\Windows\Boot\Resources\en-US\*.*",
+    "$osDrive\Windows\System32\bootres.dll",
+    "$osDrive\Windows\System32\bootvid.dll"
+)
+foreach ($t in $bootPathTargets) {
+    if ($t -notmatch '\*' -and -not (Test-Path -LiteralPath $t)) {
+        Write-Host "    -> (absent, skipped) $t"
+        continue
+    }
+    Write-Host "    -> Decompressing $t"
+    $compactFailures += Invoke-CompactDecompress -Arguments @($t)
+}
 
-Write-Host "    -> Decompressing drivers in $osDrive\Windows\System32\drivers\*.*"
-& compact.exe /u /f /s:"$osDrive\Windows\System32\drivers" *.*
+Write-Host "    -> Decompressing drivers under $osDrive\Windows\System32\drivers\"
+$compactFailures += Invoke-CompactDecompress -Arguments @("/s:$osDrive\Windows\System32\drivers", '*.*')
 
 # Extra hardening: Re-write bootres.dll.mui cleanly to eliminate any leftover Alternate Data Streams (ADS)
 $bootresMui = "$osDrive\Windows\Boot\Resources\en-US\bootres.dll.mui"
@@ -127,8 +168,21 @@ if (Test-Path $bootresMui) {
     # Read raw bytes and re-save to guarantee normal uncompressed clusters
     $bytes = [System.IO.File]::ReadAllBytes($bootresMui)
     [System.IO.File]::WriteAllBytes($bootresMui, $bytes)
-    & compact.exe /u /f /exe:none "$bootresMui"
-    Write-Host "    -> bootres.dll.mui verified uncompressed (Length: $($bytes.Length) bytes)." -ForegroundColor Green
+    $compactFailures += Invoke-CompactDecompress -Arguments @($bootresMui)
+
+    # Confirm the result rather than assuming the calls above worked.
+    $muiState = (& compact.exe "$bootresMui" | Out-String)
+    if ($muiState -match '1 are compressed') {
+        Write-Host "    -> bootres.dll.mui is STILL COMPRESSED after decompression." -ForegroundColor Red
+        $compactFailures++
+    }
+    else {
+        Write-Host "    -> bootres.dll.mui verified uncompressed (Length: $($bytes.Length) bytes)." -ForegroundColor Green
+    }
+}
+
+if ($compactFailures -gt 0) {
+    Write-Host "[!] $compactFailures compact.exe invocation(s) failed -- see the messages above." -ForegroundColor Red
 }
 
 # 6. Inject Hardware Stabilization Keys into Offline Registry Hive

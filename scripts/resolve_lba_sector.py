@@ -344,7 +344,7 @@ def resolve_lba(vhd_path, target_lba, request_length_bytes):
         print(f"       - 'SkipPhyReset'        = DWORD:1")
         print(f"       Ensure 'msiscsi' service has 'Start' = DWORD:0.")
         print(f"   [2] Uncompress Boot Resources (De-Compact WOF):")
-        print(f"       Boot into WinPE or mount VHD and run: 'compact /u /f /exe:none C:\\Windows\\Boot\\Resources\\*.*'")
+        print(f"       Boot into WinPE or mount VHD and run: 'compact /u /f /exe C:\\Windows\\Boot\\Resources\\*.*'")
         print(f"       Ensure boot-critical binaries (bootres.dll, bootres.dll.mui, winload.exe) are uncompressed")
         print(f"       standard NTFS clusters rather than WofCompressedData streams.")
         print("=" * 80)
