@@ -124,16 +124,25 @@ void CowOverlaySession::init_file_handle() {
             std::filesystem::create_directories(parent, ec);
         }
 
-        // Ephemeral COW File Lifecycle Management:
-        // CREATE_ALWAYS with FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OVERLAPPED.
+        // File creation flags: open, never truncate, never self-delete.
+        //
+        // This handle shares its path with WritebackContext, which owns the
+        // same overlay file and has already committed the 512-byte COWB
+        // header to it. CREATE_ALWAYS would zero that header out, and
+        // FILE_FLAG_DELETE_ON_CLOSE would unlink the file as soon as the last
+        // handle went away -- either way the persistent overlay is gone
+        // before its owner ever reads it back. OPEN_ALWAYS creates a file
+        // that is genuinely new and leaves an existing one untouched;
+        // deletion stays an explicit close_and_destroy_file() decision so the
+        // ephemeral lifecycle still releases space on disconnect.
         // Opens without FILE_FLAG_WRITE_THROUGH for volatile writeback (QEMU cache=unsafe).
         HANDLE h = CreateFileA(
             cow_path_.string().c_str(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OVERLAPPED,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OVERLAPPED,
             nullptr
         );
 

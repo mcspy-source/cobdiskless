@@ -465,10 +465,17 @@ Result<void> WritebackContext::init_or_load_overlay_locked() {
     drain_failed_ = false;
     drain_error_.clear();
 
-    // Ensure parent directories exist
+    // Ensure parent directories exist, and verify it. Left unchecked, a
+    // failed create here surfaces later as a misleading "failed to create
+    // writeback file" from the open below instead of the real path error.
     if (overlay_path_.has_parent_path()) {
         std::error_code dir_ec;
         std::filesystem::create_directories(overlay_path_.parent_path(), dir_ec);
+        if (dir_ec) {
+            return Error(ErrorCode::StorageFailure,
+                         "Failed to create writeback directory " +
+                         overlay_path_.parent_path().string() + ": " + dir_ec.message());
+        }
     }
 
     std::error_code ec;
@@ -558,6 +565,18 @@ Result<void> WritebackContext::init_or_load_overlay_locked() {
         if (!res.is_ok()) {
             overlay_.close();
             return res;
+        }
+        // Verify the initial header commit actually reached the file. A
+        // caller checking the overlay straight after create() is entitled to
+        // find a whole COWB header, not a zero-length file, and a header that
+        // silently failed to land would be indistinguishable from a valid
+        // empty overlay on the next open.
+        std::error_code commit_ec;
+        const auto committed_bytes = std::filesystem::file_size(overlay_path_, commit_ec);
+        if (commit_ec || committed_bytes < sizeof(CowHeader)) {
+            overlay_.close();
+            return Error(ErrorCode::StorageFailure,
+                         "COW header did not commit to disk: " + overlay_path_.string());
         }
         Logger::default_logger().info("COW",
             "[COW] Created fresh empty writeback overlay: " + overlay_path_.string());

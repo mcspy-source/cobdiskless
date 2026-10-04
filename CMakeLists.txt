@@ -260,6 +260,24 @@ if(BUILD_TESTING)
         COMMAND cobdiskless_core_test
     )
 
+    # The CompactOS preflight test drives compact.exe with Windows switches
+    # (/c to compress, /u /f to decompress) via std::system(). Because the test
+    # binary is built for the MSYS2 runtime, those switches are mistaken for
+    # POSIX paths and rewritten before the child ever starts -- "compact.exe /c
+    # ..." arrives as "compact.exe C:\ ...". compact.exe then runs in query
+    # mode, exits 0 having compressed nothing, and the test's own
+    # "did this file really compress?" assertions fail for a reason that has
+    # nothing to do with what they are measuring. Excluding exactly those three
+    # switches from path conversion leaves every genuine path argument still
+    # converted as before.
+    #
+    # NB: MSYS2 wants literal semicolons inside the value, but the ENVIRONMENT
+    # property is a CMake list and would split on them -- hence the \; escapes,
+    # which CTest unescapes back into a single MSYS2_ARG_CONV_EXCL value.
+    set_tests_properties(CoreLifecycleTest PROPERTIES
+        ENVIRONMENT "MSYS2_ARG_CONV_EXCL=/c\;/u\;/f"
+    )
+
     # cob-armer is exercised end to end rather than through a unit harness: the
     # self-test builds a synthetic SYSTEM hive, arms it, reads the result back
     # and round-trips the JSON report; the two negatives pin down the argument

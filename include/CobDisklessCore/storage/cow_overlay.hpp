@@ -107,9 +107,12 @@ private:
  * 4. Background Elevator Lazy Flush Engine (True Asynchronous Writeback):
  *    Writes copied to in-memory dirty buffer and acked immediately (0.1ms latency).
  *    Elevator worker sorts flush_queue in ascending LBA order every 1,000ms or 32MB.
- * 5. Ephemeral COW File Lifecycle Management:
- *    Opened with FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE.
- *    Unlinked on disconnect/LOGOUT to reclaim SSD space immediately.
+ * 5. COW file lifecycle:
+ *    The overlay file is opened with OPEN_ALWAYS, so an existing file is
+ *    never truncated out from under the WritebackContext that owns the same
+ *    path; DELETE_ON_CLOSE is deliberately not used for that reason.
+ *    Unlinking is an explicit close_and_destroy_file() call, made on
+ *    disconnect/LOGOUT to reclaim SSD space immediately.
  */
 class CowOverlaySession : public BlockDevice {
 public:

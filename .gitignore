@@ -108,13 +108,10 @@ ipch/
 *.gch
 *.pch
 
-# Note: tftp_boot/ holds prebuilt iPXE bootloaders that are required at runtime
-# and are deliberately tracked; these negations run after the *.exe/*.dll rules
-# above. Negation works because the tftp_boot/ directory itself is never
-# excluded -- only extension patterns are.
-!tftp_boot/*.efi
-!tftp_boot/*.kpxe
-!tftp_boot/*.pxe
+# Note: tftp_boot/ holds the prebuilt iPXE bootloaders the clients actually
+# boot from (ipxe.efi, snponly.efi, undionly.kpxe, realtek.kpxe). They are
+# runtime artifacts rather than build output and are deliberately tracked.
+# No ignore rule covers their extensions, so no negation is needed for them.
 
 # -----------------------------------------------------------------------------
 # 3. Diskless test images, disk dumps, and network captures
@@ -229,15 +226,10 @@ UsrClass.dat
 # One-off diagnostic scratch under tools/.  Only tools/fix_vhd_payload.ps1 is
 # project source -- it is named in the remediation hint printed by
 # reg_bootstart.cpp -- so it is re-included and force-added; everything else
-# here (probe output, service listings, hive dumps, ad-hoc utilities) is
-# local state.
+# here (probe output, service listings, hive dumps) is local state. The
+# ad-hoc utilities that used to sit beside them now live in archive/.
 /tools/*
 !/tools/fix_vhd_payload.ps1
-
-# Local host scratch scripts referenced by no tracked file.
-/inspect_vhd_hive.ps1
-/restart_stack.ps1
-/test_mount.ps1
 
 # -----------------------------------------------------------------------------
 # 7. Archives, compressed payloads, and scratch media
@@ -305,24 +297,3 @@ __pycache__/
 *.p12
 *.pfx
 /secrets/
-
-# -----------------------------------------------------------------------------
-# 11. Vendored reference code held outside third_party/
-# -----------------------------------------------------------------------------
-# src/reference/ holds verbatim copies of upstream source kept for reading
-# only -- QEMU's qcow2.c and io.c, which back our own VHD/qcow2 handling.
-#
-# They are deliberately NOT committed:
-#
-#   * nothing in CMakeLists.txt or in the code references them -- they are not
-#     compiled into any target, so the build is unaffected either way;
-#   * they were imported without their SPDX / copyright headers, so a copy in
-#     this tree carries no visible licence notice of its own; and
-#   * QEMU is a different licence tree from this project's GPLv3, so
-#     redistributing it here needs a provenance record in
-#     docs/THIRD_PARTY_NOTES.md first -- the repository's standing rule for
-#     third-party material.
-#
-# To ship them deliberately: restore the licence headers, document them in
-# docs/THIRD_PARTY_NOTES.md, then `git add -f src/reference/`.
-/src/reference/
