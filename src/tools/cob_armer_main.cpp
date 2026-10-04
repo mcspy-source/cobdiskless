@@ -146,6 +146,12 @@ std::vector<std::string> unmet_arming(const HiveInspectionReport& report) {
                            ": BootFlags (CM_SERVICE_NETWORK_BOOT_LOAD) is absent");
         }
     }
+    if (!report.has_disk_timeout || report.disk_timeout < 60) {
+        gaps.push_back("disk\\TimeOutValue is absent or less than 60s");
+    }
+    if (!report.tcpip_media_sense_disabled) {
+        gaps.push_back("Tcpip Parameters\\DisableDHCPMediaSense is not 1");
+    }
     return gaps;
 }
 

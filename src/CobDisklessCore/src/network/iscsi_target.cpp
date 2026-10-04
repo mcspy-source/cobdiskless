@@ -1244,6 +1244,26 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
 
     Logger::default_logger().info("BOOT", "[BOOT STAGE 11] iSCSI TCP connection received: Client=" + client_ip.ip_string() + ":" + std::to_string(client_ip.port()));
 
+    if (session_mgr_) {
+        if (auto existing_session = session_mgr_->find_session_by_ip(client_ip)) {
+            uintptr_t old_sock = existing_session->active_socket();
+            if (old_sock != ~static_cast<uintptr_t>(0) && old_sock != client_sock) {
+                Logger::default_logger().warn("iSCSI",
+                    "[SESSION REINSTATEMENT] Incoming reconnection from IP " + client_ip.ip_string() +
+                    " with stale socket " + std::to_string(old_sock) + ". Aborting dead connection and releasing locks.");
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+                ::shutdown(static_cast<SOCKET>(old_sock), SD_BOTH);
+                closesocket(static_cast<SOCKET>(old_sock));
+#endif
+                {
+                    std::lock_guard<std::mutex> sock_lock(client_sockets_mutex_);
+                    client_sockets_.erase(old_sock);
+                }
+                existing_session->set_active_socket(client_sock);
+            }
+        }
+    }
+
     std::shared_ptr<ClientSession> session;
     std::string initiator_name;
     std::string target_name;
@@ -1504,6 +1524,7 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 } else if (err == WSAECONNRESET || err == WSAECONNABORTED) {
                     std::string tag = get_client_tag();
                     Logger::default_logger().warn("iSCSI", "[iSCSI TCP] Client [" + tag + "] connection reset by peer (TCP RST received).");
+                    connection_broken = true;
                     if (session) {
                         auto now = std::chrono::steady_clock::now();
                         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - session->last_scsi_time()).count();
@@ -1512,6 +1533,24 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                                 "[WATCHDOG] Client [" + tag + "] silent for 3000ms. Last active LBA: " + std::to_string(session->last_active_lba()) +
                                 " (" + std::to_string(session->last_active_sectors()) + " sectors). TCP Socket Status: Closed");
                         }
+                        if (session->active_socket() == client_sock) {
+                            session->set_active_socket(~static_cast<uintptr_t>(0));
+                        }
+                        session->mark_disconnected();
+                        if (session->cow_block_device()) {
+                            if (session->cow_block_device()->ram_overlay()) {
+                                (void)session->cow_block_device()->ram_overlay()->flush_to_disk();
+                            }
+                            (void)session->cow_block_device()->flush();
+                        }
+                    }
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+                    ::shutdown(s, SD_BOTH);
+                    closesocket(s);
+#endif
+                    {
+                        std::lock_guard<std::mutex> sock_lock(client_sockets_mutex_);
+                        client_sockets_.erase(client_sock);
                     }
                     return -1;
                 } else {
@@ -1641,6 +1680,33 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                             "[SESSION REINSTATEMENT] RFC 3720 §5.3.5: Active session [" + existing_session->id().value() +
                             "] found for Initiator='" + initiator_name + "' ISID=" + isid_key +
                             " with stale socket " + std::to_string(old_sock) + ". Aborting dead connection and reinstating.");
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+                        ::shutdown(static_cast<SOCKET>(old_sock), SD_BOTH);
+                        closesocket(static_cast<SOCKET>(old_sock));
+#endif
+                        {
+                            std::lock_guard<std::mutex> sock_lock(client_sockets_mutex_);
+                            client_sockets_.erase(old_sock);
+                        }
+                    }
+                    session = existing_session;
+                    session->set_active_socket(client_sock);
+                    session->set_state(ClientState::Online);
+                    (void)retain_session_connection(session);
+                    Logger::default_logger().info("iSCSI",
+                        "[SESSION REINSTATEMENT] Rebound existing session [" + session->id().value() +
+                        "] and COW overlay to socket " + std::to_string(client_sock));
+                }
+            }
+
+            if (!session && session_mgr_) {
+                std::lock_guard<std::mutex> r_lock(reinstatement_mutex_);
+                if (auto existing_session = session_mgr_->find_session_by_ip(client_ip)) {
+                    uintptr_t old_sock = existing_session->active_socket();
+                    if (old_sock != ~static_cast<uintptr_t>(0) && old_sock != client_sock) {
+                        Logger::default_logger().warn("iSCSI",
+                            "[SESSION REINSTATEMENT] Active session [" + existing_session->id().value() +
+                            "] found for IP=" + client_ip.ip_string() + " with stale socket " + std::to_string(old_sock) + ". Reinstating.");
 #if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
                         ::shutdown(static_cast<SOCKET>(old_sock), SD_BOTH);
                         closesocket(static_cast<SOCKET>(old_sock));

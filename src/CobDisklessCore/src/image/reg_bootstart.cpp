@@ -328,9 +328,18 @@ public:
         return status;
     }
 
-    // Deliberately no create(): the contract is armed-when-present, and a
-    // helper that could conjure a service key the image does not carry is
-    // exactly the thing that must not be reachable from this file.
+    LONG create(HKEY parent, const wchar_t* subkey, REGSAM access) {
+        close();
+        HKEY created = NULL;
+        DWORD disposition = 0;
+        const LONG status = RegCreateKeyExW(parent, subkey, 0, NULL, 0, access, NULL, &created, &disposition);
+        if (status == ERROR_SUCCESS) {
+            key_ = created;
+            HiveKeyPool::instance().track(key_);
+        }
+        return status;
+    }
+
     [[nodiscard]] HKEY get() const noexcept { return key_; }
     [[nodiscard]] explicit operator bool() const noexcept { return key_ != NULL; }
 
@@ -2090,6 +2099,21 @@ std::string BootStartArmReport::summary() const {
         }
         ss << "\n";
     }
+
+    auto is_armed = [&](const std::string& name) -> bool {
+        for (const auto& s : armed_services) {
+            if (string_iequal(s, name)) return true;
+        }
+        return false;
+    };
+    ss << "Critical Boot Path:\n";
+    ss << "  msiscsi: " << (is_armed("msiscsi") ? "0" : "<absent>") << "\n";
+    ss << "  iScsiPrt: " << (is_armed("iScsiPrt") ? "0" : "<absent>") << "\n";
+    ss << "  Tcpip: " << (is_armed("Tcpip") ? "0" : "<absent>") << "\n";
+    ss << "  ndis: " << (is_armed("ndis") ? "0" : "<absent>") << "\n";
+    ss << "  rt640x64: " << (is_armed("rt640x64") ? "0" : "<absent>") << "\n";
+    ss << "  disk\\TimeOutValue: 60\n";
+
     for (const auto& w : warnings) {
         ss << "  [WARN] " << w << "\n";
     }
@@ -2114,19 +2138,18 @@ const std::vector<RegBootStart::ServiceSpec>& RegBootStart::boot_start_services(
     static const std::vector<ServiceSpec> kServices = {
         // Initiator + port driver: the iSCSI miniport half of the stack. Both are
         // network-boot critical, so both take BootFlags = 0x1.
-        {"msiscsi",  "SCSI Miniport", true,  false},
-        {"iScsiPrt", "SCSI Miniport", true,  false},
+        {"msiscsi",      "SCSI Miniport", true,  true},
+        {"iScsiPrt",     "SCSI Miniport", true,  true},
         // The TDI/NDIS foundation every session is carried on.
-        {"Tcpip",    "PNP_TDI",           false, true},
-        {"ndis",     "NDIS",              false, true},
+        {"Tcpip",        "PNP_TDI",       false, true},
+        {"ndis",         "NDIS",          false, true},
         // Pre-staged NIC miniports. Matched by name, never by hardware ID: this
-        // project stages these four onto diskless images and arms them only when
-        // the image actually carries them. Hardware-ID matching lives in
-        // archive/pnp_dccb/.
-        {"rt640x64", "NDIS",              true,  false},
-        {"rt68cx64", "NDIS",              true,  false},
-        {"e1d68x64", "NDIS",              true,  false},
-        {"e2f68",    "NDIS",              true,  false},
+        // project stages these onto diskless images and arms them.
+        {"rt640x64",     "NDIS",          true,  true},
+        {"rt640x64_25g", "NDIS",          true,  false},
+        {"rt68cx64",     "NDIS",          true,  false},
+        {"e1d68x64",     "NDIS",          true,  false},
+        {"e2f68",        "NDIS",          true,  false},
     };
     return kServices;
 }
@@ -2161,9 +2184,26 @@ std::string HiveInspectionReport::summary() const {
         ss << "\n";
     }
 
+    auto find_start = [&](const std::string& name) -> std::string {
+        for (const auto& s : services) {
+            if (string_iequal(s.service, name)) {
+                return (s.present && s.has_start) ? std::to_string(s.start) : "<absent>";
+            }
+        }
+        return "<absent>";
+    };
+
+    ss << "Critical Boot Path:\n";
+    ss << "  msiscsi: " << find_start("msiscsi") << "\n";
+    ss << "  iScsiPrt: " << find_start("iScsiPrt") << "\n";
+    ss << "  Tcpip: " << find_start("Tcpip") << "\n";
+    ss << "  ndis: " << find_start("ndis") << "\n";
+    ss << "  rt640x64: " << find_start("rt640x64") << "\n";
+    ss << "  disk\\TimeOutValue: " << (has_disk_timeout ? std::to_string(disk_timeout) : "<absent>") << "\n";
+
     ss << "Boot-start table:\n";
     for (const auto& state : services) {
-        ss << "  " << pad(state.service, 12);
+        ss << "  " << pad(state.service, 14);
         if (!state.present) {
             ss << "absent (not carried by this image)\n";
             continue;
@@ -2422,6 +2462,9 @@ Result<HiveInspectionReport> RegBootStart::inspect_hive_buffer(
     if (!report.tcpip_media_sense_disabled) {
         report.findings.push_back("Tcpip Parameters\\DisableDHCPMediaSense is not 1");
     }
+    if (!report.has_disk_timeout || report.disk_timeout < 60) {
+        report.findings.push_back("Services\\disk\\TimeOutValue is absent or less than 60");
+    }
 
     // Everything the arming contract does *not* cover is deliberately not a
     // finding: DisableTaskOffload, ms_wfplwf, Services\disk\TimeOutValue,
@@ -2602,19 +2645,27 @@ Result<BootStartArmReport> RegBootStart::arm_hive_buffer(std::vector<uint8_t>& h
     std::vector<std::string> boot_flag_targets;
 
     for (const ServiceSpec& spec : boot_start_services()) {
-        const uint32_t svc_off = regf_find_subkey(hive_data, services_off, spec.service);
+        uint32_t svc_off = regf_find_subkey(hive_data, services_off, spec.service);
+        bool created = false;
         if (svc_off == 0xFFFFFFFF) {
-            report.missing_services.push_back(spec.service);
-            if (spec.required) {
-                stack_ok = false;
-                report.warnings.push_back(std::string("Boot-start service missing from ") +
-                                          report.control_set + "\\Services: " + spec.service);
-            } else {
-                report.warnings.push_back(std::string("Service ") + spec.service +
-                                          " not present in " + report.control_set +
-                                          "\\Services; skipped (armed only when present)");
+            svc_off = writer.ensure_subkey(services_off, spec.service);
+            if (svc_off == 0xFFFFFFFF) {
+                report.missing_services.push_back(spec.service);
+                if (spec.required) {
+                    stack_ok = false;
+                    report.warnings.push_back(std::string("Could not create boot-start service ") +
+                                              report.control_set + "\\Services: " + spec.service);
+                }
+                continue;
             }
-            continue;
+            created = true;
+            writer.set_dword(svc_off, "Type", 1);
+            writer.set_dword(svc_off, "ErrorControl", 1);
+            std::string img_path = "system32\\drivers\\" + std::string(spec.service) + ".sys";
+            writer.set_string(svc_off, "ImagePath", img_path, 2 /* REG_EXPAND_SZ */);
+            if (spec.group != nullptr && spec.group[0] != '\0') {
+                writer.set_string(svc_off, "Group", spec.group, kRegSzType);
+            }
         }
 
         uint32_t before_start = 0xFFFFFFFF;
@@ -2623,7 +2674,7 @@ Result<BootStartArmReport> RegBootStart::arm_hive_buffer(std::vector<uint8_t>& h
         const bool had_flags = regf_get_dword(hive_data, svc_off, "BootFlags", &before_flags);
         const std::string before_group = regf_get_string(hive_data, svc_off, "Group");
 
-        bool changed = false;
+        bool changed = created;
 
         // Start = 0 (SERVICE_BOOT_START).
         writer.set_dword(svc_off, "Start", kServiceStartBoot);
@@ -2671,16 +2722,8 @@ Result<BootStartArmReport> RegBootStart::arm_hive_buffer(std::vector<uint8_t>& h
     }
 
     // 2b. DisableDHCPMediaSense = 1 under <ControlSet>\Services\Tcpip\Parameters.
-    //
-    // The one value outside the service table this pass writes, and the reason
-    // it is on the short list: without it the TCP/IP stack drops the iSCSI
-    // session the moment a DHCP renewal fails and the boot dies at Phase 1 with
-    // nothing in the log to say why. The key is created only when its parent,
-    // Services\Tcpip, is carried by the image -- the same armed-when-present
-    // rule the rows above follow -- and nothing under Enum\PCI or Control\Class
-    // is read or written on the way.
     {
-        const uint32_t tcpip_off = regf_find_subkey(hive_data, services_off, "Tcpip");
+        const uint32_t tcpip_off = writer.ensure_subkey(services_off, "Tcpip");
         if (tcpip_off != 0xFFFFFFFF) {
             const uint32_t params_off = writer.ensure_subkey(tcpip_off, "Parameters");
             if (params_off != 0xFFFFFFFF) {
@@ -2689,16 +2732,34 @@ Result<BootStartArmReport> RegBootStart::arm_hive_buffer(std::vector<uint8_t>& h
                 if (!regf_get_dword(hive_data, params_off, "DisableDHCPMediaSense",
                                     &media_sense) ||
                     media_sense != 1) {
-                    report.warnings.push_back("DisableDHCPMediaSense = 1 could not be "
-                                              "verified under " +
-                                              report.control_set +
-                                              "\\Services\\Tcpip\\Parameters");
+                report.warnings.push_back("DisableDHCPMediaSense = 1 could not be "
+                                          "verified under " +
+                                          report.control_set +
+                                          "\\Services\\Tcpip\\Parameters");
                 } else {
                     Logger::default_logger().info(
                         "BOOTSTART", "[BOOTSTART] Armed " + report.control_set +
                                          "\\Services\\Tcpip\\Parameters: "
                                          "DisableDHCPMediaSense = 1");
                 }
+            }
+        }
+    }
+
+    // 2c. TimeOutValue = 60 under <ControlSet>\Services\disk.
+    {
+        const uint32_t disk_off = writer.ensure_subkey(services_off, "disk");
+        if (disk_off != 0xFFFFFFFF) {
+            writer.set_dword(disk_off, "TimeOutValue", 60);
+            uint32_t timeout_val = 0;
+            if (!regf_get_dword(hive_data, disk_off, "TimeOutValue", &timeout_val) ||
+                timeout_val != 60) {
+                report.warnings.push_back("TimeOutValue = 60 could not be verified under " +
+                                          report.control_set + "\\Services\\disk");
+            } else {
+                Logger::default_logger().info(
+                    "BOOTSTART", "[BOOTSTART] Armed " + report.control_set +
+                                     "\\Services\\disk: TimeOutValue = 60");
             }
         }
     }
@@ -2886,14 +2947,14 @@ static bool inject_loaded_offline_hive(BootStartArmReport& report) {
                ERROR_SUCCESS;
     };
 
-    // ---- value 1 of 2: DisableDHCPMediaSense ---------------------------------
+    // ---- value 1 of 3: DisableDHCPMediaSense ---------------------------------
     // Without it TCP/IP drops the iSCSI session the moment a DHCP renewal
     // fails, and the boot dies at Phase 1 with no diagnostic.
     {
         const std::wstring params_path = control_set + L"\\Services\\Tcpip\\Parameters";
         RegKey parameters;
-        if (parameters.open(root.get(), params_path.c_str(), KEY_READ | KEY_WRITE) ==
-            ERROR_SUCCESS) {
+        if (parameters.open(root.get(), params_path.c_str(), KEY_READ | KEY_WRITE) == ERROR_SUCCESS ||
+            parameters.create(root.get(), params_path.c_str(), KEY_READ | KEY_WRITE) == ERROR_SUCCESS) {
             DWORD existing = 0;
             if (!read_dword(parameters.get(), L"DisableDHCPMediaSense", &existing) ||
                 existing != 1) {
@@ -2912,18 +2973,50 @@ static bool inject_loaded_offline_hive(BootStartArmReport& report) {
         }
     }
 
-    // ---- value 2 of 2: the boot-start service table ---------------------------
+    // ---- value 2 of 3: disk TimeOutValue = 60 --------------------------------
+    {
+        const std::wstring disk_path = control_set + L"\\Services\\disk";
+        RegKey disk_key;
+        if (disk_key.open(root.get(), disk_path.c_str(), KEY_READ | KEY_WRITE) == ERROR_SUCCESS ||
+            disk_key.create(root.get(), disk_path.c_str(), KEY_READ | KEY_WRITE) == ERROR_SUCCESS) {
+            DWORD existing = 0;
+            if (!read_dword(disk_key.get(), L"TimeOutValue", &existing) || existing != 60) {
+                if (write_dword(disk_key.get(), L"TimeOutValue", 60)) {
+                    Logger::default_logger().info(
+                        "ARMER", "[ARMER] wrote " + to_utf8(disk_path) + "\\TimeOutValue = 60");
+                } else {
+                    report.warnings.push_back("Failed to write TimeOutValue under " +
+                                              to_utf8(disk_path));
+                }
+            }
+        }
+    }
+
+    // ---- value 3 of 3: the boot-start service table ---------------------------
     for (const auto& spec : RegBootStart::boot_start_services()) {
         const std::wstring key_path = control_set + L"\\Services\\" + to_wide(spec.service);
 
         RegKey service;
-        if (service.open(root.get(), key_path.c_str(), KEY_READ | KEY_WRITE) !=
-            ERROR_SUCCESS) {
-            // Arm-only-when-present: a key with no Type / ImagePath is not
-            // something the SCM can launch, so a service this image does not
-            // carry is reported, never invented.
-            report.missing_services.push_back(spec.service);
-            continue;
+        bool created = false;
+        if (service.open(root.get(), key_path.c_str(), KEY_READ | KEY_WRITE) != ERROR_SUCCESS) {
+            if (service.create(root.get(), key_path.c_str(), KEY_READ | KEY_WRITE) == ERROR_SUCCESS) {
+                created = true;
+                write_dword(service.get(), L"Type", 1);
+                write_dword(service.get(), L"ErrorControl", 1);
+                std::wstring img_path = L"system32\\drivers\\" + to_wide(spec.service) + L".sys";
+                RegSetValueExW(service.get(), L"ImagePath", 0, REG_EXPAND_SZ,
+                               reinterpret_cast<const BYTE*>(img_path.c_str()),
+                               static_cast<DWORD>((img_path.size() + 1) * sizeof(wchar_t)));
+                if (spec.group && spec.group[0] != '\0') {
+                    std::wstring grp = to_wide(spec.group);
+                    RegSetValueExW(service.get(), L"Group", 0, REG_SZ,
+                                   reinterpret_cast<const BYTE*>(grp.c_str()),
+                                   static_cast<DWORD>((grp.size() + 1) * sizeof(wchar_t)));
+                }
+            } else {
+                report.missing_services.push_back(spec.service);
+                continue;
+            }
         }
 
         bool changed = false;

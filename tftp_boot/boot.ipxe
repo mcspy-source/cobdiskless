@@ -5,4 +5,5 @@ echo =========================================================
 echo Connecting to CobDiskless SAN Target...
 dhcp
 set keep-san 1
-sanboot iscsi:${next-server}::::iqn.2026-09.com.cobdiskless:storage
+sanhook --drive 0x80 iscsi:${next-server}::::iqn.2026-09.com.cobdiskless:storage
+sanboot --drive 0x80
