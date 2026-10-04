@@ -182,6 +182,42 @@ if(CYGWIN OR MSYS OR WIN32)
 endif()
 
 # ==============================================================================
+# cob-armer (standalone offline SYSTEM hive armer)
+# ==============================================================================
+# Deliberately its own executable rather than a subcommand of cobdiskless_app:
+# this is what an operator runs against a single image next to a VHD, and it
+# must link nothing beyond CobDisklessCore to do so.
+add_executable(cob_armer
+    src/tools/cob_armer_main.cpp
+)
+
+target_link_libraries(cob_armer
+    PRIVATE
+        CobDisklessCore
+)
+
+if(CYGWIN OR MSYS OR WIN32)
+    target_link_libraries(cob_armer
+        PRIVATE
+            ws2_32
+            iphlpapi
+            virtdisk
+    )
+
+    # Same MSYS2 runtime the app drops into the shared bin/ directory, so the
+    # CLI also runs from cmd.exe without MSYS2 on PATH.
+    if(MSYS_RUNTIME_DLL)
+        get_filename_component(_armer_msys_bin_dir "${MSYS_RUNTIME_DLL}" DIRECTORY)
+        add_custom_command(TARGET cob_armer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_armer_msys_bin_dir}/msys-2.0.dll" $<TARGET_FILE_DIR:cob_armer>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_armer_msys_bin_dir}/msys-gcc_s-seh-1.dll" $<TARGET_FILE_DIR:cob_armer>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_armer_msys_bin_dir}/msys-stdc++-6.dll" $<TARGET_FILE_DIR:cob_armer>
+            COMMENT "Copying MSYS2 runtime DLLs for cob_armer"
+        )
+    endif()
+endif()
+
+# ==============================================================================
 # Testing
 # ==============================================================================
 option(BUILD_TESTING "Build CobDiskless test suite" ON)
@@ -223,6 +259,31 @@ if(BUILD_TESTING)
         NAME CoreLifecycleTest
         COMMAND cobdiskless_core_test
     )
+
+    # cob-armer is exercised end to end rather than through a unit harness: the
+    # self-test builds a synthetic SYSTEM hive, arms it, reads the result back
+    # and round-trips the JSON report; the two negatives pin down the argument
+    # contract so a bad invocation fails loudly instead of arming nothing.
+    add_test(
+        NAME CobArmerSelfTest
+        COMMAND cob_armer --self-test
+    )
+
+    add_test(
+        NAME CobArmerRejectsMissingHive
+        COMMAND cob_armer /nonexistent/no_such_SYSTEM_hive
+    )
+    set_tests_properties(CobArmerRejectsMissingHive PROPERTIES
+        PASS_REGULAR_EXPRESSION "path does not exist"
+    )
+
+    add_test(
+        NAME CobArmerRequiresHivePath
+        COMMAND cob_armer --arm
+    )
+    set_tests_properties(CobArmerRequiresHivePath PROPERTIES
+        PASS_REGULAR_EXPRESSION "requires a path"
+    )
 endif()
 
 # ==============================================================================
@@ -255,7 +316,7 @@ endif()
 # glob or a stray add_library. Fail configuration outright if any target ends up
 # compiling a translation unit from the archive tree.
 set(_cob_archive_compile_errors "")
-foreach(_cob_tgt IN ITEMS CobDisklessCore cobdiskless_app cobdiskless_core_test cob_enroll)
+foreach(_cob_tgt IN ITEMS CobDisklessCore cobdiskless_app cob_armer cobdiskless_core_test cob_enroll)
     if(TARGET ${_cob_tgt})
         get_target_property(_cob_sources ${_cob_tgt} SOURCES)
         if(_cob_sources)

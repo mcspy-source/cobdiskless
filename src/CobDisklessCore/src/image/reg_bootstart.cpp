@@ -1340,6 +1340,57 @@ private:
 };
 #endif // _WIN32
 
+// Offset of a key's subkey index cell (0 when the key has no children or is not
+// a readable nk), so the walkability check can be aimed straight at a list the
+// caller has already resolved instead of re-walking the name path.
+uint32_t regf_subkey_list_offset(const std::vector<uint8_t>& hive, uint32_t nk_cell_off) {
+    const uint8_t* nk = nullptr;
+    size_t nk_len = 0;
+    if (!regf_cell(hive, nk_cell_off, &nk, &nk_len) || nk_len < 0x20 ||
+        read_le16(nk) != 0x6B6E) {
+        return 0;
+    }
+    const uint32_t list_off = read_le32(nk + 0x1C);
+    if (list_off == 0 || list_off == 0xFFFFFFFF) return 0;
+    return list_off;
+}
+
+// True when <val_name> exists on the key, whatever its type. This is what lets
+// a read-only report tell "value absent" from "value present but empty", which
+// regf_get_string() cannot: both of those decode to "".
+bool regf_value_exists(const std::vector<uint8_t>& hive, uint32_t nk_cell_off,
+                       const std::string& val_name) {
+    const uint8_t* nk = nullptr;
+    size_t nk_len = 0;
+    if (!regf_cell(hive, nk_cell_off, &nk, &nk_len) || nk_len < 0x2C ||
+        read_le16(nk) != 0x6B6E) {
+        return false;
+    }
+    const uint32_t val_count = read_le32(nk + 0x24);
+    const uint32_t val_list_off = read_le32(nk + 0x28);
+    if (val_count == 0 || val_list_off == 0 || val_list_off == 0xFFFFFFFF) return false;
+
+    const uint8_t* vl = nullptr;
+    size_t vl_len = 0;
+    if (!regf_cell(hive, val_list_off, &vl, &vl_len)) return false;
+
+    for (uint32_t i = 0; i < val_count; ++i) {
+        if (static_cast<size_t>(i + 1) * 4 > vl_len) break;
+        const uint32_t vk_off = read_le32(vl + i * 4);
+        const uint8_t* vk = nullptr;
+        size_t vk_len = 0;
+        if (!regf_cell(hive, vk_off, &vk, &vk_len) || vk_len < 0x14 ||
+            read_le16(vk) != 0x6B76) {
+            continue;
+        }
+        const uint16_t nlen = read_le16(vk + 0x02);
+        if (static_cast<size_t>(0x14) + nlen > vk_len) continue;
+        std::string name(reinterpret_cast<const char*>(vk + 0x14), nlen);
+        if (string_iequal(name, val_name)) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // -----------------------------------------------------------------------------
@@ -1507,6 +1558,410 @@ const std::vector<RegBootStart::ServiceSpec>& RegBootStart::boot_start_services(
         {"e2f68",    "NDIS",              true,  false},
     };
     return kServices;
+}
+
+// -----------------------------------------------------------------------------
+// Inspection (read-only)
+// -----------------------------------------------------------------------------
+std::string HiveInspectionReport::summary() const {
+    auto pad = [](const std::string& text, size_t width) {
+        return text + (text.size() >= width ? std::string()
+                                            : std::string(width - text.size(), ' '));
+    };
+
+    std::ostringstream ss;
+    ss << "=== CobDiskless Offline Hive Inspection ===\n";
+    ss << pad("Hive:", 22) << (hive_path.empty() ? "<buffer>" : hive_path.string()) << "\n";
+    if (!volume_path.empty()) {
+        ss << pad("Volume:", 22) << volume_path.string() << "\n";
+    }
+    ss << pad("Header:", 22) << (valid_header ? "regf OK" : "NOT regf") << "\n";
+    ss << pad("Active ControlSet:", 22)
+       << (control_set.empty() ? "<unresolved>" : control_set) << "\n";
+    ss << pad("Hive on entry:", 22)
+       << (hive_dirty_on_entry ? "DIRTY (a .LOG* may replay over an offline edit)"
+                               : "CLEAN") << "\n";
+
+    if (walkable) {
+        ss << pad("Services list:", 22) << "walkable (" << service_count << " keys)\n";
+    } else {
+        ss << pad("Services list:", 22) << "NOT WALKABLE";
+        if (!walkability_note.empty()) ss << " -- " << walkability_note;
+        ss << "\n";
+    }
+
+    ss << "Boot-start table:\n";
+    for (const auto& state : services) {
+        ss << "  " << pad(state.service, 12);
+        if (!state.present) {
+            ss << "absent (not carried by this image)\n";
+            continue;
+        }
+        ss << "Start=" << (state.has_start ? std::to_string(state.start) : "?");
+        ss << " BootFlags=";
+        if (state.has_boot_flags) {
+            ss << "0x" << std::hex << state.boot_flags << std::dec;
+        } else {
+            ss << "absent";
+        }
+        ss << " Group=" << (state.group.empty() ? "<none>" : state.group) << "\n";
+    }
+
+    ss << "Net class bindings (" << net_bindings.size() << "):\n";
+    if (net_bindings.empty()) {
+        ss << "  <none>\n";
+    }
+    for (const auto& binding : net_bindings) {
+        ss << "  " << pad(binding.instance, 8) << pad(binding.service, 12)
+           << binding.driver_desc << "\n";
+    }
+
+    ss << "Boot Stage 15 / offload / timeout:\n";
+    ss << "  CrashDumpEnabled        = "
+       << (has_crash_dump_enabled ? std::to_string(crash_dump_enabled) : "<absent>") << "\n";
+    ss << "  PagingFiles             = " << (paging_files_present ? "present" : "absent") << "\n";
+    ss << "  DisableTaskOffload      = " << (tcpip_offload_disabled ? "1" : "0 / absent") << "\n";
+    ss << "  DisableDHCPMediaSense   = "
+       << (tcpip_media_sense_disabled ? "1" : "0 / absent") << "\n";
+    ss << "  ms_wfplwf Start         = " << (wfplwf_disabled ? "4 (disabled)" : "not 4 / absent")
+       << "\n";
+    ss << "  disk TimeOutValue       = "
+       << (has_disk_timeout ? std::to_string(disk_timeout) + "s" : "<absent>") << "\n";
+    ss << "  MountedDevices C:       = "
+       << (mounted_c_present ? "present" : "absent") << "\n";
+    ss << "  CriticalDeviceDatabase  = " << cddb_entries << " entries\n";
+
+    for (const auto& finding : findings) {
+        ss << "  [!] " << finding << "\n";
+    }
+    if (!message.empty()) {
+        ss << "Message: " << message << "\n";
+    }
+    return ss.str();
+}
+
+Result<HiveInspectionReport> RegBootStart::inspect_hive_buffer(
+    const std::vector<uint8_t>& hive_data,
+    const std::filesystem::path& hive_path,
+    const std::filesystem::path& volume_path) {
+    HiveInspectionReport report;
+    report.hive_path = hive_path;
+    report.volume_path = volume_path;
+
+    if (hive_data.size() < 8192) {
+        return Error(ErrorCode::InvalidConfiguration,
+                     "Hive buffer too small to be a valid Windows registry hive");
+    }
+    if (hive_data[0] != 'r' || hive_data[1] != 'e' || hive_data[2] != 'g' ||
+        hive_data[3] != 'f') {
+        return Error(ErrorCode::InvalidConfiguration,
+                     "File is not a Windows registry hive (missing 'regf' header)");
+    }
+    report.valid_header = true;
+
+    const uint32_t root = regf_root_offset(hive_data);
+    if (root == 0xFFFFFFFF) {
+        return Error(ErrorCode::InvalidConfiguration,
+                     "regf base block does not reference a readable root key");
+    }
+
+    // Two sequence numbers that disagree mean Windows shut down dirty: the .LOG*
+    // transaction would replay over an offline edit at Phase 0.
+    report.hive_dirty_on_entry =
+        read_le32(&hive_data[0x08]) != read_le32(&hive_data[0x0C]);
+
+    std::string cs_name;
+    const uint32_t cs_off = resolve_control_set(hive_data, &cs_name);
+    report.control_set = cs_name;
+    if (cs_off == 0xFFFFFFFF) {
+        report.findings.push_back(
+            "FATAL: no control set resolved (Select\\Current missing and no ControlSet001)");
+        report.message = "Hive carries no usable control set";
+        return report;
+    }
+
+    // Walkability of <ControlSet>\Services: the list the arming pass edits, and
+    // the one whose ordering decides whether Cm can find those keys at all. A
+    // key behind an unsorted list parses fine on disk and is still invisible.
+    const uint32_t services_off = regf_find_subkey(hive_data, cs_off, "Services");
+    if (services_off == 0xFFFFFFFF) {
+        report.findings.push_back("FATAL: " + cs_name + "\\Services is missing");
+    } else {
+        const uint32_t list_off = regf_subkey_list_offset(hive_data, services_off);
+        if (list_off == 0) {
+            report.walkable = true;
+            report.findings.push_back(cs_name + "\\Services carries no children");
+        } else {
+            std::vector<RegfSubkeyEntry> entries;
+            uint16_t sig = 0;
+            std::string why;
+            if (!regf_validate_flat_list(hive_data, list_off, &entries, &sig, &why)) {
+                report.walkability_note =
+                    "subkey list cannot be judged (unreadable entry or non-ASCII name)";
+            } else if (!why.empty()) {
+                report.walkability_note = why;
+                report.findings.push_back(
+                    "FATAL: Services subkey list is not walkable -- " + why);
+            } else {
+                report.walkable = true;
+                report.service_count = entries.size();
+            }
+        }
+    }
+
+    // The boot-start table exactly as this image carries it.
+    for (const auto& spec : boot_start_services()) {
+        HiveServiceState state;
+        state.service = spec.service;
+        const uint32_t svc_off =
+            services_off == 0xFFFFFFFF
+                ? 0xFFFFFFFF
+                : regf_find_subkey(hive_data, services_off, spec.service);
+        if (svc_off != 0xFFFFFFFF) {
+            state.present = true;
+            state.has_start = regf_get_dword(hive_data, svc_off, "Start", &state.start);
+            state.has_boot_flags =
+                regf_get_dword(hive_data, svc_off, "BootFlags", &state.boot_flags);
+            state.group = regf_get_string(hive_data, svc_off, "Group");
+        }
+        report.services.push_back(std::move(state));
+    }
+
+    const uint32_t control_off = regf_find_subkey(hive_data, cs_off, "Control");
+    if (control_off != 0xFFFFFFFF) {
+        // Adapter instances and the service each one binds; `service` is the key
+        // the pipeline arms, `driver_desc` what an operator sees in devmgmt.
+        const uint32_t class_off = regf_find_subkey(hive_data, control_off, "Class");
+        if (class_off != 0xFFFFFFFF) {
+            const uint32_t net_off = regf_find_subkey(
+                hive_data, class_off, "{4d36e972-e325-11ce-bfc1-08002be10318}");
+            if (net_off != 0xFFFFFFFF) {
+                for (const uint32_t instance : regf_list_subkeys(hive_data, net_off)) {
+                    HiveNetBinding binding;
+                    regf_nk_name(hive_data, instance, &binding.instance);
+                    binding.driver_desc = regf_get_string(hive_data, instance, "DriverDesc");
+                    binding.service = regf_get_string(hive_data, instance, "Service");
+                    if (!binding.driver_desc.empty() || !binding.service.empty()) {
+                        report.net_bindings.push_back(std::move(binding));
+                    }
+                }
+            }
+        }
+
+        // Boot Stage 15: crash dump stack and the paging file.
+        const uint32_t crash_off = regf_find_subkey(hive_data, control_off, "CrashControl");
+        if (crash_off != 0xFFFFFFFF) {
+            report.has_crash_dump_enabled =
+                regf_get_dword(hive_data, crash_off, "CrashDumpEnabled",
+                               &report.crash_dump_enabled);
+        }
+        const uint32_t mm_off = regf_find_subkey(hive_data, control_off, "Memory Management");
+        if (mm_off != 0xFFFFFFFF) {
+            report.paging_files_present = regf_value_exists(hive_data, mm_off, "PagingFiles");
+        }
+
+        // CDDB bindings; the pipeline adds them but never requires them to exist.
+        const uint32_t cddb_off =
+            regf_find_subkey(hive_data, control_off, "CriticalDeviceDatabase");
+        if (cddb_off != 0xFFFFFFFF) {
+            report.cddb_entries = regf_list_subkeys(hive_data, cddb_off).size();
+        }
+    }
+
+    if (services_off != 0xFFFFFFFF) {
+        const uint32_t tcpip_off = regf_find_subkey(hive_data, services_off, "Tcpip");
+        if (tcpip_off != 0xFFFFFFFF) {
+            const uint32_t params_off = regf_find_subkey(hive_data, tcpip_off, "Parameters");
+            if (params_off != 0xFFFFFFFF) {
+                uint32_t value = 0;
+                if (regf_get_dword(hive_data, params_off, "DisableTaskOffload", &value)) {
+                    report.tcpip_offload_disabled = value == 1;
+                }
+                value = 0;
+                if (regf_get_dword(hive_data, params_off, "DisableDHCPMediaSense", &value)) {
+                    report.tcpip_media_sense_disabled = value == 1;
+                }
+            }
+        }
+
+        const uint32_t wfplwf_off = regf_find_subkey(hive_data, services_off, "ms_wfplwf");
+        if (wfplwf_off != 0xFFFFFFFF) {
+            uint32_t start = 0;
+            if (regf_get_dword(hive_data, wfplwf_off, "Start", &start)) {
+                report.wfplwf_disabled = start == 4;
+            }
+        }
+
+        const uint32_t disk_off = regf_find_subkey(hive_data, services_off, "disk");
+        if (disk_off != 0xFFFFFFFF) {
+            report.has_disk_timeout =
+                regf_get_dword(hive_data, disk_off, "TimeOutValue", &report.disk_timeout);
+        }
+    }
+
+    // MountedDevices: the pipeline deletes only \DosDevices\C:, never the Volume
+    // GUIDs -- deleting those breaks hive validation with bugcheck 0x74.
+    const uint32_t mounted_off = regf_find_subkey(hive_data, root, "MountedDevices");
+    if (mounted_off != 0xFFFFFFFF) {
+        report.mounted_c_present =
+            regf_value_exists(hive_data, mounted_off, "\\DosDevices\\C:");
+    }
+
+    // ---- Findings: everything below the bar, so an already-armed hive reports
+    // an empty list and the two reports diff cleanly.
+    auto find_spec = [](const std::string& name) -> const ServiceSpec* {
+        for (const auto& candidate : boot_start_services()) {
+            if (name == candidate.service) return &candidate;
+        }
+        return nullptr;
+    };
+
+    for (const auto& state : report.services) {
+        const ServiceSpec* spec = find_spec(state.service);
+        if (!state.present) {
+            report.findings.push_back(state.service + ": not carried by this image");
+            continue;
+        }
+        if (!state.has_start) {
+            report.findings.push_back(state.service + ": no Start value");
+            continue;
+        }
+        if (state.start != 0) {
+            report.findings.push_back(state.service + ": Start=" +
+                                      std::to_string(state.start) +
+                                      " (not boot-start; the loader will not resolve it over "
+                                      "the network)");
+        } else if (spec != nullptr && spec->require_network_boot_flag && !state.has_boot_flags) {
+            report.findings.push_back(state.service +
+                                      ": Start=0 but BootFlags is absent (Windows 10/11 needs "
+                                      "CM_SERVICE_NETWORK_BOOT_LOAD, otherwise 0x7B)");
+        }
+    }
+
+    if (report.hive_dirty_on_entry) {
+        report.findings.push_back(
+            "hive arrived dirty: a .LOG* transaction may replay over an offline edit at Phase 0");
+    }
+    if (report.has_crash_dump_enabled && report.crash_dump_enabled != 0) {
+        report.findings.push_back("CrashDumpEnabled=" +
+                                  std::to_string(report.crash_dump_enabled) +
+                                  " (Boot Stage 15 dump stack still armed)");
+    }
+    if (report.paging_files_present) {
+        report.findings.push_back(
+            "PagingFiles present (Boot Stage 15 paging file not cleared)");
+    }
+    if (!report.tcpip_offload_disabled) {
+        report.findings.push_back("Tcpip Parameters\\DisableTaskOffload is not 1");
+    }
+    if (!report.tcpip_media_sense_disabled) {
+        report.findings.push_back("Tcpip Parameters\\DisableDHCPMediaSense is not 1");
+    }
+    if (!report.wfplwf_disabled) {
+        report.findings.push_back("ms_wfplwf is not disabled (Start != 4)");
+    }
+    if (!report.has_disk_timeout) {
+        report.findings.push_back("Services\\disk has no TimeOutValue");
+    } else if (report.disk_timeout != 60) {
+        report.findings.push_back("Services\\disk\\TimeOutValue=" +
+                                  std::to_string(report.disk_timeout) +
+                                  "s (armed value is 60s)");
+    }
+    if (report.mounted_c_present) {
+        report.findings.push_back("MountedDevices still carries \\DosDevices\\C:");
+    }
+    if (report.net_bindings.empty()) {
+        report.findings.push_back(
+            "no net-class adapter binding under Control\\Class\\{4d36e972-...}");
+    }
+
+    report.success = report.valid_header && !report.control_set.empty() && report.walkable;
+    report.message = report.success ? "Read-only inspection completed"
+                                    : "Inspection completed but the hive is not healthy";
+    return report;
+}
+
+Result<HiveInspectionReport> RegBootStart::inspect_offline_hive(
+    const std::filesystem::path& hive_path) {
+    auto hive = read_hive_file(hive_path);
+    if (hive.is_err()) return hive.error();
+    return inspect_hive_buffer(hive.value(), hive_path, {});
+}
+
+Result<HiveInspectionReport> RegBootStart::inspect_image(
+    const std::filesystem::path& image_path) {
+    if (!path_exists_or_std(image_path)) {
+        return Error(ErrorCode::StorageFailure,
+                     "Image path does not exist: " + image_path.string());
+    }
+
+    // 1. A mounted volume / Windows directory above the path.
+    std::filesystem::path candidate_sys =
+        image_path / "Windows" / "System32" / "config" / "SYSTEM";
+    if (!file_exists_or_std(candidate_sys)) {
+        candidate_sys = image_path / "System32" / "config" / "SYSTEM";
+    }
+    if (file_exists_or_std(candidate_sys)) {
+        auto hive = read_hive_file(candidate_sys);
+        if (hive.is_err()) return hive.error();
+        return inspect_hive_buffer(hive.value(), candidate_sys, image_path);
+    }
+
+    // 2. The path itself is a raw regf hive.
+    if (file_exists_or_std(image_path)) {
+        std::ifstream test_in(image_path, std::ios::binary);
+        if (test_in.is_open()) {
+            char sig[4] = {0};
+            test_in.read(sig, 4);
+            test_in.close();
+            if (std::memcmp(sig, "regf", 4) == 0) {
+                return inspect_offline_hive(image_path);
+            }
+        }
+    }
+
+    // 3. A virtual disk image: attach it only long enough to locate the hive,
+    //    and let MountedVhdVolume's destructor detach it.
+    std::string ext = image_path.extension().string();
+    for (auto& c : ext) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (ext == ".vhd" || ext == ".vhdx") {
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+        MountedVhdVolume volume(image_path);
+        if (!volume.attached()) {
+            std::string detail;
+            for (const auto& warning : volume.warnings()) {
+                detail += (detail.empty() ? "" : " ") + warning;
+            }
+            return Error(ErrorCode::StorageFailure,
+                         "Could not attach virtual disk: " + image_path.string() +
+                             (detail.empty() ? "" : " (" + detail + ")"));
+        }
+        if (!volume.found_hive()) {
+            return Error(ErrorCode::StorageFailure,
+                         "No Windows SYSTEM hive found on mounted VHD: " +
+                             image_path.string());
+        }
+        const std::filesystem::path located = volume.hive_path();
+        const std::filesystem::path volume_root =
+            located.parent_path().parent_path().parent_path().parent_path();
+        auto hive = read_hive_file(located);
+        if (hive.is_err()) return hive.error();
+        return inspect_hive_buffer(hive.value(), located, volume_root);
+#else
+        return Error(ErrorCode::StorageFailure,
+                     "Attaching a virtual disk requires Windows: " + image_path.string());
+#endif
+    }
+
+    // 4. Nothing here holds a hive. Report success without inspecting anything,
+    //    matching ensure_image_armed().
+    HiveInspectionReport report;
+    report.success = true;
+    report.hive_path = image_path;
+    report.message = "Image format " + ext + " holds no Windows registry hive to inspect";
+    return report;
 }
 
 // -----------------------------------------------------------------------------

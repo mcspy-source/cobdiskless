@@ -4,6 +4,7 @@
 
 #include "CobDisklessCore/errors/result.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -67,6 +68,80 @@ struct BootStartArmReport {
     std::vector<std::string> modified_services; // Start / BootFlags / Group actually changed
     std::vector<std::string> missing_services;  // not carried by this image
     std::vector<std::string> warnings;
+    std::string message;
+
+    [[nodiscard]] std::string summary() const;
+};
+
+// -----------------------------------------------------------------------------
+// Read-only inspection of an offline SYSTEM hive.
+//
+// This is the "before" half of an inspect -> arm -> re-inspect workflow: a
+// snapshot of everything arm_hive_buffer() / arm_image_offline_pipeline()
+// would touch, so two reports taken either side of an arm diff cleanly. It
+// never writes -- no cell is allocated, no header is flushed, no transaction
+// log is touched -- and it deliberately reports only what this project's own
+// arming pass manages. Hardware-ID matching, DriverStore file identity and
+// guest OS/arch detection live in archive/pnp_dccb/ and are not reimplemented
+// here.
+// -----------------------------------------------------------------------------
+
+// One row of boot_start_services() as the hive currently carries it.
+struct HiveServiceState {
+    std::string service; // Services\<name>
+    bool present{false};
+    bool has_start{false};
+    uint32_t start{0}; // raw Start value; meaningless when has_start == false
+    bool has_boot_flags{false};
+    uint32_t boot_flags{0};
+    std::string group; // "" when the key carries no Group yet
+};
+
+// One Control\Class\{4d36e972-...} adapter instance and the service it binds.
+// `service` is the key the pipeline arms; `driver_desc` is what an operator
+// recognises in Device Manager.
+struct HiveNetBinding {
+    std::string instance;    // "0000"
+    std::string driver_desc; // DriverDesc
+    std::string service;     // Service
+};
+
+struct HiveInspectionReport {
+    bool success{false};
+    std::filesystem::path hive_path;
+    std::filesystem::path volume_path; // "" when inspected without a volume
+
+    bool valid_header{false};          // "regf" signature and a readable root nk
+    std::string control_set;           // resolved from Select\Current
+    bool hive_dirty_on_entry{false};   // base-block sequence numbers disagree
+
+    // Subkey list of <ControlSet>\Services judged by the same rules Windows
+    // binary-searches with (name order plus the lf/lh hash Cm reproduces).
+    // `walkable` is false only when the list is provably broken; a list that
+    // cannot be judged at all is reported through `walkability_note` rather
+    // than called healthy.
+    bool walkable{false};
+    std::string walkability_note;
+    std::size_t service_count{0}; // children of <ControlSet>\Services
+
+    std::vector<HiveServiceState> services;
+    std::vector<HiveNetBinding> net_bindings;
+
+    // Boot Stage 15, offload and timeout scalars the pipeline neutralises.
+    bool has_crash_dump_enabled{false};
+    uint32_t crash_dump_enabled{0};
+    bool paging_files_present{false};
+    bool tcpip_offload_disabled{false};
+    bool tcpip_media_sense_disabled{false};
+    bool wfplwf_disabled{false}; // ms_wfplwf Start = 4
+    bool has_disk_timeout{false};
+    uint32_t disk_timeout{0};
+    bool mounted_c_present{false}; // MountedDevices still holds \DosDevices\C:
+    std::size_t cddb_entries{0};    // children of Control\CriticalDeviceDatabase
+
+    // Operator-facing bullets: everything below the bar, so an already-armed
+    // hive reports an empty list.
+    std::vector<std::string> findings;
     std::string message;
 
     [[nodiscard]] std::string summary() const;
@@ -162,6 +237,26 @@ public:
     // directory, a raw regf hive, a .vhd/.vhdx, or something else entirely
     // (which reports success without writing anything).
     [[nodiscard]] static Result<BootStartArmReport> ensure_image_armed(
+        const std::filesystem::path& image_path);
+
+    // ---- Read-only inspection ---------------------------------------------------
+    // Snapshots what the arming pass would touch. `volume_path` is the mounted
+    // root owning <hive_path> (used only for the report; pass "" when the hive
+    // was read standalone).
+
+    [[nodiscard]] static Result<HiveInspectionReport> inspect_hive_buffer(
+        const std::vector<uint8_t>& hive_data,
+        const std::filesystem::path& hive_path = {},
+        const std::filesystem::path& volume_path = {});
+
+    [[nodiscard]] static Result<HiveInspectionReport> inspect_offline_hive(
+        const std::filesystem::path& hive_path);
+
+    // Dispatch by what `image_path` actually is: a raw regf hive, or a
+    // .vhd/.vhdx (attached through the VirtDisk API solely to locate the SYSTEM
+    // hive, detached again when the report is built). Anything else reports
+    // success without inspecting anything, matching ensure_image_armed().
+    [[nodiscard]] static Result<HiveInspectionReport> inspect_image(
         const std::filesystem::path& image_path);
 
     // XOR-fold of the 0x1FC bytes at the head of a regf base block.
