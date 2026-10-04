@@ -3,9 +3,10 @@
 // ============================================================================
 // cob-armer - standalone offline SYSTEM hive armer for CobDiskless clients.
 //
-//   Usage: cob-armer <path_to_SYSTEM_hive>            (inspect, read-only)
-//          cob-armer --arm <hive|volume|vhd>          (arm, then re-inspect)
-//          cob-armer --self-test                      (synthetic round-trip)
+//   Usage: cob-armer <path>                       (inspect, read-only)
+//          cob-armer inspect <path>               (inspect, step-by-step log)
+//          cob-armer arm <path>                   (arm, then re-inspect)
+//          cob-armer --self-test                  (synthetic round-trip)
 //
 // The tool is the human/automation entry point for the same arming pass the
 // server runs after WinPE has injected NIC drivers into a client's target VHD.
@@ -13,13 +14,17 @@
 // CobDisklessCore (RegBootStart), so the CLI, the HTTP callback and the tests
 // can never drift apart.
 //
-// --arm passes the target to RegBootStart::arm_image_offline_pipeline(), which
+// `arm` passes the target to RegBootStart::arm_image_offline_pipeline(), which
 // dispatches on what the path actually is: a .vhd/.vhdx is attached through the
 // VirtDisk API, a loose regf hive is used as-is, and a mounted volume root is
-// resolved to the SYSTEM hive underneath it. When the process is not elevated
-// RegLoadKeyW fails and the pipeline falls back to the in-place regf writer, so
-// --arm always does *something* useful but does less without Administrator
-// rights -- the Stage 15 / CDDB / net-class half needs the hive loaded.
+// resolved to the SYSTEM hive underneath it. Elevated, the hive is mounted with
+// RegLoadKeyW and mutated through it; unelevated the mount is refused and the
+// pipeline falls back to the in-place regf writer, so `arm` always does
+// something useful -- and says in its log which of the two it used.
+//
+// Both `arm` and `inspect` narrate themselves: every phase prints [STEP n/N]
+// and every check prints [VERIFY] / [FAIL], so the point of failure is visible
+// without a debugger. Neither mode ever touches a path it was not given.
 //
 // Inspection never writes: no cell is allocated, no header is flushed, no
 // transaction log is touched, no virtual disk is left attached.
@@ -53,6 +58,7 @@ namespace {
 namespace fs = std::filesystem;
 
 using cobdiskless::Error;
+using cobdiskless::BootStartArmReport;
 using cobdiskless::HiveInspectionReport;
 using cobdiskless::HiveNetBinding;
 using cobdiskless::HiveServiceState;
@@ -72,9 +78,14 @@ enum ExitCode {
 
 void print_usage(std::ostream& out) {
     out << "Usage: cob-armer <path>                       inspect a hive (default)\n"
-        << "       cob-armer --inspect <hive|volume|vhd>  read-only report\n"
-        << "       cob-armer --arm <hive|volume|vhd>      run the arming pass, re-inspect\n"
+        << "       cob-armer inspect <hive|volume|vhd>    read-only report (step-by-step)\n"
+        << "       cob-armer arm <hive|volume|vhd>        run the arming pass, re-inspect\n"
+        << "       cob-armer --inspect <hive|volume|vhd>  same as 'inspect'\n"
+        << "       cob-armer --arm <hive|volume|vhd>      same as 'arm'\n"
         << "       cob-armer --self-test                  arm a synthetic hive and verify\n"
+        << "\n"
+        << "Both 'arm' and 'inspect' print a [STEP n/N] line for every phase and a\n"
+        << "[VERIFY] line for every check, so a failed run says which phase failed.\n"
         << "\n"
         << "Options:\n"
         << "  --json         emit the report as JSON on stdout instead of text\n"
@@ -213,51 +224,103 @@ void emit_report(const HiveInspectionReport& report, bool json, std::ostream& ou
 // ---- Modes ------------------------------------------------------------------
 
 int run_inspect(const fs::path& target, bool json) {
+    std::cerr << "[STEP 1/3] target: " << target << "\n";
+
     auto result = RegBootStart::inspect_image(target);
     if (result.is_err()) {
-        std::cerr << "[ERROR] " << result.error().message() << "\n";
+        std::cerr << "[FAIL] " << result.error().message() << "\n";
         return inspect_exit_code(result.error());
     }
 
     const HiveInspectionReport& report = result.value();
+    std::cerr << "[STEP 2/3] header " << (report.valid_header ? "valid" : "INVALID")
+              << ", control set " << (report.control_set.empty() ? "(unresolved)"
+                                                                 : report.control_set)
+              << ", Services list "
+              << (report.walkable ? "walkable" : "NOT walkable") << ", "
+              << report.service_count << " services\n";
+    if (!report.walkability_note.empty()) {
+        std::cerr << "[NOTE] " << report.walkability_note << "\n";
+    }
+
     emit_report(report, json, std::cout);
-    return report.success ? kExitOk : kExitInspectFailed;
+
+    const std::vector<std::string> gaps = unmet_arming(report);
+    std::cerr << "[STEP 3/3] arming bar over "
+              << RegBootStart::boot_start_services().size() << " boot-start rows: "
+              << (gaps.empty() ? "already met" : std::to_string(gaps.size()) + " gap(s)")
+              << "\n";
+    for (const auto& gap : gaps) {
+        std::cerr << "[GAP] " << gap << "\n";
+    }
+
+    if (!report.success) {
+        std::cerr << "[VERIFY] FAILED -- the hive is readable but not healthy\n";
+        return kExitInspectFailed;
+    }
+    std::cerr << "[VERIFY] OK -- inspection completed, nothing was written\n";
+    return kExitOk;
 }
 
 int run_arm(const fs::path& target, bool json) {
+    std::cerr << "[STEP 1/6] target: " << target << "\n";
+
     auto armed = RegBootStart::arm_image_offline_pipeline(target);
     if (armed.is_err()) {
-        std::cerr << "[ERROR] " << armed.error().message() << "\n";
+        std::cerr << "[FAIL] " << armed.error().message() << "\n";
         return kExitArmFailed;
     }
     if (!armed.value().success) {
-        std::cerr << "[ERROR] arming pass reported failure: " << armed.value().message << "\n";
+        std::cerr << "[FAIL] arming pass reported failure: " << armed.value().message << "\n";
         return kExitArmFailed;
     }
-    std::cerr << "[OK] " << armed.value().summary() << "\n";
+
+    const BootStartArmReport& pass = armed.value();
+    std::cerr << "[STEP 2/6] arming pass: " << pass.message << "\n";
+    std::cerr << "[STEP 3/6] control set "
+              << (pass.control_set.empty() ? "(unresolved)" : pass.control_set) << ", armed "
+              << pass.armed_services.size() << ", modified " << pass.modified_services.size()
+              << ", not carried " << pass.missing_services.size() << ", "
+              << (pass.hive_dirty_on_entry ? "dirty on entry" : "clean on entry") << "\n";
+    for (const auto& warning : pass.warnings) {
+        std::cerr << "[WARN] " << warning << "\n";
+    }
+    std::cerr << "[OK] " << pass.summary() << "\n";
 
     // Verification is a fresh read of the same target: if the write did not
     // land (or landed and was rolled back by a transaction log), it shows here
     // rather than in the arming report, which only knows what it *tried*.
+    std::cerr << "[STEP 4/6] re-reading " << target << " from disk\n";
     auto after = RegBootStart::inspect_image(target);
     if (after.is_err()) {
-        std::cerr << "[ERROR] could not re-inspect after arming: "
+        std::cerr << "[FAIL] could not re-inspect after arming: "
                   << after.error().message() << "\n";
         return kExitVerifyFailed;
     }
 
     const HiveInspectionReport& report = after.value();
+    std::cerr << "[STEP 5/6] header " << (report.valid_header ? "valid" : "INVALID")
+              << ", control set " << (report.control_set.empty() ? "(unresolved)"
+                                                                 : report.control_set)
+              << ", Services list "
+              << (report.walkable ? "walkable" : "NOT walkable") << ", "
+              << report.service_count << " services\n";
+
     emit_report(report, json, std::cout);
 
     const std::vector<std::string> gaps = unmet_arming(report);
+    std::cerr << "[STEP 6/6] checking every row of boot_start_services(): "
+              << (gaps.empty() ? "all met" : std::to_string(gaps.size()) + " unmet") << "\n";
     if (gaps.empty()) {
-        std::cerr << "[OK] verification passed: the iSCSI stack will resolve over the "
-                     "network.\n";
+        std::cerr << "[VERIFY] OK -- Start = 0 landed on every row the image carries, "
+                     "BootFlags where required, and the iSCSI stack will resolve over "
+                     "the network.\n";
         return kExitOk;
     }
     for (const auto& gap : gaps) {
         std::cerr << "[FAIL] " << gap << "\n";
     }
+    std::cerr << "[VERIFY] FAILED -- the arming pass did not reach every required row\n";
     return kExitVerifyFailed;
 }
 
@@ -404,17 +467,23 @@ int main(int argc, char** argv) {
             json = true;
             continue;
         }
-        if (arg == "--self-test") {
+        if (arg == "--self-test" || arg == "self-test") {
             self_test = true;
             continue;
         }
-        if (arg == "--arm" || arg == "--inspect") {
-            if (i + 1 >= argc) {
+        // "arm" / "inspect" are accepted bare as well as with their dashed
+        // spelling, so `cob_armer arm <image>` and `cob_armer --arm <image>`
+        // are the same call. Both forms demand a path that is not itself an
+        // option; a lone `cob_armer arm` is a usage error, not an inspection
+        // of a file that happens to be called "arm".
+        if (arg == "--arm" || arg == "--inspect" || arg == "arm" || arg == "inspect") {
+            const bool needs_path = (i + 1 >= argc) || (argv[i + 1][0] == '-');
+            if (needs_path) {
                 std::cerr << "[ERROR] " << arg << " requires a path\n\n";
                 print_usage(std::cerr);
                 return kExitUsage;
             }
-            arm = (arg == "--arm");
+            arm = (arg == "--arm" || arg == "arm");
             target = argv[++i];
             continue;
         }

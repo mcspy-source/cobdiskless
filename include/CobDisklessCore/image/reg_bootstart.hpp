@@ -25,7 +25,7 @@ namespace cobdiskless {
 // in that list now lives in archive/pnp_dccb/ and is kept only so it can be
 // lifted back out as a standalone utility.
 //
-// What this module *does* write, for the services in boot_start_services():
+// What this module *does* write, and nothing else, is:
 //
 //   Start      0 (SERVICE_BOOT_START) -- the service is resolved while the boot
 //              volume is still a network device.
@@ -36,13 +36,43 @@ namespace cobdiskless {
 //   Group      "SCSI Miniport" / "NDIS" / "PNP_TDI", written only when the key
 //              has none yet. A Group the image already carries describes a
 //              driver that image itself installed and is never clobbered.
+//   DisableDHCPMediaSense
+//              1 under <ControlSet>\Services\Tcpip\Parameters -- the one value
+//              outside the table, and the reason it is there: without it the
+//              stack drops the iSCSI session on a failed DHCP renewal and the
+//              boot dies at Phase 1 with nothing in the log to say why.
+//
+// Deliberately *not* written: nothing under Enum\PCI or Control\Class, no
+// CriticalDeviceDatabase entries, no CrashControl / PagingFiles / MountedDevices
+// edits, no ms_wfplwf or Services\disk tweaks, and no service key invented for
+// hardware the image does not carry. Rewriting hardware enumeration offline is
+// what took a supposedly-armed image to 0x74 BAD_SYSTEM_CONFIG_INFO: those trees
+// are the device's own record, and a second, partial copy written from outside
+// PnP reads back to the boot loader as information that does not reconcile. The
+// routines that used to do all of that are in archive/pnp_dccb/, kept only so
+// they can be lifted back out as a standalone utility.
+//
+// The mounted (elevated) path additionally removes a designated service key's
+// own StartOverride subkey, which re-applies the previous Start value on the
+// next Plug And Play pass -- the same neutralisation
+// archive/tests/repair_vhd.ps1 used to perform on rt640x64, and without which
+// Start = 0 does not survive enumeration. The in-place regf writer removes no
+// key and no value; the only thing it ever unlinks is a stale companion
+// transaction log.
 //
 // Two supporting behaviours are kept because without them Start = 0 would not
 // *take*: a structural repair pass that puts subkey lists back into the name
 // order Windows binary-searches (a service key behind an unsorted list parses
-// fine on disk and is invisible to Cm), and a header sequence/checksum flush
-// that marks the hive CLEAN so HvLoadHive does not replay SYSTEM.LOG over the
-// change during Phase 0.
+// fine on disk and is invisible to Cm), and a base-block flush that
+// synchronises Primary/Secondary sequence numbers, clears the clean-state
+// fields and rewrites the XOR checksum so HvLoadHive does not replay SYSTEM.LOG
+// over the change during Phase 0.
+//
+// Two more guard the file itself: every mutation snapshots <hive>.pre_arm
+// first, and the in-place writer commits through <hive>.tmp -- written, base
+// block read back and checked, then renamed over the destination -- so a
+// failure at any point leaves the original hive exactly as it was rather than
+// half of one write.
 // -----------------------------------------------------------------------------
 
 // Outcome of one boot-start arming pass.
@@ -127,20 +157,28 @@ struct HiveInspectionReport {
     std::vector<HiveServiceState> services;
     std::vector<HiveNetBinding> net_bindings;
 
-    // Boot Stage 15, offload and timeout scalars the pipeline neutralises.
+    // Boot Stage 15, offload and timeout scalars, reported as *context*. The
+    // arming contract writes only DisableDHCPMediaSense among them; the rest
+    // are read so an operator can see what the image carries, never so
+    // anything can promise to change them. Offline edits to the
+    // device-mapping and hardware-enumeration trees these values sit beside
+    // are what produced 0x74 BAD_SYSTEM_CONFIG_INFO.
     bool has_crash_dump_enabled{false};
     uint32_t crash_dump_enabled{0};
     bool paging_files_present{false};
     bool tcpip_offload_disabled{false};
-    bool tcpip_media_sense_disabled{false};
-    bool wfplwf_disabled{false}; // ms_wfplwf Start = 4
+    bool tcpip_media_sense_disabled{false}; // part of the arming contract
+    bool wfplwf_disabled{false};            // ms_wfplwf Start = 4
     bool has_disk_timeout{false};
     uint32_t disk_timeout{0};
     bool mounted_c_present{false}; // MountedDevices still holds \DosDevices\C:
     std::size_t cddb_entries{0};    // children of Control\CriticalDeviceDatabase
 
-    // Operator-facing bullets: everything below the bar, so an already-armed
-    // hive reports an empty list.
+    // Operator-facing bullets: only what the arming contract is responsible
+    // for -- hive cleanliness, Start, BootFlags and DisableDHCPMediaSense --
+    // so a hive already carrying them reports an empty list. Nothing under
+    // Enum\PCI or Control\Class appears here, because the pass never writes
+    // there.
     std::vector<std::string> findings;
     std::string message;
 
@@ -195,12 +233,17 @@ public:
     [[nodiscard]] static const std::vector<ServiceSpec>& boot_start_services();
 
     // Repair the hive structure, force Start / BootFlags / Group per the table,
-    // then flush the header clean. The buffer is mutated in place.
+    // then flush the header clean (sequence numbers, clean-state flags, XOR
+    // checksum). The buffer is mutated in place.
     [[nodiscard]] static Result<BootStartArmReport> arm_hive_buffer(
         std::vector<uint8_t>& hive_data);
 
-    // Read <hive_path>, arm it, unlink/truncate any sibling transaction log so
-    // the change cannot be rolled back at Phase 0, and write it back.
+    // Read <hive_path>, back it up to <hive>.pre_arm, arm it, and write the
+    // result back through a temporary file that is verified and then renamed
+    // over the destination. Any sibling transaction log (.LOG / .LOG1 /
+    // .LOG2) is recognised up front and purged only after the new file has
+    // landed, so HvLoadHive cannot replay a stale log over the change during
+    // Phase 0.
     [[nodiscard]] static Result<BootStartArmReport> arm_offline_system_hive(
         const std::filesystem::path& hive_path);
 
@@ -210,17 +253,26 @@ public:
     [[nodiscard]] static Result<BootStartArmReport> arm_vhd_image(
         const std::filesystem::path& vhd_path);
 
-    // Automated offline image armer & driver sanitization pipeline:
-    // 1. Mount VHD & Hive: OpenVirtualDisk/AttachVirtualDisk or PowerShell fallback,
-    //    load <MountedDrive>:\Windows\System32\config\SYSTEM into HKLM\COB_OFFLINE_SYS via RegLoadKeyW.
-    // 2. Inject Boot-Critical Driver Flags:
-    //    - Start = 0 for rt640x64, e1dexpress, e2fexpress, netkvm, msiscsi, NDIS, Tcpip
-    //    - Group = "Boot Bus Extender" on msiscsi
-    //    - Ensure ControlSet001\Control\CriticalDeviceDatabase has valid bindings for standard cafe NIC PCI IDs
-    // 3. Unload & Commit:
-    //    - RegUnLoadKeyW(HKEY_LOCAL_MACHINE, L"COB_OFFLINE_SYS")
-    //    - DetachVirtualDisk (or dismount PowerShell)
-    //    - Stamp file as read-only.
+    // Automated offline arming pipeline, deliberately minimal touch.
+    //
+    //   1. Mount: attach the VHD/VHDX through the VirtDisk API (or use a loose
+    //      regf file as-is) and resolve <volume>\Windows\System32\config\SYSTEM.
+    //   2. Back it up to <hive>.pre_arm, stage -- by leaving them in place --
+    //      any companion transaction logs, then acquire SeBackupPrivilege /
+    //      SeRestorePrivilege and load it into HKLM\COB_OFFLINE_SYS with
+    //      RegLoadKeyW (falling back to reg.exe load, then to the in-place
+    //      regf writer when the process is not elevated).
+    //   3. Mutate through the mounted hive: Start = 0, BootFlags and Group for
+    //      the rows of boot_start_services() the image already carries, plus
+    //      Tcpip\Parameters\DisableDHCPMediaSense = 1. Nothing under Enum\PCI,
+    //      Control\Class or CriticalDeviceDatabase is written -- rewriting
+    //      hardware enumeration offline is what produced 0x74
+    //      BAD_SYSTEM_CONFIG_INFO.
+    //   4. Close every handle (RAII plus a handle pool), RegFlushKey() the
+    //      mount root, then RegUnLoadKeyW() with five bounded retries. A load
+    //      that will not unload is a fatal error, not a warning: the companion
+    //      logs are purged only after it succeeds, and the VHD is detached and
+    //      stamped read-only only then as well.
     [[nodiscard]] static Result<BootStartArmReport> arm_image_offline_pipeline(
         const std::filesystem::path& vhd_path);
 

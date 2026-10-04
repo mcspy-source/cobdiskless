@@ -13,6 +13,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <cwchar>
 
@@ -132,20 +134,217 @@ bool string_iequal(std::string_view a, std::string_view b) noexcept {
 const GUID kVirtualStorageVendorMicrosoft = {
     0xEC984AEC, 0xA0F9, 0x47e9, {0x90, 0x1F, 0x71, 0x41, 0x5A, 0x66, 0x34, 0x5B}};
 
-void enable_token_privilege(LPCWSTR priv_name) {
+// -----------------------------------------------------------------------------
+// Privilege acquisition -- strict, because AdjustTokenPrivileges() lies.
+//
+// AdjustTokenPrivileges() reports failure in two places: its return value, and
+// GetLastError() when it returns TRUE anyway with ERROR_NOT_ALL_ASSIGNED. The
+// old code checked neither, so a process without SeBackupPrivilege /
+// SeRestorePrivilege sailed into RegLoadKeyW() and died deep in ntoskrnl with
+// 1314 ERROR_PRIVILEGE_NOT_HELD, and the pipeline could not say why -- it just
+// silently fell back to the raw writer.
+//
+// `priv_wide` is what is handed to the API, `priv_name` the same string in
+// ASCII for diagnostics (the file deliberately avoids TCHAR macros so it works
+// with and without UNICODE defined).
+// -----------------------------------------------------------------------------
+bool enable_token_privilege(LPCWSTR priv_wide, const char* priv_name, std::string* why) {
     HANDLE hToken = NULL;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        LUID luid;
-        if (LookupPrivilegeValueW(NULL, priv_name, &luid)) {
-            TOKEN_PRIVILEGES tp{};
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Luid = luid;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        if (why) {
+            *why = std::string(priv_name) + ": OpenProcessToken failed (Win32 error " +
+                   std::to_string(GetLastError()) + ")";
         }
-        CloseHandle(hToken);
+        return false;
     }
+
+    LUID luid{};
+    if (!LookupPrivilegeValueW(NULL, priv_wide, &luid)) {
+        const DWORD err = GetLastError();
+        CloseHandle(hToken);
+        if (why) {
+            *why = std::string(priv_name) + ": LookupPrivilegeValueW failed (Win32 error " +
+                   std::to_string(err) + ")";
+        }
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    SetLastError(ERROR_SUCCESS);
+    const BOOL adjusted =
+        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+    const DWORD err = GetLastError();
+    CloseHandle(hToken);
+
+    if (!adjusted) {
+        if (why) {
+            *why = std::string(priv_name) + ": AdjustTokenPrivileges failed (Win32 error " +
+                   std::to_string(err) + ")";
+        }
+        return false;
+    }
+    if (err == ERROR_NOT_ALL_ASSIGNED) {
+        if (why) {
+            *why = std::string(priv_name) + " is not held by this process token "
+                                              "(run the armer from an elevated prompt)";
+        }
+        return false;
+    }
+    if (err != ERROR_SUCCESS) {
+        if (why) {
+            *why = std::string(priv_name) + ": AdjustTokenPrivileges returned Win32 error " +
+                   std::to_string(err);
+        }
+        return false;
+    }
+    return true;
 }
+
+// SE_BACKUP_NAME / SE_RESTORE_NAME. RegLoadKeyW() and RegUnLoadKeyW() replace
+// the backing file of a hive the process does not own, so they need both; the
+// mount is not attempted without them rather than being attempted and failing
+// with an error nobody can act on. SeManageVolumePrivilege is needed only by
+// the VirtDisk attach and stays best-effort -- an image can be mounted by an
+// operator without it.
+bool acquire_hive_mount_privileges(std::string* why) {
+    static const struct {
+        const wchar_t* wide;
+        const char* name;
+    } kRequired[] = {
+        {L"SeBackupPrivilege", "SeBackupPrivilege"},   // SE_BACKUP_NAME
+        {L"SeRestorePrivilege", "SeRestorePrivilege"}, // SE_RESTORE_NAME
+    };
+
+    for (const auto& privilege : kRequired) {
+        std::string reason;
+        if (!enable_token_privilege(privilege.wide, privilege.name, &reason)) {
+            if (why) *why = reason;
+            return false;
+        }
+    }
+    return true;
+}
+
+void try_enable_volume_privilege() {
+    std::string ignored;
+    (void)enable_token_privilege(L"SeManageVolumePrivilege", "SeManageVolumePrivilege",
+                                 &ignored);
+}
+
+// -----------------------------------------------------------------------------
+// Strict handle lifecycle for the offline hive mount
+// -----------------------------------------------------------------------------
+// RegUnLoadKeyW() fails with ERROR_SHARING_VIOLATION (32) for as long as a
+// single handle opened under HKLM\COB_OFFLINE_SYS is alive -- including a
+// subkey handle opened two early-returns ago that nobody remembers. A mount
+// left that way is locked *and* transactionally dirty, and the image boots
+// straight into a corrupted SYSTEM hive.
+//
+// So every HKEY this file opens goes through RegKey, which closes on scope
+// exit (including exceptions and early returns), and every RegKey registers
+// with HiveKeyPool. The caller can then *prove* before it unmounts that the
+// mount is handle-free, and close_all() exists only as a last-resort sweep
+// that reports what it had to force -- never as the normal path.
+// -----------------------------------------------------------------------------
+class HiveKeyPool {
+public:
+    static HiveKeyPool& instance() {
+        static HiveKeyPool pool;
+        return pool;
+    }
+
+    void track(HKEY key) {
+        if (key == NULL) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        keys_.insert(key);
+    }
+
+    void untrack(HKEY key) {
+        if (key == NULL) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        keys_.erase(key);
+    }
+
+    [[nodiscard]] size_t live() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return keys_.size();
+    }
+
+    // Close whatever is still registered and report how many it had to force.
+    size_t close_all() {
+        std::vector<HKEY> leftovers;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            leftovers.assign(keys_.begin(), keys_.end());
+            keys_.clear();
+        }
+        for (HKEY key : leftovers) {
+            RegCloseKey(key);
+        }
+        return leftovers.size();
+    }
+
+private:
+    HiveKeyPool() = default;
+
+    mutable std::mutex mutex_;
+    std::set<HKEY> keys_;
+};
+
+class RegKey {
+public:
+    RegKey() = default;
+    ~RegKey() { close(); }
+
+    RegKey(const RegKey&) = delete;
+    RegKey& operator=(const RegKey&) = delete;
+
+    RegKey(RegKey&& other) noexcept : key_(other.key_) { other.key_ = nullptr; }
+
+    RegKey& operator=(RegKey&& other) noexcept {
+        if (this != &other) {
+            close();
+            key_ = other.key_;
+            other.key_ = nullptr;
+        }
+        return *this;
+    }
+
+    // Open (KEY_READ|KEY_WRITE as the caller prefers) into the guard and hand
+    // back the LSTATUS so the caller still decides what a failure means.
+    LONG open(HKEY parent, const wchar_t* subkey, REGSAM access) {
+        close();
+        HKEY opened = NULL;
+        const LONG status = RegOpenKeyExW(parent, subkey, 0, access, &opened);
+        if (status == ERROR_SUCCESS) {
+            key_ = opened;
+            HiveKeyPool::instance().track(key_);
+        }
+        return status;
+    }
+
+    // Deliberately no create(): the contract is armed-when-present, and a
+    // helper that could conjure a service key the image does not carry is
+    // exactly the thing that must not be reachable from this file.
+    [[nodiscard]] HKEY get() const noexcept { return key_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return key_ != NULL; }
+
+    void close() noexcept {
+        if (key_ == NULL) return;
+        HKEY dying = key_;
+        key_ = NULL;
+        HiveKeyPool::instance().untrack(dying);
+        RegCloseKey(dying);
+    }
+
+private:
+    HKEY key_ = NULL;
+};
 
 bool is_process_elevated() {
     HANDLE hToken = NULL;
@@ -207,6 +406,64 @@ std::string to_utf8(std::wstring_view wstr) {
 }
 #endif // _WIN32
 
+// Transaction logs that belong to `hive`. Windows derives their names by
+// appending .LOG1 / .LOG2 to the hive path, so they only mean anything when
+// they sit beside it: they are read *on mount* (HvLoadHive replays them while
+// the base-block sequence numbers disagree) and they must be gone *after* the
+// offline flush, or winload replays a log that no longer matches the file it
+// is replaying over. Both halves matter -- never isolate them, never leave
+// them stale.
+std::vector<std::filesystem::path> companion_logs(const std::filesystem::path& hive) {
+    static const char* const kSuffixes[] = {
+        ".LOG", ".LOG0", ".LOG1", ".LOG2",
+        ".log", ".log0", ".log1", ".log2",
+    };
+
+    std::vector<std::filesystem::path> found;
+    std::set<std::string> seen;
+    for (const char* suffix : kSuffixes) {
+        std::error_code ec;
+        std::filesystem::path candidate = hive.string() + suffix;
+        if (!std::filesystem::is_regular_file(candidate, ec)) continue;
+
+        // Windows file systems are case-insensitive, so ".LOG1" and ".log1"
+        // name one file. Staging it twice reports a companion that is not
+        // there, and purging it twice makes the second pass look like a
+        // failure to delete.
+        std::string key = candidate.filename().string();
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (!seen.insert(key).second) continue;
+
+        found.push_back(std::move(candidate));
+    }
+    return found;
+}
+
+// Purge the companion logs once -- and only once -- the hive has been flushed
+// and its mount (if there was one) is confirmed gone. Removing them earlier
+// would orphan a hive Windows still needs to replay on mount; leaving them
+// later lets winload roll the arming pass back during Phase 0.
+void purge_companion_logs(const std::vector<std::filesystem::path>& logs,
+                          std::vector<std::string>* warnings) {
+    for (const std::filesystem::path& log : logs) {
+        std::error_code ec;
+        std::filesystem::remove(log, ec);
+        if (ec) {
+            std::ofstream truncate(log, std::ios::binary | std::ios::trunc);
+            truncate.close();
+            if (warnings) {
+                warnings->push_back("Could not delete stale transaction log " +
+                                    log.filename().string() +
+                                    "; truncated it to 0 bytes instead");
+            }
+        }
+        Logger::default_logger().info(
+            "ARMER", "[ARMER] purged stale transaction log: " + log.filename().string());
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Hive file IO
 // -----------------------------------------------------------------------------
@@ -234,20 +491,180 @@ Result<std::vector<uint8_t>> read_hive_file(const std::filesystem::path& path) {
     return buffer;
 }
 
+// -----------------------------------------------------------------------------
+// Backup + atomic write
+// -----------------------------------------------------------------------------
+// <hive>.pre_arm is the image as this run found it, taken before the first
+// mutation. It is overwritten on each run so it always describes the state
+// *this* run started from, and it is deliberately kept afterwards: when an
+// arming pass fails halfway it is the only rollback artefact there is.
+Result<std::filesystem::path> make_pre_arm_backup(const std::filesystem::path& hive_path) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(hive_path, ec)) {
+        return Error(ErrorCode::StorageFailure,
+                     "Cannot back up a hive that is not a regular file: " +
+                         hive_path.string());
+    }
+
+    const std::filesystem::path backup = hive_path.string() + ".pre_arm";
+
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    // A previous arm may have left the backup stamped read-only; that
+    // attribute has to drop for copy_file to replace it.
+    const std::wstring backup_wide = backup.wstring();
+    const DWORD backup_attrs = GetFileAttributesW(backup_wide.c_str());
+    if (backup_attrs != INVALID_FILE_ATTRIBUTES &&
+        (backup_attrs & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(backup_wide.c_str(), backup_attrs & ~FILE_ATTRIBUTE_READONLY);
+    }
+#endif
+
+    std::filesystem::copy_file(hive_path, backup,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        return Error(ErrorCode::StorageFailure,
+                     "Could not create pre-arm backup " + backup.string() + " (" +
+                         ec.message() + "); refusing to mutate a hive with no way back");
+    }
+    return backup;
+}
+
+// Write `buffer` to `path` so that a failure at any point leaves the original
+// file exactly as it was:
+//
+//   1. the bytes go to <path>.tmp;
+//   2. the copy is read back and its *base block* is verified against the
+//      buffer -- size, "regf" signature, Primary == Secondary sequence and the
+//      XOR checksum at 0x1FC;
+//   3. only then does it replace the destination, in one rename.
+//
+// Without that window discipline an out-of-space or interrupted write used to
+// leave a half-written SYSTEM hive -- the one file a boot loader cannot get
+// itself out of. The replaced file object picks up the destination's
+// inherited directory ACL, which for Windows\System32\config is the same
+// SYSTEM/Administrators-only protection the original carried.
 Result<void> write_hive_file(const std::filesystem::path& path,
                              const std::vector<uint8_t>& buffer) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-        return Error(ErrorCode::StorageFailure,
-                     "Failed to open SYSTEM hive for writing: " + path.string());
+    if (buffer.size() < 0x200) {
+        return Error(ErrorCode::InvalidConfiguration,
+                     "Refusing to write a " + std::to_string(buffer.size()) +
+                         "-byte hive buffer to " + path.string());
     }
-    out.write(reinterpret_cast<const char*>(buffer.data()),
-              static_cast<std::streamsize>(buffer.size()));
-    out.flush();
-    if (!out.good()) {
-        return Error(ErrorCode::StorageFailure,
-                     "Failed to write complete SYSTEM hive to: " + path.string());
+
+    const std::filesystem::path tmp_path = path.string() + ".tmp";
+    const auto discard_tmp = [&]() {
+        std::error_code remove_ec;
+        std::filesystem::remove(tmp_path, remove_ec);
+    };
+
+    {
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return Error(ErrorCode::StorageFailure,
+                         "Failed to open the transactional hive copy for writing: " +
+                             tmp_path.string());
+        }
+        out.write(reinterpret_cast<const char*>(buffer.data()),
+                  static_cast<std::streamsize>(buffer.size()));
+        out.flush();
+        if (!out.good()) {
+            out.close();
+            discard_tmp();
+            return Error(ErrorCode::StorageFailure,
+                         "Short write to the transactional hive copy: " + tmp_path.string());
+        }
     }
+
+    // Verify the copy on disk, not the buffer in memory.
+    std::error_code size_ec;
+    const uint64_t tmp_size = std::filesystem::file_size(tmp_path, size_ec);
+    if (size_ec || tmp_size != buffer.size()) {
+        discard_tmp();
+        return Error(ErrorCode::StorageFailure,
+                     "Hive copy is " + (size_ec ? std::string("unreadable")
+                                                : std::to_string(tmp_size)) +
+                         " bytes, expected " + std::to_string(buffer.size()) + ": " +
+                         tmp_path.string());
+    }
+
+    uint8_t head[0x200] = {0};
+    {
+        std::ifstream in(tmp_path, std::ios::binary);
+        if (!in.is_open()) {
+            discard_tmp();
+            return Error(ErrorCode::StorageFailure,
+                         "Cannot re-open the hive copy for verification: " + tmp_path.string());
+        }
+        in.read(reinterpret_cast<char*>(head), sizeof(head));
+        if (in.gcount() != static_cast<std::streamsize>(sizeof(head))) {
+            discard_tmp();
+            return Error(ErrorCode::StorageFailure,
+                         "Short read while verifying the hive copy: " + tmp_path.string());
+        }
+    }
+
+    if (std::memcmp(head, "regf", 4) != 0) {
+        discard_tmp();
+        return Error(ErrorCode::InvalidConfiguration,
+                     "Hive copy lost the 'regf' signature: " + tmp_path.string());
+    }
+    if (read_le32(&head[0x04]) != read_le32(&head[0x08])) {
+        discard_tmp();
+        return Error(ErrorCode::InvalidConfiguration,
+                     "Hive copy has mismatched Primary/Secondary sequence numbers: " +
+                         tmp_path.string());
+    }
+    if (read_le32(&head[0x1FC]) !=
+        RegBootStart::calculate_regf_header_checksum(head)) {
+        discard_tmp();
+        return Error(ErrorCode::InvalidConfiguration,
+                     "Hive copy failed its base-block checksum: " + tmp_path.string());
+    }
+
+    // The destination may be read-only (this pass usually stamps it so), and
+    // NTFS refuses to replace a read-only file. Save, drop, rename, restore.
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    const std::wstring dest_wide = path.wstring();
+    const std::wstring tmp_wide = tmp_path.wstring();
+    const DWORD dest_attrs = GetFileAttributesW(dest_wide.c_str());
+    const bool had_attrs = (dest_attrs != INVALID_FILE_ATTRIBUTES);
+    if (had_attrs && (dest_attrs & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(dest_wide.c_str(), dest_attrs & ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    const bool replaced =
+        MoveFileExW(tmp_wide.c_str(), dest_wide.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    const DWORD move_error = replaced ? ERROR_SUCCESS : GetLastError();
+
+    if (!replaced) {
+        // Fall back to the portable path; if that fails too, the destination
+        // is still the file it was before this call.
+        std::error_code rename_ec;
+        std::filesystem::rename(tmp_path, path, rename_ec);
+        if (rename_ec) {
+            if (had_attrs) SetFileAttributesW(dest_wide.c_str(), dest_attrs);
+            discard_tmp();
+            return Error(ErrorCode::StorageFailure,
+                         "Atomic replace of " + path.string() + " failed (MoveFileExW " +
+                             std::to_string(move_error) + ", rename " + rename_ec.message() +
+                             ")");
+        }
+    }
+
+    if (had_attrs) {
+        SetFileAttributesW(dest_wide.c_str(), dest_attrs);
+    }
+#else
+    std::error_code rename_ec;
+    std::filesystem::rename(tmp_path, path, rename_ec);
+    if (rename_ec) {
+        discard_tmp();
+        return Error(ErrorCode::StorageFailure,
+                     "Atomic replace of " + path.string() + " failed: " + rename_ec.message());
+    }
+#endif
+
     return {};
 }
 
@@ -519,8 +936,17 @@ std::string regf_get_string(const std::vector<uint8_t>& hive, uint32_t nk_cell_o
 // Appends an allocated cell (aligned to 8 bytes) to the hive buffer and returns
 // the cell offset relative to 0x1000. Reuses a free cell when one is big enough,
 // otherwise grows the hive with a fresh 4096-aligned hbin.
+//
+// Two format invariants are enforced here rather than assumed, because both of
+// them failing silently is how an armed hive stops being openable:
+//
+//   * every cell descriptor is 8-byte aligned -- cell offsets are 32-bit and
+//     relative to the 0x1000 base-block boundary, so a cell whose start is not
+//     a multiple of 8 makes every cell after it unreachable;
+//   * every size carried by the chain is rounded down to that same multiple,
+//     so a corrupt length cannot drag the remainder of the bin off alignment.
 uint32_t allocate_cell(std::vector<uint8_t>& hive_data, size_t payload_size) {
-    size_t cell_size = (4 + payload_size + 7) & ~7;
+    size_t cell_size = (4 + payload_size + 7) & ~static_cast<size_t>(7);
     uint32_t hbins_size = read_le32(&hive_data[0x28]);
 
     if (hive_data.size() > 0x1000 && 0x1000 + hbins_size > hive_data.size()) {
@@ -533,17 +959,24 @@ uint32_t allocate_cell(std::vector<uint8_t>& hive_data, size_t payload_size) {
         if (std::memcmp(&hive_data[0x1000 + scan_off], "hbin", 4) != 0) break;
         uint32_t hbin_len = read_le32(&hive_data[0x1000 + scan_off + 0x08]);
         if (hbin_len < 0x20 || scan_off + hbin_len > hbins_size) break;
+        if ((scan_off & 7u) != 0) break; // hbins are 4 KiB aligned; a misaligned one is corrupt
 
         uint32_t cell_cursor = scan_off + 0x20;
         uint32_t hbin_end = scan_off + hbin_len;
 
         while (cell_cursor + 4 <= hbin_end && 0x1000 + cell_cursor + 4 <= hive_data.size()) {
+            if ((cell_cursor & 7u) != 0) break; // alignment lost: trust nothing past here
             int32_t raw_csize = static_cast<int32_t>(read_le32(&hive_data[0x1000 + cell_cursor]));
             if (raw_csize == 0) break;
 
             if (raw_csize > 0) {
                 uint32_t free_len = static_cast<uint32_t>(raw_csize);
                 if (free_len < 8 || cell_cursor + free_len > hbin_end) break;
+                // A free block whose length is not a multiple of 8 cannot be
+                // split without putting the remainder off alignment, so it is
+                // never allocated from -- and never rewritten either: the file
+                // is walked with the length it actually carries.
+                if ((free_len & 7u) != 0) break;
                 if (free_len >= cell_size) {
                     if (free_len >= cell_size + 8) {
                         uint32_t rem = free_len - static_cast<uint32_t>(cell_size);
@@ -561,6 +994,7 @@ uint32_t allocate_cell(std::vector<uint8_t>& hive_data, size_t payload_size) {
             } else {
                 uint32_t alloc_len = static_cast<uint32_t>(-raw_csize);
                 if (alloc_len < 8 || cell_cursor + alloc_len > hbin_end) break;
+                if ((alloc_len & 7u) != 0) break; // next header would land off alignment
                 cell_cursor += alloc_len;
             }
         }
@@ -569,7 +1003,7 @@ uint32_t allocate_cell(std::vector<uint8_t>& hive_data, size_t payload_size) {
     }
 
     // 2. No free cell found: allocate a new 4096-aligned hbin chunk
-    size_t needed_hbin = (0x20 + cell_size + 4095) & ~4095;
+    size_t needed_hbin = (0x20 + cell_size + 4095) & ~static_cast<size_t>(4095);
     uint32_t new_hbin_off = hbins_size;
     size_t needed_total = 0x1000 + new_hbin_off + needed_hbin;
 
@@ -1084,20 +1518,159 @@ struct HiveWriter {
                        std::max(max_data, static_cast<uint32_t>(u16_data.size())));
         }
     }
+
+    // Create `name` under `parent_off` when it does not exist yet, and return
+    // its nk cell offset (the existing one when it already does). Returns
+    // 0xFFFFFFFF when the parent is not a readable key, or when the parent's
+    // own list cannot be reproduced exactly -- a partial rebuild that silently
+    // drops a child is worse than not creating the key at all.
+    //
+    // The new key borrows its parent's security descriptor and its 0x0C word
+    // rather than carrying anything of its own: a key that describes itself
+    // differently from every sibling around it is what a validator notices.
+    // It is spliced into a freshly built subkey list, sorted by name with the
+    // hash Cm recomputes, so it is findable immediately -- no second repair
+    // pass, and no list left in creation order.
+    uint32_t ensure_subkey(uint32_t parent_off, const std::string& name) {
+        const uint32_t existing = regf_find_subkey(hive, parent_off, name);
+        if (existing != 0xFFFFFFFF) return existing;
+
+        uint8_t* parent = cell_payload(parent_off);
+        if (!parent || read_le16(parent) != 0x6B6E) return 0xFFFFFFFF;
+
+        // Values, not pointers: allocate_cell below can resize the buffer, so
+        // nothing that addresses the hive survives an allocation.
+        const uint32_t parent_sec = read_le32(parent + 0x2C);
+        const uint32_t parent_word0c = read_le32(parent + 0x0C);
+
+        struct Child {
+            uint32_t nk;
+            std::string name;
+        };
+        std::vector<Child> children;
+        uint16_t list_sig = kRegfSigLF;
+        for (uint32_t child : regf_list_subkeys(hive, parent_off)) {
+            std::string child_name;
+            if (!regf_nk_name(hive, child, &child_name)) {
+                return 0xFFFFFFFF; // cannot rebuild a list whose names we cannot read
+            }
+            children.push_back({child, std::move(child_name)});
+        }
+        {
+            const uint32_t list_off = read_le32(parent + 0x1C);
+            const uint8_t* sl = nullptr;
+            size_t sl_size = 0;
+            if (list_off != 0 && list_off != 0xFFFFFFFF &&
+                regf_cell(hive, list_off, &sl, &sl_size) && sl_size >= 4) {
+                const uint16_t sig = read_le16(sl);
+                if (sig == kRegfSigLH || sig == kRegfSigLI) list_sig = sig;
+            }
+        }
+        parent = cell_payload(parent_off);
+        if (!parent) return 0xFFFFFFFF;
+        if (read_le32(parent + 0x14) != children.size()) {
+            return 0xFFFFFFFF; // declared count disagrees: leave it alone
+        }
+
+        const uint32_t nk_off = allocate_cell(hive, 0x4C + name.size());
+        if (nk_off == 0) return 0xFFFFFFFF;
+        uint8_t* nk = cell_payload(nk_off);
+        if (!nk || read_le16(nk) != 0) return 0xFFFFFFFF;
+
+        const uint64_t now = regf_now_filetime();
+        write_le16(nk + 0x00, 0x6B6E);                        // "nk"
+        write_le16(nk + 0x02, 0x0020);                        // KEY_COMP_NAME: inline ANSI
+        write_le32(nk + 0x04, static_cast<uint32_t>(now & 0xFFFFFFFFu));
+        write_le32(nk + 0x08, static_cast<uint32_t>(now >> 32)); // LastWriteTime
+        write_le32(nk + 0x0C, parent_word0c);
+        write_le32(nk + 0x10, parent_off);
+        write_le32(nk + 0x14, 0);                             // subkey count
+        write_le32(nk + 0x18, 0);                             // volatile subkey count
+        write_le32(nk + 0x1C, 0xFFFFFFFF);                    // no subkey list yet
+        write_le32(nk + 0x20, 0xFFFFFFFF);                    // no volatile subkey list
+        write_le32(nk + 0x24, 0);                             // value count
+        write_le32(nk + 0x28, 0xFFFFFFFF);                    // no value list yet
+        write_le32(nk + 0x2C, parent_sec);
+        write_le32(nk + 0x30, 0xFFFFFFFF);                    // no class name
+        write_le32(nk + 0x34, 0);                             // max subkey name length
+        write_le32(nk + 0x38, 0);                             // max subkey class length
+        write_le32(nk + 0x3C, 0);                             // max value name length
+        write_le32(nk + 0x40, 0);                             // max value data length
+        write_le32(nk + 0x44, 0);                             // work var
+        write_le16(nk + 0x48, static_cast<uint16_t>(name.size()));
+        write_le16(nk + 0x4A, 0);                             // class name length
+        std::memcpy(nk + 0x4C, name.data(), name.size());
+
+        children.push_back({nk_off, name});
+        std::stable_sort(children.begin(), children.end(),
+                         [](const Child& a, const Child& b) {
+                             return regf_compare_subkey_names(a.name, b.name) < 0;
+                         });
+
+        const bool hashed = (list_sig == kRegfSigLF || list_sig == kRegfSigLH);
+        const uint32_t stride = hashed ? 8u : 4u;
+        const uint32_t list_off =
+            allocate_cell(hive, 4u + static_cast<uint32_t>(children.size()) * stride);
+        uint8_t* sl = cell_payload(list_off);
+        if (!sl) return 0xFFFFFFFF;
+        write_le16(sl + 0x00, list_sig);
+        write_le16(sl + 0x02, static_cast<uint16_t>(children.size()));
+        for (size_t i = 0; i < children.size(); ++i) {
+            write_le32(sl + 0x04 + static_cast<uint32_t>(i) * stride, children[i].nk);
+            if (hashed) {
+                write_le32(sl + 0x08 + static_cast<uint32_t>(i) * stride,
+                           regf_subkey_hash(list_sig, children[i].name));
+            }
+        }
+
+        parent = cell_payload(parent_off);
+        if (!parent) return 0xFFFFFFFF;
+        write_le32(parent + 0x14, static_cast<uint32_t>(children.size()));
+        write_le32(parent + 0x1C, list_off);
+        const uint32_t max_name_len = read_le32(parent + 0x34);
+        if (name.size() > max_name_len) {
+            write_le32(parent + 0x34, static_cast<uint32_t>(name.size()));
+        }
+        return nk_off;
+    }
 };
 
-// Base-block sequence synchronisation + HbinsDataSize + XOR checksum, i.e. the
-// flush that marks the hive CLEAN.
+// Base-block flush: sequence synchronisation, clean-state flags, HbinsDataSize
+// and the XOR checksum -- i.e. everything that decides whether the hive on disk
+// reads back as CLEAN.
 //
 // Forcing Primary == Secondary is what marks the hive CLEAN. The NT kernel's
 // hive loader (HvLoadHive) only replays SYSTEM.LOG1/SYSTEM.LOG2 when the two
 // sequence numbers disagree, so synchronising them here is what guarantees the
 // offline changes above are not rolled back during Phase 0.
+//
+// Two clean-state fields are reset alongside it:
+//
+//   0x48  sits inside HBASE_BLOCK.FileName[32] (0x30..0x6F), the 32-wchar debug
+//         string Windows never reads. It is zeroed anyway so that no non-zero
+//         remnant of a previous writer survives into an image this pass
+//         declares clean.
+//   0x90  HBASE_BLOCK.Flags. Bit 0x1 means "KTM locked the hive (there are
+//         pending or anticipated transactions)" -- the base block's real dirty
+//         bit, and one a transaction log entry restores on recovery. An offline
+//         arming pass runs no transaction, so it must read as 0; bit 0x2 (the
+//         layered-keys / defragmented marker) is a property of the hive and is
+//         left alone.
+//
+// The checksum goes last: it covers every byte written above.
 void flush_regf_header(std::vector<uint8_t>& hive) {
+    if (hive.size() < 0x200) return;
+
     uint32_t prim_seq = read_le32(&hive[0x04]);
     prim_seq++;
     write_le32(&hive[0x04], prim_seq);
     write_le32(&hive[0x08], prim_seq);
+
+    write_le32(&hive[0x48], 0);
+    const uint32_t flags = read_le32(&hive[0x90]);
+    if (flags & 0x1u) {
+        write_le32(&hive[0x90], flags & ~0x1u);
+    }
 
     if (hive.size() >= 0x1000) {
         uint32_t actual_hbins_size = static_cast<uint32_t>(hive.size() - 0x1000);
@@ -1107,11 +1680,7 @@ void flush_regf_header(std::vector<uint8_t>& hive) {
         }
     }
 
-    uint32_t csum = 0;
-    for (size_t i = 0; i < 0x1FC; i += 4) {
-        csum ^= read_le32(&hive[i]);
-    }
-    write_le32(&hive[0x1FC], csum);
+    write_le32(&hive[0x1FC], RegBootStart::calculate_regf_header_checksum(hive.data()));
 }
 
 // Resolve active ControlSet name from Select\Current with the same fallbacks the
@@ -1154,9 +1723,11 @@ uint32_t resolve_control_set(const std::vector<uint8_t>& hive, std::string* out_
 class MountedVhdVolume {
 public:
     explicit MountedVhdVolume(const std::filesystem::path& vhd_path) {
-        enable_token_privilege(L"SeManageVolumePrivilege");
-        enable_token_privilege(L"SeBackupPrivilege");
-        enable_token_privilege(L"SeRestorePrivilege");
+        try_enable_volume_privilege();
+        std::string mount_priv_why;
+        if (!acquire_hive_mount_privileges(&mount_priv_why)) {
+            warnings_.push_back(mount_priv_why);
+        }
 
         VIRTUAL_STORAGE_TYPE storage_type{};
         storage_type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_UNKNOWN;
@@ -1607,7 +2178,8 @@ std::string HiveInspectionReport::summary() const {
         ss << " Group=" << (state.group.empty() ? "<none>" : state.group) << "\n";
     }
 
-    ss << "Net class bindings (" << net_bindings.size() << "):\n";
+    ss << "Net class bindings (" << net_bindings.size()
+       << ") -- context only: the armer never writes Control\\Class\n";
     if (net_bindings.empty()) {
         ss << "  <none>\n";
     }
@@ -1616,7 +2188,8 @@ std::string HiveInspectionReport::summary() const {
            << binding.driver_desc << "\n";
     }
 
-    ss << "Boot Stage 15 / offload / timeout:\n";
+    ss << "Boot Stage 15 / offload / timeout -- context: of these values the armer "
+          "writes DisableDHCPMediaSense only\n";
     ss << "  CrashDumpEnabled        = "
        << (has_crash_dump_enabled ? std::to_string(crash_dump_enabled) : "<absent>") << "\n";
     ss << "  PagingFiles             = " << (paging_files_present ? "present" : "absent") << "\n";
@@ -1666,9 +2239,13 @@ Result<HiveInspectionReport> RegBootStart::inspect_hive_buffer(
     }
 
     // Two sequence numbers that disagree mean Windows shut down dirty: the .LOG*
-    // transaction would replay over an offline edit at Phase 0.
+    // transaction would replay over an offline edit at Phase 0. The pair is
+    // Primary (0x04) and Secondary (0x08); this used to compare 0x08 against
+    // 0x0C, which is the transaction-system-error word and reads 0 on a clean
+    // hive -- so every healthy hive was reported as DIRTY and the one signal
+    // that actually matters was never shown.
     report.hive_dirty_on_entry =
-        read_le32(&hive_data[0x08]) != read_le32(&hive_data[0x0C]);
+        read_le32(&hive_data[0x04]) != read_le32(&hive_data[0x08]);
 
     std::string cs_name;
     const uint32_t cs_off = resolve_control_set(hive_data, &cs_name);
@@ -1842,38 +2419,20 @@ Result<HiveInspectionReport> RegBootStart::inspect_hive_buffer(
         report.findings.push_back(
             "hive arrived dirty: a .LOG* transaction may replay over an offline edit at Phase 0");
     }
-    if (report.has_crash_dump_enabled && report.crash_dump_enabled != 0) {
-        report.findings.push_back("CrashDumpEnabled=" +
-                                  std::to_string(report.crash_dump_enabled) +
-                                  " (Boot Stage 15 dump stack still armed)");
-    }
-    if (report.paging_files_present) {
-        report.findings.push_back(
-            "PagingFiles present (Boot Stage 15 paging file not cleared)");
-    }
-    if (!report.tcpip_offload_disabled) {
-        report.findings.push_back("Tcpip Parameters\\DisableTaskOffload is not 1");
-    }
     if (!report.tcpip_media_sense_disabled) {
         report.findings.push_back("Tcpip Parameters\\DisableDHCPMediaSense is not 1");
     }
-    if (!report.wfplwf_disabled) {
-        report.findings.push_back("ms_wfplwf is not disabled (Start != 4)");
-    }
-    if (!report.has_disk_timeout) {
-        report.findings.push_back("Services\\disk has no TimeOutValue");
-    } else if (report.disk_timeout != 60) {
-        report.findings.push_back("Services\\disk\\TimeOutValue=" +
-                                  std::to_string(report.disk_timeout) +
-                                  "s (armed value is 60s)");
-    }
-    if (report.mounted_c_present) {
-        report.findings.push_back("MountedDevices still carries \\DosDevices\\C:");
-    }
-    if (report.net_bindings.empty()) {
-        report.findings.push_back(
-            "no net-class adapter binding under Control\\Class\\{4d36e972-...}");
-    }
+
+    // Everything the arming contract does *not* cover is deliberately not a
+    // finding: DisableTaskOffload, ms_wfplwf, Services\disk\TimeOutValue,
+    // PagingFiles, CrashDumpEnabled, MountedDevices and the net-class / CDDB
+    // bindings all used to be reported here as gaps the pass was supposed to
+    // close, and it duly closed them. The armer now writes only the service
+    // table and DisableDHCPMediaSense -- rewriting hardware enumeration and
+    // device-mapping trees offline is what produced 0x74
+    // BAD_SYSTEM_CONFIG_INFO -- so listing them as gaps would promise work
+    // that must not happen. The raw values are still reported above, under
+    // "Boot Stage 15 / offload / timeout", as context rather than as debt.
 
     report.success = report.valid_header && !report.control_set.empty() && report.walkable;
     report.message = report.success ? "Read-only inspection completed"
@@ -2111,6 +2670,39 @@ Result<BootStartArmReport> RegBootStart::arm_hive_buffer(std::vector<uint8_t>& h
                 (spec.require_network_boot_flag ? ", BootFlags = 0x1" : ""));
     }
 
+    // 2b. DisableDHCPMediaSense = 1 under <ControlSet>\Services\Tcpip\Parameters.
+    //
+    // The one value outside the service table this pass writes, and the reason
+    // it is on the short list: without it the TCP/IP stack drops the iSCSI
+    // session the moment a DHCP renewal fails and the boot dies at Phase 1 with
+    // nothing in the log to say why. The key is created only when its parent,
+    // Services\Tcpip, is carried by the image -- the same armed-when-present
+    // rule the rows above follow -- and nothing under Enum\PCI or Control\Class
+    // is read or written on the way.
+    {
+        const uint32_t tcpip_off = regf_find_subkey(hive_data, services_off, "Tcpip");
+        if (tcpip_off != 0xFFFFFFFF) {
+            const uint32_t params_off = writer.ensure_subkey(tcpip_off, "Parameters");
+            if (params_off != 0xFFFFFFFF) {
+                writer.set_dword(params_off, "DisableDHCPMediaSense", 1);
+                uint32_t media_sense = 0;
+                if (!regf_get_dword(hive_data, params_off, "DisableDHCPMediaSense",
+                                    &media_sense) ||
+                    media_sense != 1) {
+                    report.warnings.push_back("DisableDHCPMediaSense = 1 could not be "
+                                              "verified under " +
+                                              report.control_set +
+                                              "\\Services\\Tcpip\\Parameters");
+                } else {
+                    Logger::default_logger().info(
+                        "BOOTSTART", "[BOOTSTART] Armed " + report.control_set +
+                                         "\\Services\\Tcpip\\Parameters: "
+                                         "DisableDHCPMediaSense = 1");
+                }
+            }
+        }
+    }
+
     report.iscsi_stack_armed = stack_ok;
 
     // 3. Verify BootFlags landed everywhere they were supposed to.
@@ -2160,50 +2752,41 @@ Result<BootStartArmReport> RegBootStart::arm_offline_system_hive(
     }
     rep.target_path = hive_path;
 
-    // Warn about dirty transaction-log siblings on entry (they are unlinked or
-    // truncated on flush, below).
-    for (const std::string& suffix :
-         {std::string(".LOG"), std::string(".LOG0"), std::string(".LOG1"),
-          std::string(".LOG2")}) {
-        std::filesystem::path log_path = hive_path.string() + suffix;
+    // Companion transaction logs are recognised *before* anything is written:
+    // they are the difference between an image that boots and one winload rolls
+    // back during Phase 0. They stay in place until the new file has landed --
+    // a log is part of the hive, not something to isolate from it.
+    const std::vector<std::filesystem::path> companion = companion_logs(hive_path);
+    for (const std::filesystem::path& log_path : companion) {
         std::error_code log_ec;
-        if (std::filesystem::exists(log_path, log_ec) &&
-            std::filesystem::file_size(log_path, log_ec) > 0) {
+        if (std::filesystem::file_size(log_path, log_ec) > 0) {
             rep.warnings.push_back(
                 "Dirty hive transaction log detected: " + log_path.filename().string() +
-                " (will be unlinked/truncated on flush to prevent Phase 0 rollback)");
+                " (purged after the flush so Phase 0 cannot replay it)");
         }
     }
+
+    // Rollback artefact first: <hive>.pre_arm, copied from the file as it is
+    // right now, before the replacement takes over the destination.
+    auto backup_res = make_pre_arm_backup(hive_path);
+    if (!backup_res.is_ok()) {
+        return backup_res.error();
+    }
+    Logger::default_logger().info("BOOTSTART",
+                                  "[BOOTSTART] Pre-arm backup: " +
+                                      backup_res.value().string());
 
     auto write_res = write_hive_file(hive_path, buffer);
     if (!write_res.is_ok()) {
         return write_res.error();
     }
 
-    // Truncate / delete transaction logs. If SYSTEM.LOG1 or SYSTEM.LOG2 survive
-    // from an ungraceful shutdown, HvLoadHive replays them during Phase 0 and
-    // silently reverts the writes above.
-    for (const std::string& suffix :
-         {std::string(".LOG"), std::string(".LOG1"), std::string(".LOG2"),
-          std::string(".LOG0"), std::string(".log"), std::string(".log1"),
-          std::string(".log2"), std::string(".log0")}) {
-        std::filesystem::path log_path = hive_path.string() + suffix;
-        std::error_code log_ec;
-        if (!std::filesystem::exists(log_path, log_ec)) continue;
-        std::filesystem::remove(log_path, log_ec);
-        if (log_ec) {
-            std::ofstream trunc(log_path, std::ios::binary | std::ios::trunc);
-            trunc.close();
-            rep.warnings.push_back("Truncated transaction log to 0 bytes: " +
-                                   log_path.filename().string());
-        } else {
-            rep.warnings.push_back("Unlinked transaction log: " + log_path.filename().string());
-        }
-        Logger::default_logger().info("BOOTSTART",
-                                      "[BOOTSTART] Cleaned up transaction log: " +
-                                          log_path.filename().string());
-    }
-
+    // Purge the companion logs only now, with the flushed hive already in
+    // place. If SYSTEM.LOG1 or SYSTEM.LOG2 survived an ungraceful shutdown,
+    // HvLoadHive replays them during Phase 0 and silently reverts the writes
+    // above -- and an out-of-sync replay against a now-clean base block is
+    // exactly how a healthy image arrives at 0x74 BAD_SYSTEM_CONFIG_INFO.
+    purge_companion_logs(companion, &rep.warnings);
     Logger::default_logger().info("BOOTSTART",
                                   "[BOOTSTART] Armed offline hive: " + hive_path.string() + " (" +
                                       std::to_string(rep.armed_services.size()) +
@@ -2223,422 +2806,246 @@ Result<BootStartArmReport> RegBootStart::arm_offline_system_hive(
 }
 
 #if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
-static void delete_registry_key_tree(HKEY hParent, const wchar_t* subkey_name) {
-    HKEY hKey = NULL;
-    if (RegOpenKeyExW(hParent, subkey_name, 0, KEY_READ | KEY_WRITE, &hKey) == ERROR_SUCCESS) {
-        wchar_t child[256];
-        DWORD child_len = 256;
-        while (RegEnumKeyExW(hKey, 0, child, &child_len, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            delete_registry_key_tree(hKey, child);
-            child_len = 256;
-        }
-        RegCloseKey(hKey);
-        RegDeleteKeyW(hParent, subkey_name);
-    }
-}
-
-static bool inject_loaded_offline_hive(BootStartArmReport& report, const std::filesystem::path& win_vol_root = {}) {
-    HKEY hOfflineSys = NULL;
-    LONG res = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"COB_OFFLINE_SYS", 0, KEY_READ | KEY_WRITE, &hOfflineSys);
-    if (res != ERROR_SUCCESS) {
-        report.warnings.push_back("Failed to open HKLM\\COB_OFFLINE_SYS: Win32 error " + std::to_string(res));
+// -----------------------------------------------------------------------------
+// The mutation half of the Win32 mount path.
+//
+// Minimal touch, deliberately. Everything this routine writes is named by the
+// arming contract, and nothing else is:
+//
+//   1. one value under <ControlSet>\Services\Tcpip\Parameters --
+//      DisableDHCPMediaSense = 1;
+//   2. one row of boot_start_services(), opened only when the key the image
+//      already carries exists: Start = 0, the BootFlags that row asks for, a
+//      Group only when the key has none, and the removal of that key's own
+//      StartOverride -- which is what forces Start back to 3 on the next Plug
+//      And Play pass, so leaving it would silently undo the only write this
+//      function exists for.
+//
+// What it deliberately no longer does: it does not walk Enum\PCI, does not
+// rewrite Control\Class\{4d36e972-...} adapter instances, does not touch
+// CriticalDeviceDatabase, CrashControl, PagingFiles or MountedDevices, and
+// does not invent service keys the image does not carry. Mutating the hardware
+// enumeration trees offline is what took a supposedly-armed image into 0x74
+// BAD_SYSTEM_CONFIG_INFO: those trees are the device's own record, and a
+// second, partial copy written from outside PnP is read back by the boot
+// loader as information that does not reconcile.
+//
+// Handle discipline: every HKEY is a RegKey, so no early return can leak one;
+// the mount root is flushed through its own handle (never through
+// HKEY_LOCAL_MACHINE, which RegFlushKey treats as impractical) before that
+// guard closes; and by the time this function returns HiveKeyPool is empty,
+// which is the precondition RegUnLoadKeyW needs.
+// -----------------------------------------------------------------------------
+static bool inject_loaded_offline_hive(BootStartArmReport& report) {
+    RegKey root;
+    const LONG open_status = root.open(HKEY_LOCAL_MACHINE, L"COB_OFFLINE_SYS",
+                                       KEY_READ | KEY_WRITE);
+    if (open_status != ERROR_SUCCESS) {
+        report.warnings.push_back("Failed to open HKLM\\COB_OFFLINE_SYS: Win32 error " +
+                                  std::to_string(open_status));
         return false;
     }
 
-    // Determine target control sets
-    std::vector<std::wstring> control_sets;
-    control_sets.push_back(L"ControlSet001");
-
-    HKEY hSelect = NULL;
-    if (RegOpenKeyExW(hOfflineSys, L"Select", 0, KEY_READ, &hSelect) == ERROR_SUCCESS) {
-        DWORD dwVal = 0;
-        DWORD cbVal = sizeof(dwVal);
-        DWORD dwType = 0;
-        if (RegQueryValueExW(hSelect, L"Current", NULL, &dwType, reinterpret_cast<LPBYTE>(&dwVal), &cbVal) == ERROR_SUCCESS) {
-            wchar_t cs_buf[32] = {0};
-            swprintf(cs_buf, 32, L"ControlSet%03u", static_cast<unsigned int>(dwVal));
-            if (wcscmp(cs_buf, L"ControlSet001") != 0) {
-                control_sets.push_back(cs_buf);
-            }
+    // Exactly one control set is armed: Select\Current, the set the boot
+    // loader actually loads, falling back to ControlSet001 when the image has
+    // no readable Select key. Arming a second, inactive set would be a write
+    // nothing boots from -- the opposite of minimal touch.
+    std::wstring control_set = L"ControlSet001";
+    RegKey select;
+    if (select.open(root.get(), L"Select", KEY_READ) == ERROR_SUCCESS) {
+        DWORD current = 0;
+        DWORD size = sizeof(current);
+        DWORD type = 0;
+        if (RegQueryValueExW(select.get(), L"Current", NULL, &type,
+                             reinterpret_cast<LPBYTE>(&current), &size) == ERROR_SUCCESS &&
+            current > 0) {
+            wchar_t name[32] = {0};
+            swprintf(name, 32, L"ControlSet%03u", static_cast<unsigned int>(current));
+            control_set = name;
         }
-        RegCloseKey(hSelect);
+        select.close();
     }
+    report.control_set = to_utf8(control_set);
 
-    report.control_set = to_utf8(control_sets[0]);
-
-    // Check disk for driver existence if win_vol_root is available
-    auto driver_exists_on_disk = [&](const wchar_t* rel_sys_path) -> bool {
-        if (win_vol_root.empty()) return true;
-        std::error_code ec;
-        std::filesystem::path full_p = win_vol_root / rel_sys_path;
-        return std::filesystem::exists(full_p, ec);
+    const auto read_dword = [](HKEY key, const wchar_t* value_name, DWORD* out) -> bool {
+        DWORD data = 0;
+        DWORD size = sizeof(data);
+        DWORD type = 0;
+        if (RegQueryValueExW(key, value_name, NULL, &type,
+                             reinterpret_cast<LPBYTE>(&data), &size) != ERROR_SUCCESS) {
+            return false;
+        }
+        if (type != REG_DWORD || size != sizeof(data)) return false;
+        *out = data;
+        return true;
     };
 
-    // If rtcx21x64.sys does not exist on disk, delete any orphan rtcx21 service key to prevent incorrect binding
-    if (!win_vol_root.empty() && !driver_exists_on_disk(L"Windows\\System32\\drivers\\rtcx21x64.sys")) {
-        for (const auto& cs : control_sets) {
-            std::wstring rtcx_path = cs + L"\\Services\\rtcx21";
-            delete_registry_key_tree(hOfflineSys, rtcx_path.c_str());
-        }
-    }
-
-    // Target drivers and stack per requirements:
-    // Network Drivers: rt640x64, rtcx21, rt68cx64, rt68cx21x64, e1dexpress, e2fexpress, netkvm
-    // Network Stack: iScsiPrt, msiscsi, NDIS, Tcpip, Wdf01000
-    struct DriverTarget {
-        const wchar_t* name;
-        bool is_msiscsi_svc;
-        bool is_net_driver;
-        const wchar_t* default_group;
-        const wchar_t* default_image_path;
-        DWORD service_type;
+    const auto write_dword = [](HKEY key, const wchar_t* value_name, DWORD data) -> bool {
+        return RegSetValueExW(key, value_name, 0, REG_DWORD,
+                              reinterpret_cast<const BYTE*>(&data), sizeof(data)) ==
+               ERROR_SUCCESS;
     };
 
-    static const DriverTarget kTargets[] = {
-        // Realtek Network Drivers (NDIS 6.40 and NDIS 6.8x/Windows 10)
-        { L"rt640x64",    false, true,  L"NDIS",             L"System32\\drivers\\rt640x64.sys", 1 },
-        { L"rtcx21",      false, true,  L"NDIS",             L"System32\\drivers\\rtcx21x64.sys", 1 },
-        { L"rt68cx64",    false, true,  L"NDIS",             L"System32\\drivers\\rt68cx64.sys", 1 },
-        { L"rt68cx21x64", false, true,  L"NDIS",             L"System32\\drivers\\rt68cx21x64.sys", 1 },
-        // Intel Network Drivers
-        { L"e1dexpress",  false, true,  L"NDIS",             L"System32\\drivers\\e1d68x64.sys", 1 },
-        { L"e2fexpress",  false, true,  L"NDIS",             L"System32\\drivers\\e2f68.sys", 1 },
-        // Red Hat VirtIO
-        { L"netkvm",      false, true,  L"NDIS",             L"System32\\drivers\\netkvm.sys", 1 },
-        // iSCSI Kernel Driver (msiscsi.sys) - critical for mounting boot disk in Phase 1
-        { L"iScsiPrt",    false, false, L"CCiSCSI",          L"\\SystemRoot\\System32\\drivers\\msiscsi.sys", 1 },
-        // Microsoft iSCSI Initiator User-Mode Service
-        { L"msiscsi",     true,  false, L"Boot Bus Extender", L"%SystemRoot%\\system32\\svchost.exe -k netsvcs -p", 32 },
-        // Core Network Stack & KMDF
-        { L"NDIS",        false, false, L"NDIS Wrapper",     L"system32\\drivers\\ndis.sys", 1 },
-        { L"Tcpip",       false, false, L"PNP_TDI",          L"System32\\drivers\\tcpip.sys", 1 },
-        { L"Wdf01000",    false, false, L"WdfLoadGroup",     L"system32\\drivers\\Wdf01000.sys", 1 }
-    };
-
-    // Check which Realtek driver is actually present and valid in this offline hive / disk:
-    bool has_rt640 = driver_exists_on_disk(L"Windows\\System32\\drivers\\rt640x64.sys");
-    bool has_rtcx21 = driver_exists_on_disk(L"Windows\\System32\\drivers\\rtcx21x64.sys");
-
-    const wchar_t* realtek_target_svc = L"rt640x64";
-    if (has_rtcx21 && !has_rt640) {
-        realtek_target_svc = L"rtcx21";
-    } else {
-        realtek_target_svc = L"rt640x64";
-    }
-
-    for (const auto& cs : control_sets) {
-        for (const auto& dt : kTargets) {
-            // For network drivers, do not create a service if the underlying driver binary does not exist on disk
-            if (dt.is_net_driver && !driver_exists_on_disk(dt.default_image_path)) {
-                continue;
-            }
-
-            std::wstring svc_path = cs + L"\\Services\\" + dt.name;
-            HKEY hSvc = NULL;
-            DWORD disp = 0;
-            LONG c_res = RegCreateKeyExW(hOfflineSys, svc_path.c_str(), 0, NULL,
-                                         REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE,
-                                         NULL, &hSvc, &disp);
-            if (c_res == ERROR_SUCCESS) {
-                // Set Start = 0 (BOOT_START)
-                DWORD start_val = 0;
-                RegSetValueExW(hSvc, L"Start", 0, REG_DWORD,
-                               reinterpret_cast<const BYTE*>(&start_val), sizeof(start_val));
-
-                // Set BootFlags = 1 (CM_SERVICE_NETWORK_BOOT_LOAD)
-                DWORD boot_flags = 1;
-                RegSetValueExW(hSvc, L"BootFlags", 0, REG_DWORD,
-                               reinterpret_cast<const BYTE*>(&boot_flags), sizeof(boot_flags));
-
-                // Always ensure Group is populated
-                DWORD dwType = 0;
-                if (RegQueryValueExW(hSvc, L"Group", NULL, &dwType, NULL, NULL) != ERROR_SUCCESS) {
-                    RegSetValueExW(hSvc, L"Group", 0, REG_SZ,
-                                   reinterpret_cast<const BYTE*>(dt.default_group),
-                                   static_cast<DWORD>((wcslen(dt.default_group) + 1) * sizeof(wchar_t)));
-                }
-
-                // If newly created or missing ImagePath, write default ImagePath and Type
-                if (disp == REG_CREATED_NEW_KEY ||
-                    RegQueryValueExW(hSvc, L"ImagePath", NULL, &dwType, NULL, NULL) != ERROR_SUCCESS) {
-                    DWORD type_val = dt.service_type;
-                    DWORD err_ctrl = 1; // SERVICE_ERROR_NORMAL
-                    RegSetValueExW(hSvc, L"Type", 0, REG_DWORD,
-                                   reinterpret_cast<const BYTE*>(&type_val), sizeof(type_val));
-                    RegSetValueExW(hSvc, L"ErrorControl", 0, REG_DWORD,
-                                   reinterpret_cast<const BYTE*>(&err_ctrl), sizeof(err_ctrl));
-                    RegSetValueExW(hSvc, L"ImagePath", 0, REG_EXPAND_SZ,
-                                   reinterpret_cast<const BYTE*>(dt.default_image_path),
-                                   static_cast<DWORD>((wcslen(dt.default_image_path) + 1) * sizeof(wchar_t)));
-                }
-
-                // CRITICAL: Delete StartOverride subkey if present!
-                // Windows 10/11 creates StartOverride to force drivers back to Start=3 (DEMAND)
-                // during boot, which drops network drivers and causes 0x7B BSOD.
-                delete_registry_key_tree(hSvc, L"StartOverride");
-
-                // If this is a network driver, configure Parameters subkey with hardware guards:
-                if (dt.is_net_driver) {
-                    HKEY hParams = NULL;
-                    std::wstring params_path = svc_path + L"\\Parameters";
-                    if (RegCreateKeyExW(hOfflineSys, params_path.c_str(), 0, NULL,
-                                        REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE,
-                                        NULL, &hParams, NULL) == ERROR_SUCCESS) {
-                        DWORD one_dw = 1;
-                        DWORD link_delay = 10;
-                        RegSetValueExW(hParams, L"SkipPhyReset", 0, REG_DWORD,
-                                       reinterpret_cast<const BYTE*>(&one_dw), sizeof(one_dw));
-                        RegSetValueExW(hParams, L"WaitAutoNegComplete", 0, REG_DWORD,
-                                       reinterpret_cast<const BYTE*>(&one_dw), sizeof(one_dw));
-                        RegSetValueExW(hParams, L"LinkDownDelay", 0, REG_DWORD,
-                                       reinterpret_cast<const BYTE*>(&link_delay), sizeof(link_delay));
-                        RegCloseKey(hParams);
-                    }
-                }
-
-                RegCloseKey(hSvc);
-
-                std::string u8_name = to_utf8(dt.name);
-                if (std::find(report.armed_services.begin(), report.armed_services.end(), u8_name) == report.armed_services.end()) {
-                    report.armed_services.push_back(u8_name);
-                    report.modified_services.push_back(u8_name);
-                }
-                Logger::default_logger().info("ARMER", "[ARMER] Set Start=0 and flags for " + u8_name + " in " + to_utf8(cs));
-            } else {
-                report.warnings.push_back("Failed to open/create service key " + to_utf8(svc_path) + ": Win32 error " + std::to_string(c_res));
-            }
-        }
-
-        // NIC PHY Stabilization & Power-Management hardening to eliminate Realtek/Intel PHY drops during boot:
-        std::wstring net_class_path = cs + L"\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}";
-        HKEY hNetClass = NULL;
-        if (RegOpenKeyExW(hOfflineSys, net_class_path.c_str(), 0, KEY_READ | KEY_WRITE, &hNetClass) == ERROR_SUCCESS) {
-            DWORD index = 0;
-            wchar_t subkey_name[64];
-            DWORD name_len = 64;
-            while (RegEnumKeyExW(hNetClass, index++, subkey_name, &name_len, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                name_len = 64;
-                if (subkey_name[0] < L'0' || subkey_name[0] > L'9') continue;
-                HKEY hDevInst = NULL;
-                if (RegOpenKeyExW(hNetClass, subkey_name, 0, KEY_READ | KEY_WRITE, &hDevInst) == ERROR_SUCCESS) {
-                    const wchar_t* zero_str = L"0";
-                    const wchar_t* one_str = L"1";
-                    DWORD zero_len = static_cast<DWORD>((wcslen(zero_str) + 1) * sizeof(wchar_t));
-                    DWORD one_len = static_cast<DWORD>((wcslen(one_str) + 1) * sizeof(wchar_t));
-                    DWORD pnp_caps = 24; // 0x18: Disable Windows power saving from sleeping this NIC
-                    DWORD one_dw = 1;
-
-                    // Hardware guard values per specifications:
-                    // 1. SkipPhyReset = 1
-                    // 2. WaitAutoNegComplete = 1
-                    // 3. *EEE = "0"
-                    RegSetValueExW(hDevInst, L"*EEE", 0, REG_SZ, reinterpret_cast<const BYTE*>(zero_str), zero_len);
-                    RegSetValueExW(hDevInst, L"*GreenEthernet", 0, REG_SZ, reinterpret_cast<const BYTE*>(zero_str), zero_len);
-                    RegSetValueExW(hDevInst, L"GigaLite", 0, REG_SZ, reinterpret_cast<const BYTE*>(zero_str), zero_len);
-                    RegSetValueExW(hDevInst, L"PowerSavingMode", 0, REG_SZ, reinterpret_cast<const BYTE*>(zero_str), zero_len);
-                    RegSetValueExW(hDevInst, L"AutoDisablePhy", 0, REG_SZ, reinterpret_cast<const BYTE*>(zero_str), zero_len);
-                    RegSetValueExW(hDevInst, L"WaitAutoNegComplete", 0, REG_SZ, reinterpret_cast<const BYTE*>(one_str), one_len);
-                    RegSetValueExW(hDevInst, L"SkipPhyReset", 0, REG_SZ, reinterpret_cast<const BYTE*>(one_str), one_len);
-                    RegSetValueExW(hDevInst, L"PnPCapabilities", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&pnp_caps), sizeof(pnp_caps));
-                    RegSetValueExW(hDevInst, L"*FlowControl", 0, REG_SZ, reinterpret_cast<const BYTE*>(zero_str), zero_len);
-
-                    // 5. Force MSISupported = 0 under Interrupt Management\MessageSignaledInterruptProperties so CSM clients fall back to line IRQs
-                    HKEY hMsi = NULL;
-                    if (RegCreateKeyExW(hDevInst, L"Interrupt Management\\MessageSignaledInterruptProperties", 0, NULL,
-                                        REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hMsi, NULL) == ERROR_SUCCESS) {
-                        DWORD msi_disabled = 0;
-                        RegSetValueExW(hMsi, L"MSISupported", 0, REG_DWORD,
-                                       reinterpret_cast<const BYTE*>(&msi_disabled), sizeof(msi_disabled));
-                        RegCloseKey(hMsi);
-                    }
-
-                    RegCloseKey(hDevInst);
+    // ---- value 1 of 2: DisableDHCPMediaSense ---------------------------------
+    // Without it TCP/IP drops the iSCSI session the moment a DHCP renewal
+    // fails, and the boot dies at Phase 1 with no diagnostic.
+    {
+        const std::wstring params_path = control_set + L"\\Services\\Tcpip\\Parameters";
+        RegKey parameters;
+        if (parameters.open(root.get(), params_path.c_str(), KEY_READ | KEY_WRITE) ==
+            ERROR_SUCCESS) {
+            DWORD existing = 0;
+            if (!read_dword(parameters.get(), L"DisableDHCPMediaSense", &existing) ||
+                existing != 1) {
+                if (write_dword(parameters.get(), L"DisableDHCPMediaSense", 1)) {
+                    Logger::default_logger().info(
+                        "ARMER", "[ARMER] wrote " + to_utf8(params_path) +
+                                     "\\DisableDHCPMediaSense = 1");
+                } else {
+                    report.warnings.push_back("Failed to write DisableDHCPMediaSense under " +
+                                              to_utf8(params_path));
                 }
             }
-            RegCloseKey(hNetClass);
-        }
-
-        // Walk Enum\PCI to ensure any existing enumerated NIC device instances have MSISupported = 0:
-        std::wstring pci_path = cs + L"\\Enum\\PCI";
-        HKEY hPci = NULL;
-        if (RegOpenKeyExW(hOfflineSys, pci_path.c_str(), 0, KEY_READ | KEY_WRITE, &hPci) == ERROR_SUCCESS) {
-            DWORD pci_idx = 0;
-            wchar_t dev_key[128];
-            DWORD dev_len = 128;
-            while (RegEnumKeyExW(hPci, pci_idx++, dev_key, &dev_len, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                dev_len = 128;
-                HKEY hDevKey = NULL;
-                if (RegOpenKeyExW(hPci, dev_key, 0, KEY_READ | KEY_WRITE, &hDevKey) == ERROR_SUCCESS) {
-                    DWORD inst_idx = 0;
-                    wchar_t inst_key[128];
-                    DWORD inst_len = 128;
-                    while (RegEnumKeyExW(hDevKey, inst_idx++, inst_key, &inst_len, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                        inst_len = 128;
-                        HKEY hInstKey = NULL;
-                        if (RegOpenKeyExW(hDevKey, inst_key, 0, KEY_READ | KEY_WRITE, &hInstKey) == ERROR_SUCCESS) {
-                            wchar_t cls_buf[64] = {0};
-                            DWORD cls_sz = sizeof(cls_buf);
-                            DWORD cls_type = 0;
-                            bool is_net = false;
-                            if (RegQueryValueExW(hInstKey, L"ClassGUID", NULL, &cls_type, reinterpret_cast<LPBYTE>(cls_buf), &cls_sz) == ERROR_SUCCESS) {
-                                if (_wcsicmp(cls_buf, L"{4d36e972-e325-11ce-bfc1-08002be10318}") == 0) {
-                                    is_net = true;
-                                }
-                            }
-                            if (is_net) {
-                                HKEY hDevParams = NULL;
-                                if (RegCreateKeyExW(hInstKey, L"Device Parameters\\Interrupt Management\\MessageSignaledInterruptProperties", 0, NULL,
-                                                    REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hDevParams, NULL) == ERROR_SUCCESS) {
-                                    DWORD msi_val = 0;
-                                    RegSetValueExW(hDevParams, L"MSISupported", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&msi_val), sizeof(msi_val));
-                                    RegCloseKey(hDevParams);
-                                }
-                            }
-                            RegCloseKey(hInstKey);
-                        }
-                    }
-                    RegCloseKey(hDevKey);
-                }
-            }
-            RegCloseKey(hPci);
-        }
-
-        // Disable CrashDump generation over SAN volume
-        std::wstring crash_path = cs + L"\\Control\\CrashControl";
-        HKEY hCrash = NULL;
-        if (RegCreateKeyExW(hOfflineSys, crash_path.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hCrash, NULL) == ERROR_SUCCESS) {
-            DWORD dump_disabled = 0;
-            RegSetValueExW(hCrash, L"CrashDumpEnabled", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&dump_disabled), sizeof(dump_disabled));
-            RegCloseKey(hCrash);
-        }
-
-        // Disable DHCP Media Sense & TCP task offload to prevent packet drop / NIC resets during early boot
-        std::wstring tcp_path = cs + L"\\Services\\Tcpip\\Parameters";
-        HKEY hTcp = NULL;
-        if (RegCreateKeyExW(hOfflineSys, tcp_path.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hTcp, NULL) == ERROR_SUCCESS) {
-            DWORD one_val = 1;
-            RegSetValueExW(hTcp, L"DisableDHCPMediaSense", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&one_val), sizeof(one_val));
-            RegSetValueExW(hTcp, L"DisableTaskOffload", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&one_val), sizeof(one_val));
-            RegCloseKey(hTcp);
-        }
-
-        // Disable Windows Filtering Platform Lightweight Filter (ms_wfplwf)
-        // Prevents NDIS LWF driver from freezing newly enumerated NICs during kernel PnP handover
-        std::wstring wfplwf_path = cs + L"\\Services\\ms_wfplwf";
-        HKEY hWfp = NULL;
-        if (RegCreateKeyExW(hOfflineSys, wfplwf_path.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hWfp, NULL) == ERROR_SUCCESS) {
-            DWORD wfp_disabled = 4; // SERVICE_DISABLED
-            RegSetValueExW(hWfp, L"Start", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&wfp_disabled), sizeof(wfp_disabled));
-            RegCloseKey(hWfp);
-            Logger::default_logger().info("ARMER", "[ARMER] Disabled ms_wfplwf (Start=4) in " + to_utf8(cs));
-        }
-
-        // Remove PagingFiles to prevent smss.exe pagefile deadlock on diskless SAN volumes.
-        // NOTE: We delete the value rather than writing an invalid/empty REG_MULTI_SZ which causes 0x74 BAD_SYSTEM_CONFIG_INFO!
-        std::wstring mem_path = cs + L"\\Control\\Session Manager\\Memory Management";
-        HKEY hMem = NULL;
-        if (RegOpenKeyExW(hOfflineSys, mem_path.c_str(), 0, KEY_READ | KEY_WRITE, &hMem) == ERROR_SUCCESS) {
-            RegDeleteValueW(hMem, L"PagingFiles");
-            RegCloseKey(hMem);
-            Logger::default_logger().info("ARMER", "[ARMER] Deleted PagingFiles value in " + to_utf8(cs));
+        } else {
+            report.warnings.push_back("No " + to_utf8(params_path) +
+                                      " key in this image; DisableDHCPMediaSense not written");
         }
     }
 
-    // Clear stale \DosDevices\C: so Windows Mount Manager dynamically associates the boot partition with ARC C:.
-    // CAUTION: Do NOT delete all entries (Volume GUIDs) from MountedDevices, as doing so breaks Windows system hive validation (0x74).
-    HKEY hMounted = NULL;
-    if (RegOpenKeyExW(hOfflineSys, L"MountedDevices", 0, KEY_READ | KEY_WRITE, &hMounted) == ERROR_SUCCESS) {
-        RegDeleteValueW(hMounted, L"\\DosDevices\\C:");
-        RegCloseKey(hMounted);
-        Logger::default_logger().info("ARMER", "[ARMER] Removed stale \\DosDevices\\C: from MountedDevices");
-    }
+    // ---- value 2 of 2: the boot-start service table ---------------------------
+    for (const auto& spec : RegBootStart::boot_start_services()) {
+        const std::wstring key_path = control_set + L"\\Services\\" + to_wide(spec.service);
 
-    report.iscsi_stack_armed = true;
-    report.boot_flags_armed = true;
+        RegKey service;
+        if (service.open(root.get(), key_path.c_str(), KEY_READ | KEY_WRITE) !=
+            ERROR_SUCCESS) {
+            // Arm-only-when-present: a key with no Type / ImagePath is not
+            // something the SCM can launch, so a service this image does not
+            // carry is reported, never invented.
+            report.missing_services.push_back(spec.service);
+            continue;
+        }
 
-    // Ensure ControlSet001\Control\CriticalDeviceDatabase has valid bindings for standard cafe NIC PCI device IDs
-    struct CddbEntry {
-        const wchar_t* hw_id;
-        const wchar_t* service;
-        const wchar_t* class_guid;
-    };
+        bool changed = false;
 
-    const CddbEntry kCafeCddbTable[] = {
-        // Microsoft iSCSI Initiator
-        { L"root#iscsiprt", L"iScsiPrt", L"{4d36e97b-e325-11ce-bfc1-08002be10318}" },
-
-        // Realtek 1GbE PCIe (RTL8168 / RTL8111 / RTL8169 / RTL8136) - NDIS 6.40 rt640x64
-        { L"pci#ven_10ec&dev_8168", L"rt640x64", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_10ec&dev_8168&rev_06", L"rt640x64", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_10ec&dev_8169", L"rt640x64", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_10ec&dev_8136", L"rt640x64", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_10ec&cc_0200", L"rt640x64", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_10ec&cc_020000", L"rt640x64", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-
-        // Realtek 2.5GbE PCIe (RTL8125 / RTL8125B) - NDIS 6.8x rtcx21
-        { L"pci#ven_10ec&dev_8125", (has_rtcx21 ? L"rtcx21" : L"rt640x64"), L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_10ec&dev_8125&rev_04", (has_rtcx21 ? L"rtcx21" : L"rt640x64"), L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_10ec&dev_8125&rev_05", (has_rtcx21 ? L"rtcx21" : L"rt640x64"), L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-
-        // Intel 1GbE (I219-LM/V, I217-V, I218-V)
-        { L"pci#ven_8086&dev_15b8", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15d7", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15e3", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_153a", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_153b", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15bc", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15bd", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15be", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15df", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15e1", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15e2", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_1a1e", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_1a1f", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&cc_0200", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&cc_020000", L"e1dexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-
-        // Intel 2.5GbE (I225-V, I226-V)
-        { L"pci#ven_8086&dev_15f3", L"e2fexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_15f2", L"e2fexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_125b", L"e2fexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_125c", L"e2fexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_8086&dev_125d", L"e2fexpress", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-
-        // Red Hat / VirtIO KVM
-        { L"pci#ven_1af4&dev_1000", L"netkvm", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-        { L"pci#ven_1af4&dev_1041", L"netkvm", L"{4d36e972-e325-11ce-bfc1-08002be10318}" },
-    };
-
-    HKEY hCddb = NULL;
-    LONG cddb_res = RegCreateKeyExW(hOfflineSys,
-                                    L"ControlSet001\\Control\\CriticalDeviceDatabase",
-                                    0, NULL, REG_OPTION_NON_VOLATILE,
-                                    KEY_READ | KEY_WRITE, NULL, &hCddb, NULL);
-    if (cddb_res == ERROR_SUCCESS) {
-        size_t cddb_injected = 0;
-        for (const auto& entry : kCafeCddbTable) {
-            HKEY hDev = NULL;
-            if (RegCreateKeyExW(hCddb, entry.hw_id, 0, NULL, REG_OPTION_NON_VOLATILE,
-                                KEY_READ | KEY_WRITE, NULL, &hDev, NULL) == ERROR_SUCCESS) {
-                RegSetValueExW(hDev, L"Service", 0, REG_SZ,
-                               reinterpret_cast<const BYTE*>(entry.service),
-                               static_cast<DWORD>((wcslen(entry.service) + 1) * sizeof(wchar_t)));
-                RegSetValueExW(hDev, L"ClassGUID", 0, REG_SZ,
-                               reinterpret_cast<const BYTE*>(entry.class_guid),
-                               static_cast<DWORD>((wcslen(entry.class_guid) + 1) * sizeof(wchar_t)));
-                RegCloseKey(hDev);
-                cddb_injected++;
+        // StartOverride pins the previous Start value and is re-applied by the
+        // next PnP pass. It lives under this same service key, and it is why
+        // Start = 0 alone does not take.
+        {
+            RegKey start_override;
+            if (start_override.open(service.get(), L"StartOverride", KEY_READ | KEY_WRITE) ==
+                ERROR_SUCCESS) {
+                start_override.close();
+                if (RegDeleteKeyW(service.get(), L"StartOverride") == ERROR_SUCCESS) {
+                    changed = true;
+                    Logger::default_logger().info(
+                        "ARMER", "[ARMER] removed StartOverride under " +
+                                     to_utf8(key_path));
+                }
             }
         }
-        RegCloseKey(hCddb);
-        Logger::default_logger().info("ARMER", "[ARMER] Injected " + std::to_string(cddb_injected) + " CDDB entries into ControlSet001\\Control\\CriticalDeviceDatabase");
-        std::cout << "[INFO] CriticalDeviceDatabase: successfully bound " << cddb_injected << " cafe NIC hardware IDs." << std::endl;
-    } else {
-        report.warnings.push_back("Failed to open/create ControlSet001\\Control\\CriticalDeviceDatabase: Win32 error " + std::to_string(cddb_res));
+
+        DWORD start = 0;
+        if (!read_dword(service.get(), L"Start", &start) || start != kServiceStartBoot) {
+            if (write_dword(service.get(), L"Start", kServiceStartBoot)) changed = true;
+        }
+
+        if (spec.require_network_boot_flag) {
+            DWORD flags = 0;
+            if (!read_dword(service.get(), L"BootFlags", &flags) ||
+                flags != kNetworkBootLoad) {
+                if (write_dword(service.get(), L"BootFlags", kNetworkBootLoad)) {
+                    changed = true;
+                }
+            }
+        }
+
+        if (spec.group != nullptr && *spec.group != '\0') {
+            wchar_t existing_group[128] = {0};
+            DWORD group_size = sizeof(existing_group);
+            DWORD group_type = 0;
+            const LONG group_status =
+                RegQueryValueExW(service.get(), L"Group", NULL, &group_type,
+                                 reinterpret_cast<LPBYTE>(existing_group), &group_size);
+            const bool has_group =
+                (group_status == ERROR_SUCCESS) || (group_status == ERROR_MORE_DATA);
+            if (!has_group) {
+                const std::wstring group = to_wide(spec.group);
+                if (RegSetValueExW(service.get(), L"Group", 0, REG_SZ,
+                                   reinterpret_cast<const BYTE*>(group.c_str()),
+                                   static_cast<DWORD>((group.size() + 1) * sizeof(wchar_t))) ==
+                    ERROR_SUCCESS) {
+                    changed = true;
+                }
+            }
+        }
+
+        report.armed_services.push_back(spec.service);
+        if (changed) report.modified_services.push_back(spec.service);
+
+        Logger::default_logger().info("ARMER", std::string("[ARMER] ") + spec.service +
+                                                   " under " + report.control_set +
+                                                   (changed ? ": changed" : ": already correct"));
     }
 
-    RegCloseKey(hOfflineSys);
-    RegFlushKey(HKEY_LOCAL_MACHINE);
+    // Read the two contract booleans back rather than assuming the writes
+    // landed: a report that claims success on an unverified write hands the
+    // client an image that will not boot.
+    bool stack_armed = true;
+    bool network_flags_armed = true;
+
+    for (const auto& spec : RegBootStart::boot_start_services()) {
+        RegKey service;
+        const std::wstring key_path = control_set + L"\\Services\\" + to_wide(spec.service);
+        if (service.open(root.get(), key_path.c_str(), KEY_READ) != ERROR_SUCCESS) {
+            if (spec.required) stack_armed = false;
+            continue;
+        }
+
+        DWORD start = 0;
+        const bool is_boot_start =
+            read_dword(service.get(), L"Start", &start) && start == kServiceStartBoot;
+        if (spec.required && !is_boot_start) stack_armed = false;
+
+        if (spec.require_network_boot_flag) {
+            DWORD flags = 0;
+            if (!read_dword(service.get(), L"BootFlags", &flags) ||
+                flags != kNetworkBootLoad) {
+                network_flags_armed = false;
+            }
+        }
+    }
+
+    report.iscsi_stack_armed = stack_armed;
+    report.boot_flags_armed = network_flags_armed;
+
+    // Flush the mount itself. RegFlushKey(HKEY_LOCAL_MACHINE) is documented as
+    // impractical on a root key and returns without promising anything, so the
+    // old call flushed nothing that mattered: an unflushed mount reaches the
+    // disk with sequence numbers that never moved, and that is what winload
+    // reads as a hive still owed a transaction-log replay.
+    const LONG flush_status = RegFlushKey(root.get());
+    if (flush_status != ERROR_SUCCESS) {
+        report.warnings.push_back("RegFlushKey(HKLM\\COB_OFFLINE_SYS) returned Win32 error " +
+                                  std::to_string(flush_status));
+    }
+
+    report.success = true;
+    report.message =
+        "Armed " + std::to_string(report.armed_services.size()) + " boot service(s) in " +
+        report.control_set + " (" + std::to_string(report.modified_services.size()) +
+        " modified, " + std::to_string(report.missing_services.size()) + " not carried" +
+        (report.boot_flags_armed ? ", network BootFlags armed"
+                                 : ", network BootFlags NOT armed") +
+        (report.iscsi_stack_armed ? ", iSCSI boot stack armed"
+                                  : ", iSCSI boot stack NOT armed") +
+        "); minimal touch: service table + DisableDHCPMediaSense only, no hardware "
+        "enumeration tree was modified";
+
+    Logger::default_logger().info("ARMER", "[ARMER] " + report.message);
+
+    // `root` is declared first and so closes last: every subkey guard above
+    // has already left HiveKeyPool by the time this return runs.
     return true;
 }
 #endif
@@ -2670,9 +3077,7 @@ Result<BootStartArmReport> RegBootStart::arm_image_offline_pipeline(
         }
 
 #if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
-        enable_token_privilege(L"SeManageVolumePrivilege");
-        enable_token_privilege(L"SeBackupPrivilege");
-        enable_token_privilege(L"SeRestorePrivilege");
+        try_enable_volume_privilege();
 
         std::wstring native_vhd = to_native_win_path(vhd_path);
 
@@ -2923,48 +3328,119 @@ Result<BootStartArmReport> RegBootStart::arm_image_offline_pipeline(
             }
         }
 
-        std::cout << "[INFO] Loading offline SYSTEM hive from: " << system_hive_path.string() << " into HKLM\\COB_OFFLINE_SYS..." << std::endl;
+        std::cout << "[STEP] offline SYSTEM hive: " << system_hive_path.string() << std::endl;
 
-        // Step 1 cont.: Load hive into HKLM\COB_OFFLINE_SYS using RegLoadKeyW
+        // Rollback artefact first. The mount path never goes through
+        // write_hive_file(), so it takes its own <hive>.pre_arm from the file
+        // exactly as this run found it.
+        auto backup_res = make_pre_arm_backup(system_hive_path);
+        if (!backup_res.is_ok()) {
+            return backup_res.error();
+        }
+        std::cout << "[STEP]   pre-arm backup: " << backup_res.value().string() << std::endl;
+
+        // Companion transaction logs are detected and *staged* by staying
+        // exactly where they are. HvLoadHive derives .LOG1/.LOG2 from the hive
+        // path and replays them while the base-block sequence numbers disagree,
+        // so moving or deleting them before the mount would orphan a hive that
+        // still needs them. They are purged only once the unload below is
+        // confirmed, because a log left behind after the flush is replayed over
+        // a base block that is now clean -- and that out-of-sync replay is how
+        // an armed image reaches 0x74 BAD_SYSTEM_CONFIG_INFO.
+        const std::vector<std::filesystem::path> staged_logs = companion_logs(system_hive_path);
+        for (const std::filesystem::path& log : staged_logs) {
+            std::cout << "[STEP]   companion transaction log staged beside the hive: "
+                      << log.filename().string() << std::endl;
+        }
+
+        // SE_BACKUP_NAME + SE_RESTORE_NAME first: RegLoadKeyW and
+        // RegUnLoadKeyW replace a file this process does not own, and without
+        // both the mount dies inside ntoskrnl with 1314
+        // ERROR_PRIVILEGE_NOT_HELD. The failure is now reported instead of
+        // silently degrading into the raw writer.
+        std::string privilege_why;
+        const bool privileges_ok = acquire_hive_mount_privileges(&privilege_why);
+        if (privileges_ok) {
+            std::cout << "[STEP]   SeBackupPrivilege + SeRestorePrivilege acquired" << std::endl;
+        } else {
+            std::cout << "[WARN]   " << privilege_why << std::endl;
+        }
+
+        // A mount left behind by an interrupted earlier run blocks this one.
         (void)RegUnLoadKeyW(HKEY_LOCAL_MACHINE, L"COB_OFFLINE_SYS");
 
         std::wstring native_sys_hive = to_native_win_path(system_hive_path);
-        LONG reg_load_status = RegLoadKeyW(HKEY_LOCAL_MACHINE, L"COB_OFFLINE_SYS", native_sys_hive.c_str());
-        bool loaded_via_reg_api = (reg_load_status == ERROR_SUCCESS);
-
-        if (!loaded_via_reg_api) {
-            std::string reg_load_cmd = "reg.exe load HKLM\\COB_OFFLINE_SYS \"" + system_hive_path.string() + "\"";
-            if (std::system(reg_load_cmd.c_str()) == 0) {
+        LONG reg_load_status = ERROR_PRIVILEGE_NOT_HELD;
+        bool loaded_via_reg_api = false;
+        if (privileges_ok) {
+            reg_load_status =
+                RegLoadKeyW(HKEY_LOCAL_MACHINE, L"COB_OFFLINE_SYS", native_sys_hive.c_str());
+            loaded_via_reg_api = (reg_load_status == ERROR_SUCCESS);
+        }
+        if (loaded_via_reg_api) {
+            std::cout << "[STEP]   RegLoadKeyW -> HKLM\\COB_OFFLINE_SYS OK" << std::endl;
+        } else {
+            std::cout << "[WARN]   RegLoadKeyW refused (code " << reg_load_status
+                      << "); trying reg.exe load" << std::endl;
+            const std::string reg_load_cmd =
+                "reg.exe load HKLM\\COB_OFFLINE_SYS \"" + system_hive_path.string() + "\"";
+            if (privileges_ok && std::system(reg_load_cmd.c_str()) == 0) {
                 loaded_via_reg_api = true;
+                std::cout << "[STEP]   reg.exe load -> HKLM\\COB_OFFLINE_SYS OK" << std::endl;
             }
         }
 
-        if (loaded_via_reg_api) {
-            std::cout << "[INFO] Successfully loaded hive into HKLM\\COB_OFFLINE_SYS via RegLoadKeyW." << std::endl;
-            // Step 2: Inject Boot-Critical Driver Flags & CDDB entries
-            inject_loaded_offline_hive(report, win_vol_root);
+        bool unload_failed = false;
+        LONG unload_status = ERROR_SUCCESS;
 
-            // Step 3: Unload & Commit
-            std::cout << "[INFO] Unloading hive HKLM\\COB_OFFLINE_SYS via RegUnLoadKeyW..." << std::endl;
-            LONG unload_status = ERROR_SUCCESS;
-            for (int retry = 0; retry < 10; ++retry) {
+        if (loaded_via_reg_api) {
+            // Step 2: minimal-touch arming through the mounted hive.
+            inject_loaded_offline_hive(report);
+
+            // Every handle opened under the mount must be gone before the
+            // unload: a single survivor makes RegUnLoadKeyW return
+            // ERROR_SHARING_VIOLATION and leaves a locked, dirty hive behind.
+            const size_t forced = HiveKeyPool::instance().close_all();
+            std::cout << "[VERIFY] registry handles still open under the mount: 0"
+                      << (forced > 0 ? " (closed " + std::to_string(forced) + " by force)" : "")
+                      << std::endl;
+            if (forced > 0) {
+                report.warnings.push_back("Force-closed " + std::to_string(forced) +
+                                          " registry handle(s) that outlived their scope");
+            }
+
+            // Step 3: Unload & Commit -- checked, bounded, and fatal.
+            std::cout << "[VERIFY] RegUnLoadKeyW(HKLM\\COB_OFFLINE_SYS)..." << std::endl;
+            constexpr int kUnloadAttempts = 5;
+            for (int attempt = 1; attempt <= kUnloadAttempts; ++attempt) {
                 unload_status = RegUnLoadKeyW(HKEY_LOCAL_MACHINE, L"COB_OFFLINE_SYS");
-                if (unload_status == ERROR_SUCCESS) break;
+                if (unload_status == ERROR_SUCCESS) {
+                    std::cout << "[VERIFY]   unloaded on attempt " << attempt << "/"
+                              << kUnloadAttempts << std::endl;
+                    break;
+                }
+                std::cout << "[VERIFY]   attempt " << attempt << "/" << kUnloadAttempts
+                          << " failed (Win32 error " << unload_status << ")" << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
+
             if (unload_status != ERROR_SUCCESS) {
-                std::string reg_unload_cmd = "reg.exe unload HKLM\\COB_OFFLINE_SYS";
-                (void)std::system(reg_unload_cmd.c_str());
+                unload_failed = true;
+            } else {
+                // Only now are the logs stale, and only now are they safe to drop.
+                purge_companion_logs(staged_logs, &report.warnings);
             }
         } else {
-            // Un-elevated fallback or synthetic test hive
-            std::cout << "[WARN] RegLoadKeyW failed (code " << reg_load_status << "); falling back to in-place hive armer..." << std::endl;
+            // Un-elevated fallback or synthetic test hive.
+            std::cout << "[WARN]   hive could not be mounted; falling back to the in-place "
+                         "regf writer" << std::endl;
             auto arm_fallback = arm_offline_system_hive(system_hive_path);
             if (arm_fallback.is_ok()) {
                 report = arm_fallback.value();
                 report.target_path = vhd_path;
             } else {
-                report.warnings.push_back("Fallback arming failed: " + std::string(arm_fallback.error().message()));
+                report.warnings.push_back("Fallback arming failed: " +
+                                          std::string(arm_fallback.error().message()));
             }
         }
 
@@ -2990,6 +3466,23 @@ Result<BootStartArmReport> RegBootStart::arm_image_offline_pipeline(
             (void)std::system(ps_dismount.c_str());
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+
+        // Abort only after the volume has been torn down, and say exactly what
+        // an operator has to do: leaving a hive mounted and dirty is the state
+        // that produces a corrupted SYSTEM file on the next boot, so it is an
+        // error to report rather than a warning to file.
+        if (unload_failed) {
+            const std::string detail =
+                "RegUnLoadKeyW(HKLM\\COB_OFFLINE_SYS) still failing after 5 attempts "
+                "(Win32 error " + std::to_string(unload_status) +
+                "). The hive is still mounted and transactionally dirty and this image "
+                "must not be handed to the boot loader: run \"reg.exe unload "
+                "HKLM\\COB_OFFLINE_SYS\", close whatever holds it, then retry. The pre-arm "
+                "backup is at " + backup_res.value().string();
+            Logger::default_logger().error("ARMER", "[ARMER] " + detail);
+            std::cerr << "[FATAL] " << detail << std::endl;
+            return Error(ErrorCode::StorageFailure, detail);
+        }
 #else
         auto arm_res = arm_offline_system_hive(vhd_path);
         if (!arm_res.is_ok()) return arm_res;
@@ -3009,7 +3502,10 @@ Result<BootStartArmReport> RegBootStart::arm_image_offline_pipeline(
 
         report.success = true;
         report.target_path = vhd_path;
-        report.message = "VHD ingestion pipeline complete: drivers sanitized, CDDB injected, stamped read-only.";
+        report.message =
+            "VHD ingestion pipeline complete: boot-start service table and "
+            "DisableDHCPMediaSense armed with minimal touch, companion transaction logs "
+            "purged, no hardware enumeration tree modified, stamped read-only.";
         std::cout << "[INFO] " << report.message << std::endl;
         return report;
     } catch (const std::exception& ex) {
@@ -3160,7 +3656,11 @@ bool RegBootStart::validate_vhd_compact_os(const std::filesystem::path& vhd_path
                         if (rec.size() < 48 || std::memcmp(rec.data(), "FILE", 4) != 0) return;
                         uint16_t usa_off = read_le16(&rec[4]);
                         uint16_t usa_count = read_le16(&rec[6]);
-                        if (usa_off + usa_count * 2 > rec.size() || usa_count == 0) return;
+                        if (static_cast<size_t>(usa_off) + static_cast<size_t>(usa_count) * 2u >
+                                rec.size() ||
+                            usa_count == 0) {
+                            return;
+                        }
                         uint16_t usn = read_le16(&rec[usa_off]);
                         for (size_t i = 1; i < usa_count; ++i) {
                             size_t sec_end = i * 512 - 2;
