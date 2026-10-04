@@ -692,8 +692,10 @@ void TftpServer::run_server_loop() {
                 std::snprintf(dest_ip_buf, sizeof(dest_ip_buf), "%s", "0.0.0.0");
             }
 
-            Logger::default_logger().info("TFTP", "[TFTP] Raw packet received: " + std::to_string(bytes) +
-                                         " bytes from " + src_endpoint + " (local IP " + dest_ip_buf + ")");
+            if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("TFTP", "[TFTP] Raw packet received: " + std::to_string(bytes) +
+                                             " bytes from " + src_endpoint + " (local IP " + dest_ip_buf + ")");
+            }
 
             if (bytes < 4) {
                 Logger::default_logger().warn("TFTP", "[TFTP] Dropping request from " + src_endpoint +

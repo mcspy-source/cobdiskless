@@ -77,6 +77,7 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/types/network_address.cpp
     src/CobDisklessCore/src/errors/error.cpp
     src/CobDisklessCore/src/logging/logger.cpp
+    src/CobDisklessCore/src/logging/io_metrics.cpp
     src/CobDisklessCore/src/config/configuration.cpp
     src/CobDisklessCore/src/subsystem/subsystem.cpp
     src/CobDisklessCore/src/storage/block_device.cpp

@@ -3160,7 +3160,31 @@ int AdminApp::run_gui() {
 #endif
 }
 
-int AdminApp::run(int argc, char* argv[]) {
+int AdminApp::run(int argc_in, char* argv_in[]) {
+    // --enable-trace-io is a modifier, not a subcommand. It is recognised
+    // anywhere in argv and stripped before dispatch so every command below
+    // -- and the whole server stack it starts -- sees per-sector, per-packet
+    // and DHCP wire-inspect output promoted from TRACE to visible.
+    bool trace_io = false;
+    std::vector<char*> args;
+    args.reserve(static_cast<size_t>(argc_in));
+    for (int i = 0; i < argc_in; ++i) {
+        if (std::string(argv_in[i]) == "--enable-trace-io") {
+            trace_io = true;
+            continue;
+        }
+        args.push_back(argv_in[i]);
+    }
+    const int argc = static_cast<int>(args.size());
+    char** argv = args.data();
+
+    if (trace_io) {
+        Logger::default_logger().set_min_level(LogLevel::Trace);
+        Logger::default_logger().info("CORE",
+            "--enable-trace-io active: per-sector / per-packet / wire-inspect "
+            "logging is now visible at TRACE.");
+    }
+
     if (argc <= 1) {
         // Default execution on double-click: Launch native Windows GUI
 #if defined(_WIN32)
@@ -3221,7 +3245,10 @@ int AdminApp::run(int argc, char* argv[]) {
                   << "  --list-images             List registered golden images\n"
                   << "  --list-clients            List registered diskless clients\n"
                   << "  --list-drives             List physical drives and assigned roles\n"
-                  << "  --gui                     Launch Windows management GUI window\n";
+                  << "  --gui                     Launch Windows management GUI window\n"
+                  << "  --enable-trace-io         Modifier: also print per-sector / per-packet / wire-inspect TRACE\n"
+                  << "                            output (may be combined with any option above, e.g.\n"
+                  << "                            cobdiskless --enable-trace-io --start)\n";
         return 0;
     }
 

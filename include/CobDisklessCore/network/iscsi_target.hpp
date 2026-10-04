@@ -255,6 +255,9 @@ private:
     mutable std::mutex stage_mutex_;
     std::unordered_set<std::string> logged_lun0_;
     std::unordered_map<std::string, uint32_t> client_boot_stage_;
+    // Per-client "already reported this once" bits, guarded by stage_mutex_
+    // like the two containers above.
+    std::unordered_map<std::string, uint32_t> first_log_flags_;
 
     // RFC 3720 Section 5.3.5 Session Reinstatement tracking by (InitiatorName, ISID)
     mutable std::mutex reinstatement_mutex_;
@@ -300,6 +303,17 @@ private:
 
     void run_accept_loop();
     void handle_client_connection(uintptr_t client_sock, NetworkAddress client_ip);
+
+    /**
+     * @brief Set @p bit for @p client_id, reporting whether this is the first time.
+     *
+     * Boot stages 13/15/16 describe *every* SCSI command rather than a
+     * one-off transition, so logging them unconditionally emits a line per
+     * sector -- tens of thousands during a single boot. The first command of a
+     * kind is kept at INFO as the stage milestone; every repetition after it
+     * is left for the caller to demote to TRACE.
+     */
+    [[nodiscard]] bool mark_log_once(const std::string& client_id, uint32_t bit);
 };
 
 } // namespace cobdiskless

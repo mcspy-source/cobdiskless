@@ -5,6 +5,7 @@
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
 #include "CobDisklessCore/logging/logger.hpp"
+#include "CobDisklessCore/logging/io_metrics.hpp"
 #include "CobDisklessCore/storage/overlay_naming.hpp"
 #include <cstring>
 #include <vector>
@@ -44,6 +45,18 @@ constexpr long long kIdleTeardownMs = 60 * 1000;
 constexpr int kWorkerGraceMs = 2000;
 constexpr int kWorkerIoBreakMs = 1000;
 constexpr int kWorkerHardCloseMs = 500;
+
+// first_log_flags_ bits consumed by IscsiTarget::mark_log_once(): one bit per
+// boot stage that describes every SCSI command instead of a single
+// transition, so only the first occurrence of each stays at INFO.
+constexpr uint32_t kLogFirstScsiCommand = 1u << 0;
+constexpr uint32_t kLogFirstRead = 1u << 1;
+constexpr uint32_t kLogFirstWrite = 1u << 2;
+
+// Bound (never copied) into the stage13/stage15 lookups so the per-command
+// path does not allocate a std::string for the "no session yet" case. Both
+// operands of the ternary below must be references for that to hold.
+const std::string kNoClientSession = "unknown";
 
 inline std::string format_size_kb(size_t bytes) {
     if (bytes % 1024 == 0) {
@@ -1072,6 +1085,14 @@ int IscsiTarget::session_connection_count(const std::shared_ptr<ClientSession>& 
     return it == session_conn_refs_.end() ? 0 : it->second;
 }
 
+bool IscsiTarget::mark_log_once(const std::string& client_id, uint32_t bit) {
+    std::lock_guard<std::mutex> stage_lock(stage_mutex_);
+    uint32_t& flags = first_log_flags_[client_id];
+    const bool first_time = (flags & bit) == 0;
+    flags |= bit;
+    return first_time;
+}
+
 void IscsiTarget::run_accept_loop() {
 #if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
     // WSAStartup() already happened in initialize(); this thread only owns the
@@ -1850,9 +1871,20 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 req_lun = (bhs.lun & 0xFFFF);
             }
 
-            Logger::default_logger().info("BOOT", "[BOOT STAGE 13] SCSI command received: " + scsi_op_name(scsi_op) +
-                         " (0x" + to_hex_u8(scsi_op) + ") InitiatorTaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
-                         " LUN=" + std::to_string(req_lun));
+            // Fires for every single SCSI command, so the stage line is kept
+            // at INFO only for the first command of the session and demoted
+            // to TRACE after that (see mark_log_once).
+            const std::string& stage13_client = session ? session->id().value()
+                                                        : kNoClientSession;
+            if (mark_log_once(stage13_client, kLogFirstScsiCommand)) {
+                Logger::default_logger().info("BOOT", "[BOOT STAGE 13] SCSI command received: " + scsi_op_name(scsi_op) +
+                             " (0x" + to_hex_u8(scsi_op) + ") InitiatorTaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
+                             " LUN=" + std::to_string(req_lun));
+            } else if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("BOOT", "[BOOT STAGE 13] SCSI command received: " + scsi_op_name(scsi_op) +
+                             " (0x" + to_hex_u8(scsi_op) + ") InitiatorTaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
+                             " LUN=" + std::to_string(req_lun));
+            }
 
             auto target_device = (req_lun == 0 && session) ? std::static_pointer_cast<BlockDevice>(session->cow_block_device())
                                                             : (session ? session->get_device_for_lun(req_lun) : nullptr);
@@ -1915,8 +1947,12 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 resp.rsvd1[1] = 0x00; // Status: SAM_STAT_GOOD (0x00)
                 resp.initiator_task_tag = bhs.initiator_task_tag;
                 stamp_command_window(resp, bhs, stat_sn++);
-                Logger::default_logger().info("iSCSI", "[iSCSI I/O] TEST UNIT READY TaskTag=0x" +
-                    format_hex_u32(bhs.initiator_task_tag) + " -> Status=GOOD");
+                // Pure polling heartbeat: the initiator repeats this while
+                // idle, so it never earns an INFO line.
+                if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    Logger::default_logger().trace("iSCSI", "[iSCSI I/O] TEST UNIT READY TaskTag=0x" +
+                        format_hex_u32(bhs.initiator_task_tag) + " -> Status=GOOD");
+                }
                 send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Inquiry)) {
                 std::string sn = client_mac.empty() ? "COB-SAN-00000001" : ("COB-SAN-" + client_mac);
@@ -1977,8 +2013,17 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     session->record_scsi_activity(lba, sectors);
                 }
 
-                Logger::default_logger().info("BOOT", "[BOOT STAGE 15] SCSI READ request: LUN=" + std::to_string(req_lun) +
-                             " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors));
+                // One line per READ otherwise -- a boot issues tens of
+                // thousands. Keep the first one as the stage milestone.
+                const std::string& stage15_client = session ? session->id().value()
+                                                            : kNoClientSession;
+                if (mark_log_once(stage15_client, kLogFirstRead)) {
+                    Logger::default_logger().info("BOOT", "[BOOT STAGE 15] SCSI READ request: LUN=" + std::to_string(req_lun) +
+                                 " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors));
+                } else if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    Logger::default_logger().trace("BOOT", "[BOOT STAGE 15] SCSI READ request: LUN=" + std::to_string(req_lun) +
+                                 " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors));
+                }
 
                 if (req_lun == 0) {
                     // Boot-progress tracker: LOGGING ONLY. It never gates SCSI
@@ -1986,7 +2031,9 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     // thread, so reaching a stage has no effect on I/O handling.
                     // Guarded by stage_mutex_ because concurrent connections used to
                     // share this map through an unsynchronised function-local static.
-                    const std::string s_id = session ? session->id().value() : "unknown";
+                    // Bound, not copied: this runs on every READ.
+                    const std::string& s_id = session ? session->id().value()
+                                                      : kNoClientSession;
                     uint32_t triggered = 0;
                     {
                         std::lock_guard<std::mutex> stage_lock(stage_mutex_);
@@ -2064,24 +2111,34 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     }
                 }
 
-                std::string mode_tag = build_mode_tag(sectors);
-                std::string boot_map = build_semantic_boot_tags(lba, session.get());
-                std::string sig_tags = build_signature_tags(payload);
+                // Counted rather than logged: the per-read line below is now
+                // TRACE-only, and IoMetrics turns these counts into a single
+                // aggregated throughput line every couple of seconds.
+                IoMetrics::instance().record_read(byte_len);
 
-                std::string tags = mode_tag;
-                if (!boot_map.empty()) {
-                    tags += " " + boot_map;
-                }
-                if (!sig_tags.empty()) {
-                    tags += " " + sig_tags;
-                }
+                // The tags below exist only to explain that trace line, and
+                // build_signature_tags walks the whole payload to produce
+                // them -- work the read path must not pay unless tracing is
+                // actually switched on.
+                if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    std::string tags = build_mode_tag(sectors);
+                    const std::string boot_map = build_semantic_boot_tags(lba, session.get());
+                    if (!boot_map.empty()) {
+                        tags += " " + boot_map;
+                    }
+                    const std::string sig_tags = build_signature_tags(payload);
+                    if (!sig_tags.empty()) {
+                        tags += " " + sig_tags;
+                    }
 
-                std::string io_op = is_16 ? "READ(16)" : ((scsi_op == static_cast<uint8_t>(ScsiOpcode::Read6)) ? "READ(6)" : "READ(10)");
-                std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
-                                      " Count=" + std::to_string(sectors) +
-                                      " (" + format_size_kb(byte_len) + " KB) TaskTag=0x" +
-                                      format_hex_u32(bhs.initiator_task_tag) + " " + tags;
-                Logger::default_logger().info("iSCSI", io_line);
+                    const std::string io_op = is_16 ? "READ(16)"
+                        : ((scsi_op == static_cast<uint8_t>(ScsiOpcode::Read6)) ? "READ(6)" : "READ(10)");
+                    std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
+                                          " Count=" + std::to_string(sectors) +
+                                          " (" + format_size_kb(byte_len) + " KB) TaskTag=0x" +
+                                          format_hex_u32(bhs.initiator_task_tag) + " " + tags;
+                    Logger::default_logger().trace("iSCSI", io_line);
+                }
 
                 size_t max_burst = 65536;
                 size_t sent_bytes = 0;
@@ -2295,30 +2352,46 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 }
 
                 if (session && bytes_received >= req_bytes && !write_failed) {
-                    Logger::default_logger().info("BOOT", "[BOOT STAGE 16] SCSI WRITE request: LUN=" + std::to_string(req_lun) +
-                                 " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors) + " committed to COW overlay");
+                    // Counted rather than logged -- see the matching READ
+                    // path: IoMetrics emits one aggregated line per window.
+                    IoMetrics::instance().record_write(bytes_received);
 
-                    std::string mode_tag = build_mode_tag(sectors);
-                    std::string boot_map = build_semantic_boot_tags(lba, session.get());
-                    std::string sig_tags = build_signature_tags(write_buf);
+                    // One line per WRITE otherwise. Keep the first as the
+                    // stage milestone, demote everything after it.
+                    const std::string& stage16_client = session->id().value();
+                    if (mark_log_once(stage16_client, kLogFirstWrite)) {
+                        Logger::default_logger().info("BOOT", "[BOOT STAGE 16] SCSI WRITE request: LUN=" + std::to_string(req_lun) +
+                                     " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors) + " committed to COW overlay");
+                    } else if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                        Logger::default_logger().trace("BOOT", "[BOOT STAGE 16] SCSI WRITE request: LUN=" + std::to_string(req_lun) +
+                                     " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors) + " committed to COW overlay");
+                    }
 
-                    std::string tags = mode_tag;
-                    if (!boot_map.empty()) {
-                        tags += " " + boot_map;
-                    }
-                    if (!sig_tags.empty()) {
-                        tags += " " + sig_tags;
-                    }
+                    // Same as the READ path: these tags only decorate the
+                    // trace line, and build_signature_tags scans the whole
+                    // buffer, so skip the scan when tracing is off.
+                    if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                        std::string tags = build_mode_tag(sectors);
+                        const std::string boot_map = build_semantic_boot_tags(lba, session.get());
+                        if (!boot_map.empty()) {
+                            tags += " " + boot_map;
+                        }
+                        const std::string sig_tags = build_signature_tags(write_buf);
+                        if (!sig_tags.empty()) {
+                            tags += " " + sig_tags;
+                        }
 
-                    std::string io_op = is_16 ? "WRITE(16)" : ((scsi_op == static_cast<uint8_t>(ScsiOpcode::Write6)) ? "WRITE(6)" : "WRITE(10)");
-                    std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
-                                          " Count=" + std::to_string(sectors) +
-                                          " TaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
-                                          " -> Status=GOOD (Written to COW overlay)";
-                    if (!tags.empty()) {
-                        io_line += " " + tags;
+                        const std::string io_op = is_16 ? "WRITE(16)"
+                            : ((scsi_op == static_cast<uint8_t>(ScsiOpcode::Write6)) ? "WRITE(6)" : "WRITE(10)");
+                        std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
+                                              " Count=" + std::to_string(sectors) +
+                                              " TaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
+                                              " -> Status=GOOD (Written to COW overlay)";
+                        if (!tags.empty()) {
+                            io_line += " " + tags;
+                        }
+                        Logger::default_logger().trace("iSCSI", io_line);
                     }
-                    Logger::default_logger().info("iSCSI", io_line);
                 }
 
                 if (write_failed || bytes_received < req_bytes) {

@@ -147,6 +147,13 @@ std::string describe_option(uint8_t code, const uint8_t* v, uint8_t len) {
 // how an adopted ACK is called out of the stream.
 void log_dhcp_wire_inspect(const uint8_t* data, size_t len, bool incoming,
                            const char* note = nullptr) {
+    // A field-by-field hex dump of every frame in both directions. It is the
+    // single loudest thing this server prints, so it exists only for someone
+    // actively debugging a client that will not boot -- and the dump is not
+    // even assembled unless that tracing is switched on.
+    if (!Logger::default_logger().would_log(LogLevel::Trace)) {
+        return;
+    }
     if (data == nullptr || len < sizeof(DhcpHeader)) return;
     const auto* h = reinterpret_cast<const DhcpHeader*>(data);
 
@@ -1304,17 +1311,21 @@ void DhcpServer::run_packet_loop() {
                              (sockaddr*)&client_addr, &client_addr_len);
         if (bytes > 0) {
             // ---------------------------------------------------------------
-            // INGRESS TRACE -- fires unconditionally before any parsing guard.
-            // If this line is silent when the Acer sends a DHCPDISCOVER, the
-            // socket is either blocked by Windows Firewall or bound to the
-            // wrong adapter; check: netsh advfirewall firewall add rule
-            // name="CobDiskless DHCP" protocol=UDP dir=in localport=67
-            // action=allow
+            // INGRESS MARKER -- fires before any parsing guard, so it is the
+            // line to look for when a client's DHCPDISCOVER never shows up:
+            // the socket is either blocked by Windows Firewall or bound to
+            // the wrong adapter; check:
+            //   netsh advfirewall firewall add rule name="CobDiskless DHCP"
+            //     protocol=UDP dir=in localport=67 action=allow
+            // Routed through the logger at TRACE -- it used to be an
+            // unformatted std::cout that flushed a line straight to stdout
+            // for every packet received, and std::endl with it.
             // ---------------------------------------------------------------
-            std::cout << "[DHCP RECV] Got " << bytes << " bytes on UDP "
-                      << port_ << " from "
-                      << inet_ntoa(client_addr.sin_addr)
-                      << std::endl;
+            if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("DHCP",
+                    "[DHCP RECV] Got " + std::to_string(bytes) + " bytes on UDP " +
+                    std::to_string(port_) + " from " + inet_ntoa(client_addr.sin_addr));
+            }
             char ip_buf[INET_ADDRSTRLEN] = {0};
             inet_ntop(AF_INET, &(client_addr.sin_addr), ip_buf, INET_ADDRSTRLEN);
             std::string src_endpoint = std::string(ip_buf) + ":" + std::to_string(ntohs(client_addr.sin_port));
@@ -1328,8 +1339,10 @@ void DhcpServer::run_packet_loop() {
             }
             const std::string_view raw_mac(raw_mac_buf);
 
-            Logger::default_logger().info("DHCP", "[DHCP] Raw packet received: " + std::to_string(bytes) +
-                                         " bytes from " + src_endpoint + " | Chaddr/MAC: " + std::string(raw_mac));
+            if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("DHCP", "[DHCP] Raw packet received: " + std::to_string(bytes) +
+                                             " bytes from " + src_endpoint + " | Chaddr/MAC: " + std::string(raw_mac));
+            }
 
             try {
                 auto parsed_res = parse_packet(std::span<const uint8_t>(recv_buf.data(), bytes));
@@ -1352,8 +1365,13 @@ void DhcpServer::run_packet_loop() {
             }
 
             if (opts.message_type != 1 && opts.message_type != 3) {
-                Logger::default_logger().info("DHCP", "[DHCP] Dropping packet from MAC " + opts.client_mac +
-                                             " (Reason: Unsupported DHCP message type " + std::to_string(opts.message_type) + ")");
+                // Routine per-packet filtering (RELEASE/INFORM/anything that
+                // is not DISCOVER or REQUEST) -- TRACE so a chatty LAN cannot
+                // bury the boot log under dropped-frame notices.
+                if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    Logger::default_logger().trace("DHCP", "[DHCP] Dropping packet from MAC " + opts.client_mac +
+                                                 " (Reason: Unsupported DHCP message type " + std::to_string(opts.message_type) + ")");
+                }
                 continue;
             }
 
@@ -2004,8 +2022,12 @@ void DhcpServer::run_packet_loop() {
                         effective_srv = NetworkAddress::detect_local_ip(67);
                     }
 
-                    // Print exact buffer hex dump of the outgoing OFFER before it is passed to sendto()
-                    if (reply_type == 2) {
+                    // Exact buffer hex dump of the outgoing OFFER before it
+                    // is passed to sendto(). Dumping raw bytes on every lease
+                    // offer is precisely the hex-dump noise that belongs
+                    // behind --enable-trace-io, and the dump is never even
+                    // formatted unless tracing is on.
+                    if (reply_type == 2 && Logger::default_logger().would_log(LogLevel::Trace)) {
                         std::ostringstream hex_ss;
                         hex_ss << "\n=======================================================\n"
                                << " OUTGOING DHCP OFFER BUFFER HEX DUMP (" << reply_bytes.size() << " bytes)\n"
@@ -2025,7 +2047,7 @@ void DhcpServer::run_packet_loop() {
                             hex_ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(reply_bytes[i]) << " ";
                         }
                         hex_ss << "\n=======================================================\n";
-                        Logger::default_logger().info("BOOT", hex_ss.str());
+                        Logger::default_logger().trace("BOOT", hex_ss.str());
                     }
 
                     if (port_ != 67 && client_addr.sin_port != 0) {

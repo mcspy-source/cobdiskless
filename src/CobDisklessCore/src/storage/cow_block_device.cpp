@@ -160,10 +160,15 @@ Result<size_t> CowBlockDevice::write_blocks(uint64_t start_block, uint32_t count
     if (context_ && context_->direct_base_writes()) {
         return context_->write(start_block * bsize, source.subspan(0, req_bytes));
     }
-    Logger::default_logger().info("COW",
-        "[COW WRITE] Block write LBA=" + std::to_string(start_block) +
-        " Count=" + std::to_string(count) +
-        " -> Dispatched to RAM overlay " + writeback_path_.string());
+    // Per-block chatter: a booting client dispatches thousands of these
+    // through the RAM overlay, so the line is TRACE-only and the string is
+    // not even built unless tracing is on.
+    if (Logger::default_logger().would_log(LogLevel::Trace)) {
+        Logger::default_logger().trace("COW",
+            "[COW WRITE] Block write LBA=" + std::to_string(start_block) +
+            " Count=" + std::to_string(count) +
+            " -> Dispatched to RAM overlay " + writeback_path_.string());
+    }
     if (ram_overlay_) {
         return ram_overlay_->write_sectors(start_block, count, reinterpret_cast<const uint8_t*>(source.data()));
     }
