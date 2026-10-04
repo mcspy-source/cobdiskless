@@ -12819,15 +12819,17 @@ void test_vhd_compact_os_preflight_validation() {
 
 #if defined(_WIN32)
     // 2. CompactOS compression test: compress using compact.exe /c /exe:xpress4k
-    std::string comp_cmd = "compact.exe /c /exe:xpress4k \"" + bootres_path.string() + "\" >nul 2>&1";
+    std::filesystem::path abs_bootres = std::filesystem::absolute(bootres_path);
+    abs_bootres.make_preferred();
+    std::string comp_cmd = "\"compact.exe /c /exe:xpress4k \"" + abs_bootres.string() + "\" >nul 2>&1\"";
     int c_ret = std::system(comp_cmd.c_str());
     if (c_ret == 0) {
         // File with CompactOS / WOF compression MUST return false (fatal warning detected)
         assert(!RegBootStart::validate_vhd_compact_os(test_dir));
 
         // Now decompress using compact.exe /u /f /exe and /u /f
-        std::string uncomp_cmd = "compact.exe /u /f /exe \"" + bootres_path.string() + "\" >nul 2>&1";
-        std::string uncomp_ntfs = "compact.exe /u /f \"" + bootres_path.string() + "\" >nul 2>&1";
+        std::string uncomp_cmd = "\"compact.exe /u /f /exe \"" + abs_bootres.string() + "\" >nul 2>&1\"";
+        std::string uncomp_ntfs = "\"compact.exe /u /f \"" + abs_bootres.string() + "\" >nul 2>&1\"";
         (void)std::system(uncomp_cmd.c_str());
         (void)std::system(uncomp_ntfs.c_str());
         // Clean uncompressed file MUST return true (pass)

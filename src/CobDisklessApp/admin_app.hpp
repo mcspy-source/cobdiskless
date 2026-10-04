@@ -57,7 +57,6 @@ public:
     // Server lifecycle controls
     Result<void> start_server_services();
     void stop_server_services();
-    void auto_arm_vhd_images();
     void warm_assigned_images();
     [[nodiscard]] bool is_server_running() const noexcept { return server_running_.load(); }
 

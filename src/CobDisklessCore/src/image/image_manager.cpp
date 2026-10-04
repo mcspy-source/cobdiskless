@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "CobDisklessCore/image/image_manager.hpp"
-#include "CobDisklessCore/image/reg_bootstart.hpp"
 #include "CobDisklessCore/storage/storage_manager.hpp"
 #include "CobDisklessCore/storage/file_attributes.hpp"
 #include "CobDisklessCore/logging/logger.hpp"

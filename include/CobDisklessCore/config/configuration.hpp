@@ -102,12 +102,12 @@ public:
     [[nodiscard]] uint16_t http_port() const noexcept { return http_port_; }
     void set_http_port(uint16_t port) noexcept { http_port_ = port; }
 
-    /**
-     * @brief When true, automatically scan the images directory on server startup
-     *        and arm offline SYSTEM hives in VHD images before the iSCSI target initializes.
-     */
-    [[nodiscard]] bool auto_arm_vhd_on_boot() const noexcept { return auto_arm_vhd_on_boot_; }
-    void set_auto_arm_vhd_on_boot(bool enabled) noexcept { auto_arm_vhd_on_boot_ = enabled; }
+    // There is deliberately no auto_arm_vhd_on_boot() accessor any more:
+    // arming a SYSTEM hive is an explicit command (cob_armer arm, the admin
+    // app's 1-Click button, or its arm subcommand), never something start-up
+    // does behind the operator's back. The cobdiskless.conf key of the same
+    // name is still accepted and ignored so existing files keep loading --
+    // see Configuration::load().
 
     /**
      * @brief When true the host adapter (IP, netmask, gateway) and the default

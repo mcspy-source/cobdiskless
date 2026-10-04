@@ -3571,7 +3571,9 @@ bool RegBootStart::validate_vhd_compact_os(const std::filesystem::path& vhd_path
         }
 
         // CompactOS query via compact.exe
-        std::string cmd = "compact.exe \"" + bootres.string() + "\" 2>&1";
+        std::filesystem::path abs_bootres = std::filesystem::absolute(bootres);
+        abs_bootres.make_preferred();
+        std::string cmd = "\"compact.exe \"" + abs_bootres.string() + "\" 2>&1\"";
         FILE* pipe = _popen(cmd.c_str(), "r");
         if (pipe) {
             char buffer[512];

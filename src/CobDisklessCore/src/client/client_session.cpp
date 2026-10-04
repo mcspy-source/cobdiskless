@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "CobDisklessCore/client/client_session.hpp"
-#include "CobDisklessCore/image/reg_bootstart.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/storage/storage_manager.hpp"
@@ -783,16 +782,6 @@ Result<void> ClientSessionManager::commit_super_client_session_locked(std::share
 
     (void)target_backend.value()->flush();
     target_backend.value().reset();
-
-    // Post-merge boot-start re-arm sweep:
-    auto arm_res = RegBootStart::ensure_image_armed(img_path);
-    if (!arm_res.is_ok()) {
-        Logger::default_logger().warn("SUPER_CLIENT",
-            "Post-merge boot-start re-arm warning on " + img_path.string() + ": " + std::string(arm_res.error().message()));
-    } else {
-        Logger::default_logger().info("SUPER_CLIENT",
-            "Post-merge boot-start re-arm sweep completed on " + img_path.string());
-    }
 
     // 7. Reset writeback overlay file
     auto reset_res = cow->reset();

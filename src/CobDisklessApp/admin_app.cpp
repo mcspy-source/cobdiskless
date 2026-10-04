@@ -655,102 +655,6 @@ Result<void> AdminApp::commit_super_client(const std::string& mac) {
     return {};
 }
 
-void AdminApp::auto_arm_vhd_images() {
-    std::cout << "[INFO] Auto-arming VHD images on boot (auto_arm_vhd_on_boot = true)...\n";
-    Logger::default_logger().info("BOOTSTART", "Scanning configured images and directories for automated offline arming");
-
-    std::vector<std::filesystem::path> scan_dirs;
-    std::error_code ec;
-
-    if (!config_.os_images_dir().empty()) scan_dirs.push_back(config_.os_images_dir());
-    if (!config_.storage_path().empty()) scan_dirs.push_back(config_.storage_path());
-
-    std::vector<std::filesystem::path> candidates;
-
-    // 1. Scan image directories
-    for (const auto& dir : scan_dirs) {
-        if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) continue;
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            if (ec) break;
-            if (entry.is_regular_file(ec)) {
-                std::string ext = entry.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (ext == ".vhd" || ext == ".vhdx") {
-                    candidates.push_back(entry.path());
-                }
-            }
-        }
-    }
-
-    // 2. Parse config.json if present on disk for registered image paths
-    if (std::filesystem::exists(images_config_path_, ec)) {
-        std::ifstream in(images_config_path_, std::ios::binary);
-        if (in.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            auto parsed = JsonValue::parse(content);
-            if (parsed && parsed->is_object()) {
-                const auto* images_val = parsed->find("images");
-                if (images_val && images_val->is_array()) {
-                    for (const auto& item : images_val->as_array()) {
-                        if (item.is_object()) {
-                            std::string p_str = item["path"].as_string();
-                            if (!p_str.empty()) {
-                                std::filesystem::path p(p_str);
-                                if (!std::filesystem::exists(p, ec) && !config_.os_images_dir().empty()) {
-                                    p = config_.os_images_dir() / p;
-                                }
-                                if (std::filesystem::exists(p, ec)) {
-                                    std::string ext = p.extension().string();
-                                    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                                    if (ext == ".vhd" || ext == ".vhdx") {
-                                        candidates.push_back(p);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Deduplicate candidate VHD paths
-    std::vector<std::filesystem::path> unique_vhds;
-    for (const auto& cand : candidates) {
-        bool already_seen = false;
-        for (const auto& u : unique_vhds) {
-            std::error_code eq_ec;
-            if (std::filesystem::equivalent(cand, u, eq_ec)) {
-                already_seen = true;
-                break;
-            }
-        }
-        if (!already_seen && std::filesystem::exists(cand, ec)) {
-            unique_vhds.push_back(cand);
-        }
-    }
-
-    // 4. Arm each VHD image
-    size_t armed_count = 0;
-    for (const auto& vhd_path : unique_vhds) {
-        (void)RegBootStart::validate_vhd_compact_os(vhd_path);
-        auto arm_res = RegBootStart::arm_vhd_image(vhd_path);
-        if (arm_res.is_ok()) {
-            ++armed_count;
-            Logger::default_logger().info(
-                "BOOTSTART",
-                "Armed " + vhd_path.filename().string() + " (" +
-                    std::to_string(arm_res.value().armed_services.size()) +
-                    " native boot service(s) armed)");
-        } else {
-            Logger::default_logger().warn("BOOTSTART", "Failed to auto-arm VHD " + vhd_path.string() + ": " + std::string(arm_res.error().message()));
-        }
-    }
-    if (armed_count > 0) {
-        Logger::default_logger().info("BOOTSTART", "Completed auto-arming for " + std::to_string(armed_count) + " VHD image(s).");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Multi-image activation on service start
 // ---------------------------------------------------------------------------
@@ -839,9 +743,6 @@ void AdminApp::warm_assigned_images() {
         }
 
         const std::filesystem::path on_disk_resolved = resolve_on_disk(image);
-        if (!on_disk_resolved.empty()) {
-            (void)RegBootStart::validate_vhd_compact_os(on_disk_resolved);
-        }
 
         auto warm = image_manager_->acquire_image(image);
         if (!warm.is_ok()) {
@@ -895,31 +796,14 @@ Result<void> AdminApp::start_server_services() {
         return dir_res;
     }
 
-    // Auto-arm offline SYSTEM hives for VHD images before opening iSCSI listener / target
-    if (config_.auto_arm_vhd_on_boot()) {
-        auto_arm_vhd_images();
-    }
-
-    // Pre-flight VHD Validation Check on server startup:
-    // Inspect base VHD images for CompactOS / WOF compression in \Windows\Boot\Resources\en-US\bootres.dll.mui
-    {
-        std::vector<std::filesystem::path> preflight_dirs;
-        if (!config_.os_images_dir().empty()) preflight_dirs.push_back(config_.os_images_dir());
-        if (!config_.storage_path().empty()) preflight_dirs.push_back(config_.storage_path());
-        std::error_code ec;
-        for (const auto& dir : preflight_dirs) {
-            if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) continue;
-            for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-                if (entry.is_regular_file(ec)) {
-                    std::string ext = entry.path().extension().string();
-                    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                    if (ext == ".vhd" || ext == ".vhdx") {
-                        (void)RegBootStart::validate_vhd_compact_os(entry.path());
-                    }
-                }
-            }
-        }
-    }
+    // Server start-up is deliberately passive with respect to every master
+    // VHD. Nothing in this function -- or anywhere else below it in the
+    // listener/target bring-up -- arms, sanitises or otherwise mutates a
+    // SYSTEM hive: images are opened and served read-only. Arming happens
+    // only on an explicit command (cob_armer arm, this app's 1-Click button,
+    // its arm subcommand, or the WinPE staging callback), never as a side
+    // effect of coming up. The auto_arm_vhd_on_boot switch that used to sweep
+    // every configured image here is gone with the behaviour it enabled.
 
     if (!image_manager_) {
         image_manager_ = std::make_shared<ImageManager>(registry_);
@@ -3208,9 +3092,9 @@ int AdminApp::run(int argc_in, char* argv_in[]) {
             return 1;
         }
         return cli_inspect_image(argv[2]);
-    } else if (arg1 == "--arm-image") {
+    } else if (arg1 == "--arm-image" || arg1 == "--arm" || arg1 == "arm") {
         if (argc < 3) {
-            std::cerr << "Usage: --arm-image <path_to_vhd>\n";
+            std::cerr << "Usage: cobdiskless_app arm <path_to_vhd_or_hive>\n";
             return 1;
         }
         return cli_arm_image(argv[2]);
