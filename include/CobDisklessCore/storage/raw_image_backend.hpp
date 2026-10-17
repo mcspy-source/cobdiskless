@@ -6,6 +6,7 @@
 #include <fstream>
 #include <mutex>
 #include "CobDisklessCore/storage/block_device.hpp"
+#include "CobDisklessCore/storage/file_attributes.hpp"
 
 namespace cobdiskless {
 
@@ -27,10 +28,15 @@ public:
      * @brief Opens a flat raw disk image from filesystem.
      * @param path Path to the disk image file.
      * @param read_only If true, opens file strictly in read-only mode.
+     * @param attribute_policy what a read-write open does when the file carries
+     *        the OS read-only attribute: Refuse (default -> Access Denied;
+     *        nothing ever clears the attribute implicitly) or Lift (explicit
+     *        Super Client maintenance lift, restored when this backend dies).
      */
     [[nodiscard]] static Result<std::shared_ptr<RawImageBackend>> open(
         const std::filesystem::path& path,
-        bool read_only = true
+        bool read_only = true,
+        ReadOnlyAttributePolicy attribute_policy = ReadOnlyAttributePolicy::Refuse
     );
 
     [[nodiscard]] Result<size_t> read(
@@ -67,6 +73,9 @@ private:
     mutable std::mutex mutex_;
     uint64_t file_size_{0};
     bool read_only_{true};
+    // True when an explicit ReadOnlyAttributePolicy::Lift cleared the OS
+    // read-only attribute for this writer; the destructor re-applies it.
+    bool lifted_readonly_{false};
 };
 
 } // namespace cobdiskless

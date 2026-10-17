@@ -779,11 +779,11 @@ Result<void> ClientManager::delete_client(const std::string& mac) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::string norm_mac = normalize_mac(mac);
     auto it = clients_by_mac_.find(norm_mac);
-    if (it == clients_by_mac_.end()) {
-        return Error(ErrorCode::StorageFailure, "Client with MAC " + norm_mac + " not found");
+    if (it != clients_by_mac_.end()) {
+        clients_by_mac_.erase(it);
+        return save_to_file();
     }
-    clients_by_mac_.erase(it);
-    return save_to_file();
+    return {};
 }
 
 Result<void> ClientManager::release_ip(const std::string& mac) {

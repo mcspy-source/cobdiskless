@@ -1,0 +1,8 @@
+﻿disk : Start=0 Group= ImagePath=System32\drivers\disk.sys
+partmgr : Start=0 Group=Boot Bus Extender ImagePath=System32\drivers\partmgr.sys
+mountmgr : Start=0 Group=System Bus Extender ImagePath=System32\drivers\mountmgr.sys
+volmgr : Start=0 Group=System Bus Extender ImagePath=System32\drivers\volmgr.sys
+storvsc : NOT FOUND
+storahci : Start=0 Group=SCSI Miniport ImagePath=System32\drivers\storahci.sys
+stornvme : Start=0 Group=SCSI Miniport ImagePath=System32\drivers\stornvme.sys
+spaceport : NOT FOUND

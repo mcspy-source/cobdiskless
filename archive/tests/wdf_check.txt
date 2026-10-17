@@ -1,0 +1,7 @@
+﻿reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_wdf.ps1:9 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\Wdf0100 ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

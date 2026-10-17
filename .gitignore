@@ -1,0 +1,69 @@
+# Build artifacts
+build/
+build2/
+build_vs/
+build_host/
+build*/
+logs/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.lib
+*.tlog
+*.raw
+*.cow
+*.recipe
+*.lastbuildstate
+*.marker
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Windows installation media / patches - never redistribute these
+*.esd
+*.wim
+*.swm
+*.msu
+*.cab
+*.iso
+
+# Extracted registry hives and their transaction logs
+*.hiv
+*.hive
+*.LOG1
+*.LOG2
+*.regtrans-ms
+*.blf
+*.TM.*
+
+# Rotated logs
+*.log.*
+*.log[0-9]
+# Generated files
+*.log
+*.txt
+# Disk images / scratch VHDs (multi-GB, must never be committed)
+*.vhd
+*.vhdx
+*.vmdk
+*.qcow2
+*.img
+*.iso
+scratch/
+# Local server state and machine-specific config
+release/stations.json
+release/config.json
+release/clients.json
+hardware_manifest.json
+# Boot/BCD backups produced by the armers
+*.BCD-backup-*.bak
+# Python cache
+__pycache__/
+*.pyc
+# PowerShell temporary files
+*.ps1~
+*.ps1.bak
+# Archive folder (keep)
+!archive/

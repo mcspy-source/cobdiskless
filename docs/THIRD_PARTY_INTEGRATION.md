@@ -85,6 +85,6 @@ struct VhdDynamicHeader {
 | Subsystem | Candidate Upstream | Planned Role |
 | :--- | :--- | :--- |
 | **DHCP / BootP** | `third_party/dhcplite/` | Extract DHCP option encoding/decoding and packet loop logic for `CobDisklessCore::DhcpServer`. |
-| **TFTP Subsystem** | `third_party/tftp/` | Adapt block-based UDP file streaming and timeout/retransmission state machines. |
+| **TFTP Subsystem** | ~~`third_party/tftp/`~~ **(removed)** | Cannot be used: GkWare ships freeware with no redistribution grant and withholds source (see `THIRD_PARTY_NOTES.md` §1). TFTP is a simple protocol — implement natively rather than adapting. |
 | **SAN (iSCSI)** | `third_party/iscsi/` | Adapt SCSI Command Descriptor Block (CDB) processing, BHS/AHS parsing, and PDU dispatching. |
 | **iPXE Boot Stages** | `third_party/ipxe/` | Source binaries and ROM templates for network bootstrap payloads. |

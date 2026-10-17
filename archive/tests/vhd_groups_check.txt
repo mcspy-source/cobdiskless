@@ -1,0 +1,211 @@
+﻿=== Service: rt640x64 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Tag    REG_DWORD    0xd
+    ImagePath    REG_EXPAND_SZ    system32\drivers\rt640x64.sys
+    DisplayName    REG_SZ    @oem0.inf,%rt640.Service.DispName%;Realtek RT640 NT Driver
+    Group    REG_SZ    NDIS
+    Owners    REG_MULTI_SZ    oem0.inf\0rt640x64.inf
+    BootFlags    REG_DWORD    0x1
+    NdisMajorVersion    REG_DWORD    0x6
+    NdisMinorVersion    REG_DWORD    0x28
+    DriverMajorVersion    REG_DWORD    0xa
+    DriverMinorVersion    REG_DWORD    0x50
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64\Parameters
+=== Service: ndis ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\ndis
+    Description    REG_SZ    @%SystemRoot%\system32\drivers\ndis.sys,-201
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\ndis.sys,-200
+    ErrorControl    REG_DWORD    0x3
+    Group    REG_SZ    NDIS Wrapper
+    ImagePath    REG_EXPAND_SZ    system32\drivers\ndis.sys
+    Start    REG_DWORD    0x0
+    Type    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\ndis\IfTypes
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\ndis\Parameters
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\ndis\State
+=== Service: tcpip ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\tcpip
+    BootFlags    REG_DWORD    0x1
+    Description    REG_SZ    @%SystemRoot%\system32\tcpipcfg.dll,-50003
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\tcpip.sys,-10001
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    PNP_TDI
+    ImagePath    REG_EXPAND_SZ    System32\drivers\tcpip.sys
+    Start    REG_DWORD    0x0
+    Tag    REG_DWORD    0x3
+    Type    REG_DWORD    0x1
+    NdisMajorVersion    REG_DWORD    0x6
+    NdisMinorVersion    REG_DWORD    0x28
+    DriverMajorVersion    REG_DWORD    0x0
+    DriverMinorVersion    REG_DWORD    0x0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\tcpip\Linkage
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\tcpip\Parameters
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\tcpip\Security
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\tcpip\ServiceProvider
+=== Service: netbt ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\netbt\Linkage
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\netbt\Parameters
+=== Service: tdx ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\tdx
+    DependOnService    REG_MULTI_SZ    tcpip
+    Description    REG_SZ    @%SystemRoot%\system32\tcpipcfg.dll,-50004
+    DisplayName    REG_SZ    @%SystemRoot%\system32\tcpipcfg.dll,-50004
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    PNP_TDI
+    ImagePath    REG_EXPAND_SZ    \SystemRoot\system32\DRIVERS\tdx.sys
+    Start    REG_DWORD    0x1
+    Tag    REG_DWORD    0x4
+    Type    REG_DWORD    0x1
+
+=== Service: fwpkclnt ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_groups.ps1:12 char:14
++ ...    $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\$s"  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== Service: iScsiPrt ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt
+    DisplayName    REG_SZ    iScsiPort Driver
+    ImagePath    REG_EXPAND_SZ    System32\drivers\msiscsi.sys
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    CCiSCSI
+    BootFlags    REG_DWORD    0x1
+    Owners    REG_MULTI_SZ    iscsi.inf
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Enum
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Parameters
+=== Service: disk ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\disk
+    TimeOutValue    REG_DWORD    0x3c
+    IoTimeoutValue    REG_DWORD    0x3c
+    ImagePath    REG_EXPAND_SZ    System32\drivers\disk.sys
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    DisplayName    REG_SZ    @disk.inf,%disk_ServiceDesc%;Disk Driver
+    Owners    REG_MULTI_SZ    wstorflt.inf\0smrdisk.inf\0disk.inf\0virtdisk.inf
+    AutoRunAlwaysDisable    REG_MULTI_SZ    Brother RemovableDisk(U)
+
+=== Service: partmgr ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\partmgr
+    Description    REG_SZ    @%SystemRoot%\system32\drivers\partmgr.sys,-101
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\partmgr.sys,-100
+    ErrorControl    REG_DWORD    0x3
+    Group    REG_SZ    Boot Bus Extender
+    ImagePath    REG_EXPAND_SZ    System32\drivers\partmgr.sys
+    Start    REG_DWORD    0x0
+    Type    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\partmgr\Parameters
+=== Service: volmgr ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\volmgr
+    ImagePath    REG_EXPAND_SZ    System32\drivers\volmgr.sys
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x3
+    Group    REG_SZ    System Bus Extender
+    Tag    REG_DWORD    0x9
+    DisplayName    REG_SZ    @volmgr.inf,%volmgr_svcdesc%;Volume Manager Driver
+    Owners    REG_MULTI_SZ    volmgr.inf
+
+=== Service: mountmgr ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\mountmgr
+    Description    REG_SZ    @%SystemRoot%\system32\drivers\mountmgr.sys,-101
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\mountmgr.sys,-100
+    ErrorControl    REG_DWORD    0x3
+    Group    REG_SZ    System Bus Extender
+    ImagePath    REG_EXPAND_SZ    System32\drivers\mountmgr.sys
+    Start    REG_DWORD    0x0
+    Type    REG_DWORD    0x1
+
+=== Service: fltmgr ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\fltmgr
+    AttachWhenLoaded    REG_DWORD    0x1
+    Description    REG_SZ    @%SystemRoot%\system32\drivers\fltmgr.sys,-10000
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\fltmgr.sys,-10001
+    ErrorControl    REG_DWORD    0x3
+    Group    REG_SZ    FSFilter Infrastructure
+    ImagePath    REG_EXPAND_SZ    system32\drivers\fltmgr.sys
+    Start    REG_DWORD    0x0
+    Tag    REG_DWORD    0x1
+    Type    REG_DWORD    0x2
+
+=== ServiceGroupOrder List ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\ServiceGroupOrder
+    List    REG_MULTI_SZ    System Reserved\0EMS\0WdfLoadGroup\0Boot Bus Extender\0System Bus Extender\0NDIS Wrapper\0NDIS\0Base\0PNP_TDI\0CCiSCSI\0SCSI miniport\0Port\0Primary Disk\0SCSI Class\0SCSI CDROM Class\0FSFilter Infrastructure\0FSFilter System\0FSFilter Bottom\0FSFilter Copy Protection\0FSFilter Security Enhancer\0FSFilter Open File\0FSFilter Physical Quota Management\0FSFilter Virtualization\0FSFilter Encryption\0FSFilter Compression\0FSFilter Imaging\0FSFilter HSM\0FSFilter Cluster File System\0FSFilter System Recovery\0FSFilter Quota Management\0FSFilter Content Screener\0FSFilter Continuous Backup\0FSFilter Replication\0FSFilter Anti-Virus\0FSFilter Undelete\0FSFilter Activity Monitor\0FSFilter Top\0Filter\0Boot File System\0Pointer Port\0Keyboard Port\0Pointer Class\0Keyboard Class\0Video Init\0Video\0Video Save\0File System\0Streams Drivers\0COM Infrastructure\0Event Log\0PerceptionGroup\0ProfSvc_Group\0AudioGroup\0UIGroup\0MS_WindowsLocalValidation\0PlugPlay\0Cryptography\0TDI\0iSCSI\0NetBIOSGroup\0ShellSvcGroup\0SchedulerGroup\0SpoolerGroup\0SmartCardGroup\0NetworkProvider\0MS_WindowsRemoteValidation\0NetDDEGroup\0Parallel arbitrator\0Extended Base\0PCI Configuration\0MS Transactions
+
+=== GroupOrderList ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\GroupOrderList
+    NDIS    REG_BINARY    0C0000000100000002000000030000000400000005000000060000000700000008000000090000000A0000000B0000000C000000
+    Base    REG_BINARY    100000000E0000000100000002000000030000000400000005000000060000000700000008000000090000000A0000000B0000000C0000000D0000000F00000010000000
+    extended base    REG_BINARY    0B0000000100000002000000040000000300000005000000060000000700000008000000090000000A00000019000000
+    System Bus Extender    REG_BINARY    0E000000070000000300000004000000010000000F00000008000000090000000A0000000B0000000C0000000D0000000E0000000200000005000000
+    Boot Bus Extender    REG_BINARY    06000000070000000100000002000000030000000400000005000000
+    SCSI Class    REG_BINARY    03000000010000000200000003000000
+    Core Security Extensions    REG_BINARY    020000000100000002000000
+    SCSI CDROM Class    REG_BINARY    020000000100000002000000
+    SCSI miniport    REG_BINARY    3F0000000001000001010000190000000100000002000000030000000400000005000000060000000700000008000000090000000A0000000B0000000C0000000D0000000E0000000F00000010000000110000001200000013000000140000001500000016000000170000001A000000180000001B0000001C0000001D0000001E0000001F00000020000000230000002400000025000000260000002700000028000000290000002A0000002B0000002C0000002D0000002E0000002F000000300000003100000032000000330000003400000035000000360000003700000038000000390000003A0000003B0000003C0000003D0000003E0000003F000000
+    PnP Filter    REG_BINARY    0400000001000000030000000400000005000000
+    Parallel arbitrator    REG_BINARY    0100000001000000
+    Video    REG_BINARY    0100000001000000
+    PNP_TDI    REG_BINARY    0700000005000000010000000200000003000000040000000600000007000000
+    Keyboard Port    REG_BINARY    0400000001000000020000000300000004000000
+    Pointer Port    REG_BINARY    03000000010000000200000003000000
+    Video Init    REG_BINARY    0100000001000000
+    Cryptography    REG_BINARY    020000000100000002000000
+    EMS    REG_BINARY    0100000001000000
+    Filter    REG_BINARY    0100000001000000
+    FSFilter Activity Monitor    REG_BINARY    0100000001000000
+    FSFilter Anti-Virus    REG_BINARY    0100000001000000
+    FSFilter Bottom    REG_BINARY    0100000001000000
+    FSFilter Cluster File System    REG_BINARY    0100000001000000
+    FSFilter Compression    REG_BINARY    0100000001000000
+    FSFilter Content Screener    REG_BINARY    0100000001000000
+    FSFilter Continuous Backup    REG_BINARY    0100000001000000
+    FSFilter Copy Protection    REG_BINARY    0100000001000000
+    FSFilter Encryption    REG_BINARY    0100000001000000
+    FSFilter HSM    REG_BINARY    0100000001000000
+    FSFilter Imaging    REG_BINARY    0100000001000000
+    FSFilter Infrastructure    REG_BINARY    0100000001000000
+    FSFilter Open File    REG_BINARY    0100000001000000
+    FSFilter Physical Quota Management    REG_BINARY    0100000001000000
+    FSFilter Quota Management    REG_BINARY    0100000001000000
+    FSFilter Replication    REG_BINARY    0100000001000000
+    FSFilter Security Enhancer    REG_BINARY    0100000001000000
+    FSFilter System    REG_BINARY    0100000001000000
+    FSFilter System Recovery    REG_BINARY    0100000001000000
+    FSFilter Top    REG_BINARY    0100000001000000
+    FSFilter Undelete    REG_BINARY    0100000001000000
+    FSFilter Virtualization    REG_BINARY    0100000001000000
+    Keyboard Class    REG_BINARY    0100000001000000
+    NetBIOSGroup    REG_BINARY    0100000001000000
+    Network    REG_BINARY    06000000010000000200000003000000040000000500000006000000
+    Pointer Class    REG_BINARY    0100000001000000
+    Primary Disk    REG_BINARY    050000000100000002000000030000000400000005000000
+    SpoolerGroup    REG_BINARY    020000000100000002000000
+    Streams Drivers    REG_BINARY    0100000001000000
+    Video Save    REG_BINARY    0100000001000000
+

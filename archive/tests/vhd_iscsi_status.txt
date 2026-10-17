@@ -1,0 +1,71 @@
+﻿OS Drive Letter: I
+msiscsi.sys: True
+iscsiprt.sys: False
+iscsi.inf: True
+iscsidsc.dll: False
+iscsiexe.dll: False
+iscsicli.exe: False
+=== SELECT ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\Select
+    Current    REG_DWORD    0x1
+    Default    REG_DWORD    0x1
+    Failed    REG_DWORD    0x0
+    LastKnownGood    REG_DWORD    0x1
+
+=== ISCSIPRT IN CONTROLSET001 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt
+    DisplayName    REG_SZ    iScsiPort Driver
+    ImagePath    REG_EXPAND_SZ    System32\drivers\msiscsi.sys
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    CCiSCSI
+    BootFlags    REG_DWORD    0x1
+    Owners    REG_MULTI_SZ    iscsi.inf
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Enum
+    0    REG_SZ    ROOT\ISCSIPRT\0000
+    Count    REG_DWORD    0x1
+    NextInstance    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Parameters
+    BusType    REG_DWORD    0x9
+    DelayForNetworkAtBoot    REG_DWORD    0x1
+    LinkDownTime    REG_DWORD    0x3c
+    MaxRequestHoldTime    REG_DWORD    0x3c
+
+=== MSISCSI IN CONTROLSET001 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\msiscsi\Parameters
+    LinkDownTime    REG_DWORD    0x3c
+    MaxRequestHoldTime    REG_DWORD    0x3c
+
+=== ROOT\\ISCSIPRT IN ENUM ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Enum\ROOT\ISCSIPRT\0000
+    ClassGUID    REG_SZ    {4d36e97b-e325-11ce-bfc1-08002be10318}
+    HardwareID    REG_SZ    ROOT\ISCSIPRT
+    Service    REG_SZ    iScsiPrt
+    DeviceDesc    REG_SZ    Microsoft iSCSI Initiator
+    Driver    REG_SZ    {4d36e97b-e325-11ce-bfc1-08002be10318}\0000
+    Mfg    REG_SZ    Microsoft
+    ConfigFlags    REG_DWORD    0x0
+
+=== CRITICAL DEVICE DATABASE ISCSIPRT ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\CriticalDeviceDatabase\root#iscsiprt
+    ClassGUID    REG_SZ    {4d36e97b-e325-11ce-bfc1-08002be10318}
+    Service    REG_SZ    iScsiPrt
+
+=== SCSI CLASS ALL ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e97b-e325-11ce-bfc1-08002be10318}
+    Class    REG_SZ    SCSIAdapter
+    ClassDesc    REG_SZ    @%SystemRoot%\System32\SysClass.Dll,-3005
+    IconPath    REG_MULTI_SZ    %SystemRoot%\System32\setupapi.dll,-12
+    LegacyAdapterDetection    REG_DWORD    0x0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e97b-e325-11ce-bfc1-08002be10318}\0000
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e97b-e325-11ce-bfc1-08002be10318}\Properties

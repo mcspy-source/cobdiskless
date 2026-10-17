@@ -1,0 +1,3 @@
+﻿Searching WinSxS for iscsi.inf...
+Windows drive: I:\
+Done.

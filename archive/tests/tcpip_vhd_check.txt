@@ -1,0 +1,35 @@
+﻿=== Tcpip Service in VHD ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip
+    BootFlags    REG_DWORD    0x1
+    Description    REG_SZ    @%SystemRoot%\system32\tcpipcfg.dll,-50003
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\tcpip.sys,-10001
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    PNP_TDI
+    ImagePath    REG_EXPAND_SZ    System32\drivers\tcpip.sys
+    Start    REG_DWORD    0x0
+    Tag    REG_DWORD    0x3
+    Type    REG_DWORD    0x1
+    NdisMajorVersion    REG_DWORD    0x6
+    NdisMinorVersion    REG_DWORD    0x28
+    DriverMajorVersion    REG_DWORD    0x0
+    DriverMinorVersion    REG_DWORD    0x0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Linkage
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Security
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\ServiceProvider
+=== NDIS Service in VHD ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\NDIS
+    Description    REG_SZ    @%SystemRoot%\system32\drivers\ndis.sys,-201
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\ndis.sys,-200
+    ErrorControl    REG_DWORD    0x3
+    Group    REG_SZ    NDIS Wrapper
+    ImagePath    REG_EXPAND_SZ    system32\drivers\ndis.sys
+    Start    REG_DWORD    0x0
+    Type    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\NDIS\IfTypes
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\NDIS\Parameters
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\NDIS\State

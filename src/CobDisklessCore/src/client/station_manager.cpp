@@ -28,6 +28,11 @@ StationEntry to_station(const MachineRecord& rec) {
     st.last_seen = rec.last_seen;
     st.uefi_bootloader = rec.uefi_bootloader;
     st.status = rec.status;
+    st.last_arch = rec.last_arch;
+    st.super_client = rec.super_client;
+    st.subsystem_id = rec.subsystem_id;
+    st.revision_id = rec.revision;
+    st.force_sniff = rec.force_sniff;
     return st;
 }
 
@@ -46,6 +51,25 @@ void apply_station(MachineRecord& rec, const StationEntry& st) {
     rec.uefi_bootloader = st.uefi_bootloader;
     if (!st.status.empty()) {
         rec.status = st.status;
+    }
+    if (!st.last_arch.empty()) {
+        rec.last_arch = st.last_arch;
+    }
+    // super_client round-trips: in-tree writers either read-modify-write
+    // (DHCP adoption, HTTP PUT carry the projected flag back) or create a
+    // fresh row (default false, correct for a new station). Dedicated
+    // togglers (CLI/API/console) write explicit values.
+    rec.super_client = st.super_client;
+    // Station-owned hardware gate state; empty means "not machine-reported".
+    // Never cleared here: only a fresh enrollment writes these. force_sniff
+    // is deliberately NOT synced here -- it is operator state managed only
+    // through PUT /api/v1/station, so routine station updates can never
+    // silently clear (or set) it.
+    if (!st.subsystem_id.empty()) {
+        rec.subsystem_id = st.subsystem_id;
+    }
+    if (!st.revision_id.empty()) {
+        rec.revision = st.revision_id;
     }
     rec.registered_at = st.registered_at;
     rec.last_seen = st.last_seen;
@@ -303,6 +327,14 @@ Result<void> StationManager::add_or_update_station(const StationEntry& station) 
     }
 
     return store_->mutate([&](MachineMap& all) -> Result<void> {
+        if (!station.name.empty()) {
+            for (const auto& [cand_mac, rec] : all) {
+                if (cand_mac != norm_mac && rec.name == station.name) {
+                    return Error(ErrorCode::InvalidConfiguration,
+                                 "Station name '" + station.name + "' is already assigned to " + cand_mac);
+                }
+            }
+        }
         MachineRecord rec = record_or_new(all, norm_mac);
         // Same rule as before the merge: the incoming entry wins outright, and
         // an empty registered_at is filled in rather than preserved.
@@ -313,17 +345,33 @@ Result<void> StationManager::add_or_update_station(const StationEntry& station) 
     });
 }
 
+Result<size_t> StationManager::update_default_image_for_stations(
+    const std::string& old_default,
+    const std::string& new_default
+) {
+    size_t count = 0;
+    const auto res = store_->mutate([&](MachineMap& all) -> Result<void> {
+        for (auto& [_, rec] : all) {
+            if (rec.image == old_default || rec.image.empty() || rec.image == "(Default)" || rec.image == "default") {
+                rec.image = new_default;
+                count++;
+            }
+        }
+        return {};
+    });
+    if (res.is_err()) {
+        return res.error();
+    }
+    return count;
+}
+
 Result<void> StationManager::remove_station(std::string_view mac) {
     const std::string norm_mac = normalize_mac(mac);
     return store_->mutate([&](MachineMap& all) -> Result<void> {
-        const auto it = all.find(norm_mac);
+        auto it = all.find(norm_mac);
         if (it == all.end()) {
             return Error(ErrorCode::InvalidConfiguration, "Station not found: " + norm_mac);
         }
-        // One row per machine means "forget this station" and "forget this
-        // machine" are the same act. Leaving a half-empty row behind instead
-        // would keep the MAC alive for station_count() and for every lookup
-        // while carrying none of the state that made it a station.
         all.erase(it);
         return {};
     });
@@ -382,6 +430,18 @@ Result<void> StationManager::update_last_seen(std::string_view mac) {
             return {}; // unregistered between the check above and this lock
         }
         it->second.last_seen = current_utc_iso8601();
+        return {};
+    });
+}
+
+Result<void> StationManager::update_station_boot_arch(std::string_view mac, std::string_view arch) {
+    const std::string norm = normalize_mac(mac);
+    return store_->mutate([&](MachineMap& all) -> Result<void> {
+        const auto it = all.find(norm);
+        if (it == all.end()) {
+            return {};
+        }
+        it->second.last_arch = std::string(arch);
         return {};
     });
 }

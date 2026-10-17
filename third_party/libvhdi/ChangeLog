@@ -1,0 +1,79 @@
+TODO
+* add VHDX block state sanity checks
+* move parent identifier and filename to IO handle ?
+* validated checksums
+* add VHDX log (journal) support
+* debug print timestamps
+* improve test coverage
+
+Tests:
+* Test concurrent read from diff image and parent
+* Add verify test
+
+* debug
+  - print creator application
+  - print creator host system
+  - print disk geometry
+* what about geometry and disk size calculation
+* read backup file footer of dynamic disk
+
+20130922
+* updated msvscpp files
+* removed libfvalue
+* see `git log' for more recent change log
+
+20130916
+* updated dependencies
+* worked on libcthreads build support
+* code clean up
+
+20130831
+* updated dependencies
+
+20130514
+* changes in parent functions
+
+20130512
+* updated dependencies
+* changes to macosx files
+* worked on Python bindings
+* worked on debug output
+* worked on differential image support
+* worked on Dokan support
+
+20130501
+* vhdimount: worked on differential images support
+
+20121209
+* changes for fdata refactor
+
+20121208
+* changes for fdata refactor
+
+20121202
+* changes for fdata refactor
+
+20121201
+* updated dependencies
+
+20120929
+* updated dependencies
+
+20120922
+* code clean up
+
+20120920
+* updated dependencies
+
+20120918
+* added support for fixed disk image
+
+20120917
+* fix for debian rules file
+
+20120914
+* fix for bitmap size, needs to be a multitude of sector size
+
+20120913
+* initial version
+

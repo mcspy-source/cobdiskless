@@ -1,0 +1,95 @@
+﻿=== rt640x64 Service ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Tag    REG_DWORD    0xd
+    ImagePath    REG_EXPAND_SZ    system32\drivers\rt640x64.sys
+    DisplayName    REG_SZ    @oem0.inf,%rt640.Service.DispName%;Realtek RT640 NT Driver
+    Group    REG_SZ    NDIS
+    Owners    REG_MULTI_SZ    oem0.inf\0rt640x64.inf
+    BootFlags    REG_DWORD    0x1
+    NdisMajorVersion    REG_DWORD    0x6
+    NdisMinorVersion    REG_DWORD    0x28
+    DriverMajorVersion    REG_DWORD    0xa
+    DriverMinorVersion    REG_DWORD    0x50
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64\Parameters
+    DrvOption    REG_DWORD    0x0
+    DrvMode    REG_DWORD    0x0
+    DmaRemappingCompatible    REG_DWORD    0x0
+    WppRecorder_TraceGuid    REG_SZ    {88c289a9-e366-45a1-b478-feb5157fdb8c}
+    WaitAutoNegComplete    REG_DWORD    0x1
+    *EEE    REG_SZ    0
+    AutoPowerSave    REG_SZ    0
+    GigaLite    REG_SZ    0
+    *FlowControl    REG_SZ    0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64\Parameters\Wdf
+    WdfMajorVersion    REG_DWORD    0x1
+    WdfMinorVersion    REG_DWORD    0xf
+
+=== Tcpip Parameters Interfaces ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Interfaces\{820c4568-d585-420e-94b3-aea0e0dc3402}
+    EnableDHCP    REG_DWORD    0x1
+    Domain    REG_SZ    
+    NameServer    REG_SZ    
+    DhcpIPAddress    REG_SZ    192.168.1.5
+    DhcpSubnetMask    REG_SZ    255.255.255.0
+    DhcpServer    REG_SZ    192.168.1.100
+    Lease    REG_DWORD    0x15180
+    LeaseObtainedTime    REG_DWORD    0x6ab7eb21
+    T1    REG_DWORD    0x6ab893e1
+    T2    REG_DWORD    0x6ab91271
+    LeaseTerminatesTime    REG_DWORD    0x6ab93ca1
+    AddressType    REG_DWORD    0x0
+    IsServerNapAware    REG_DWORD    0x0
+    DhcpConnForceBroadcastFlag    REG_DWORD    0x0
+    DhcpNameServer    REG_SZ    1.1.1.1
+    DhcpDefaultGateway    REG_MULTI_SZ    192.168.1.1
+    DhcpSubnetMaskOpt    REG_MULTI_SZ    255.255.255.0
+    DhcpInterfaceOptions    REG_BINARY    FC000000000000000000000000000000CDA8000079000000000000000000000000000000CDA8000077000000000000000000000000000000CDA800002F000000000000000000000000000000CDA800002E000000000000000000000000000000CDA800002C000000000000000000000000000000CDA800002B000000000000000000000000000000CDA8000021000000000000000000000000000000CDA800001F000000000000000000000000000000CDA800000F000000000000000000000000000000CDA80000060000000000000004000000000000000D01518001010101030000000000000004000000000000000D015180C0A80101010000000000000004000000000000000D015180FFFFFF00330000000000000004000000000000000D01518000015180360000000000000004000000000000000D015180C0A80164350000000000000001000000000000000D015180050000002A0000000000000008000000000000000E015180D8EF2304C005292942000000000000000E000000000000000E015180746674703A2F2F302E302E302E300000780000000000000017000000000000000E0151800006716379736263046674746804706C6474036E657400007D0000000000000020000000000000000E01518000000DE91B0406303045303443050C50524C4E30434234393741310603494744010000000000000000000000010000000D0000003D0000000000000007000000000000000E015180018C89A591E8E1000C000000000000000F000000000000000E0151804445534B544F502D4533475350365600
+    DhcpGatewayHardware    REG_BINARY    C0A801010600000090610CB497A1
+    DhcpGatewayHardwareCount    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip\Parameters\Interfaces\{c07a0272-b875-11f1-91b8-806e6f6e6963}
+
+=== Session Manager BootExecute ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Session Manager
+    BootExecute    REG_MULTI_SZ    autocheck autochk *
+
+=== Memory Management PagingFiles ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Session Manager\Memory Management
+    PagingFiles    REG_MULTI_SZ    
+
+=== iScsiPrt Service ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt
+    DisplayName    REG_SZ    iScsiPort Driver
+    ImagePath    REG_EXPAND_SZ    System32\drivers\msiscsi.sys
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    CCiSCSI
+    BootFlags    REG_DWORD    0x1
+    Owners    REG_MULTI_SZ    iscsi.inf
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Enum
+    0    REG_SZ    ROOT\ISCSIPRT\0000
+    Count    REG_DWORD    0x1
+    NextInstance    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Parameters
+    BusType    REG_DWORD    0x9
+    WaitForNetworkAtBoot    REG_DWORD    0x0
+    DelayForNetworkAtBoot    REG_DWORD    0x1
+
+=== ServiceGroupOrder List ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\ServiceGroupOrder
+    List    REG_MULTI_SZ    System Reserved\0EMS\0WdfLoadGroup\0Boot Bus Extender\0System Bus Extender\0SCSI miniport\0Port\0Primary Disk\0SCSI Class\0SCSI CDROM Class\0FSFilter Infrastructure\0FSFilter System\0FSFilter Bottom\0FSFilter Copy Protection\0FSFilter Security Enhancer\0FSFilter Open File\0FSFilter Physical Quota Management\0FSFilter Virtualization\0FSFilter Encryption\0FSFilter Compression\0FSFilter Imaging\0FSFilter HSM\0FSFilter Cluster File System\0FSFilter System Recovery\0FSFilter Quota Management\0FSFilter Content Screener\0FSFilter Continuous Backup\0FSFilter Replication\0FSFilter Anti-Virus\0FSFilter Undelete\0FSFilter Activity Monitor\0FSFilter Top\0Filter\0Boot File System\0Base\0Pointer Port\0Keyboard Port\0Pointer Class\0Keyboard Class\0Video Init\0Video\0Video Save\0File System\0Streams Drivers\0NDIS Wrapper\0COM Infrastructure\0Event Log\0PerceptionGroup\0ProfSvc_Group\0AudioGroup\0UIGroup\0MS_WindowsLocalValidation\0PlugPlay\0Cryptography\0PNP_TDI\0NDIS\0TDI\0iSCSI\0NetBIOSGroup\0ShellSvcGroup\0SchedulerGroup\0SpoolerGroup\0SmartCardGroup\0NetworkProvider\0MS_WindowsRemoteValidation\0NetDDEGroup\0Parallel arbitrator\0Extended Base\0PCI Configuration\0MS Transactions
+

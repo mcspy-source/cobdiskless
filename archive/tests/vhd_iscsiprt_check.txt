@@ -1,0 +1,24 @@
+﻿=== OFFLINE iScsiPrt ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_vhd_iscsiprt.ps1:11 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\iScsiPr ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== OFFLINE Enum ROOT ISCSIPRT ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_vhd_iscsiprt.ps1:13 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Enum\ROOT\ISCSIP ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== OFFLINE msiscsi ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_vhd_iscsiprt.ps1:15 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\msiscsi ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

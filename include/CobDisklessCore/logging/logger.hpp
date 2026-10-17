@@ -4,6 +4,7 @@
 
 #include <string>
 #include <string_view>
+#include <atomic>
 #include <mutex>
 #include <functional>
 #include <memory>
@@ -34,6 +35,17 @@ public:
 
     void set_min_level(LogLevel level) noexcept;
     [[nodiscard]] LogLevel min_level() const noexcept;
+
+    /**
+     * @brief True when a message at @p level would actually reach the sink.
+     *
+     * Lock-free, so hot paths can skip formatting (or scanning a payload to
+     * build a tag string) for output that is about to be discarded.
+     */
+    [[nodiscard]] bool would_log(LogLevel level) const noexcept {
+        return static_cast<int>(level) >=
+               static_cast<int>(min_level_.load(std::memory_order_relaxed));
+    }
 
     void set_sink(LogSink sink);
     void reset_to_default_sink();
@@ -66,7 +78,10 @@ public:
 
 private:
     mutable std::mutex mutex_;
-    LogLevel min_level_{LogLevel::Info};
+    // Atomic so the level gate can be checked before contending on mutex_ --
+    // TRACE chatter is rejected on nearly every call and must not serialise
+    // the I/O threads on the way out.
+    std::atomic<LogLevel> min_level_{LogLevel::Info};
     LogSink sink_;
 
     static std::string current_timestamp();

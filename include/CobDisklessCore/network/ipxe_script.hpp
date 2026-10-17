@@ -52,13 +52,17 @@ struct SanbootOptions {
 [[nodiscard]] inline std::string sanboot_script(const SanbootOptions& options = {}) {
     std::string script;
     script += "#!ipxe\n";
+    script += "dhcp net0\n";
+    script += "set net0/gateway 0.0.0.0\n";
     script += "set keep-san 1\n";
+    script += "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n";
     std::string srv = options.server_ip.empty() ? std::string("${next-server}") : options.server_ip;
     if (srv == "${server_ip}") {
         srv = "${next-server}";
     }
     const std::string iqn = options.target_iqn.empty() ? std::string("iqn.2026-09.com.cobdiskless:storage") : options.target_iqn;
-    script += "sanboot iscsi:" + srv + "::::" + iqn + "\n";
+    script += "sanhook --drive 0x80 iscsi:" + srv + "::::" + iqn + "\n";
+    script += "sanboot --drive 0x80\n";
     return script;
 }
 
@@ -124,12 +128,16 @@ struct LegacySanbootOptions {
  * @brief Builds the Legacy BIOS MBR script for a client that is READY to SAN boot.
  *
  * `sanhook` attaches the OS drive to drive 0x80 without booting it (so the
- * firmware-visible disk is stable) and `sanboot --no-describe` then boots it.
+ * firmware-visible disk is stable) and `sanboot --drive 0x80` then boots it.
  *
  * Emits strictly:
  * #!ipxe
+ * dhcp net0
+ * set net0/gateway 0.0.0.0
+ * set keep-san 1
+ * set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}
  * sanhook --drive 0x80 iscsi:${server_ip}::::${target_iqn}
- * sanboot --no-describe
+ * sanboot --drive 0x80
  */
 [[nodiscard]] inline std::string legacy_mbr_sanboot_script(const LegacySanbootOptions& options = {}) {
     const std::string server = options.server_ip.empty() ? std::string("${server_ip}")
@@ -138,8 +146,12 @@ struct LegacySanbootOptions {
                                                        : options.target_iqn;
     std::string script;
     script += "#!ipxe\n";
+    script += "dhcp net0\n";
+    script += "set net0/gateway 0.0.0.0\n";
+    script += "set keep-san 1\n";
+    script += "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n";
     script += "sanhook --drive 0x80 iscsi:" + server + "::::" + iqn + "\n";
-    script += "sanboot --no-describe\n";
+    script += "sanboot --drive 0x80\n";
     return script;
 }
 
@@ -196,6 +208,59 @@ struct WimbootOptions {
 }
 
 /**
+ * @brief Dynamic Dispatcher: Case A - Native iSCSI boot script for validated clients.
+ */
+[[nodiscard]] inline std::string native_iscsi_boot_script(
+    const std::string& server_ip,
+    const std::string& client_mac = "${net0/mac}",
+    const std::string& target_iqn = "") {
+    const std::string srv = server_ip.empty() ? "${next-server}" : server_ip;
+    std::string iqn = target_iqn;
+    if (iqn.empty()) {
+        std::string safe_mac = client_mac;
+        if (safe_mac.empty() || safe_mac == "${net0/mac}") {
+            iqn = "iqn.2026-10.local.cobdiskless:client-${net0/mac}";
+        } else {
+            iqn = "iqn.2026-10.local.cobdiskless:client-" + safe_mac;
+        }
+    }
+    std::string script;
+    script += "#!ipxe\n";
+    script += "set net0/gateway 0.0.0.0\n";
+    script += "set keep-san 1\n";
+    script += "echo [CobDiskless] Attaching SAN volume for ${net0/mac}...\n";
+    script += "sanhook --drive 0x80 --keep iscsi:" + srv + "::::" + iqn + " || goto san_fail\n";
+    script += "sanboot --drive 0x80 || goto san_fail\n\n";
+    script += ":san_fail\n";
+    script += "echo [ERROR] Failed to attach or boot from SAN target!\n";
+    script += "echo Dropping to iPXE recovery shell in 5s...\n";
+    script += "sleep 5\n";
+    script += "shell\n";
+    return script;
+
+}
+
+/**
+ * @brief Dynamic Dispatcher: Case B - Divert unknown / unvalidated clients into WinPE.
+ */
+[[nodiscard]] inline std::string winpe_bootstrap_script(
+    const std::string& server_ip,
+    uint16_t port = 0) {
+    const std::string srv = server_ip.empty() ? "${next-server}" : server_ip;
+    const std::string host = (port != 0 && port != 80) ? (srv + ":" + std::to_string(port)) : srv;
+    const std::string root = "http://" + host + "/boot/";
+    std::string script;
+    script += "#!ipxe\n";
+    script += "dhcp\n";
+    script += "kernel " + root + "wimboot\n";
+    script += "initrd " + root + "BCD         BCD\n";
+    script += "initrd " + root + "boot.sdi    boot.sdi\n";
+    script += "initrd " + root + "cob_pe.wim  boot.wim\n";
+    script += "boot\n";
+    return script;
+}
+
+/**
  * @brief Builds the bootstrap script served when no MAC was supplied.
  *
  * DHCP hands out a bare "http://server:port/boot.ipxe" URL (it cannot expand
@@ -206,9 +271,8 @@ struct WimbootOptions {
 [[nodiscard]] inline std::string self_chain_script(const std::string& boot_url) {
     std::string script;
     script += "#!ipxe\n";
-    // `platform` rides along so the second hop can run the firmware/image
-    // mismatch guard without needing a third round trip.
-    script += "chain " + boot_url + "?mac=${net0/mac}&platform=${platform}\n";
+    // Passes MAC, platform, and UUID for zero-touch hardware fingerprinting
+    script += "chain " + boot_url + "?mac=${net0/mac}&platform=${platform}&uuid=${smbios/uuid}\n";
     return script;
 }
 
@@ -284,11 +348,18 @@ enum class ClientPlatform {
  * BootMode::Unknown gives nothing to judge, so neither is ever a mismatch.
  */
 [[nodiscard]] inline bool is_platform_mismatch(ClientPlatform platform,
-                                               BootMode image_mode) noexcept {
+                                               BootMode image_mode,
+                                               PartitionScheme scheme = PartitionScheme::Unknown) noexcept {
+    if (image_mode == BootMode::Dual || image_mode == BootMode::Unknown) {
+        return false;
+    }
     switch (platform) {
-        case ClientPlatform::LegacyBios: return image_mode == BootMode::Uefi;
-        case ClientPlatform::NativeUefi: return image_mode == BootMode::Bios;
-        case ClientPlatform::Unknown:    return false;
+        case ClientPlatform::LegacyBios:
+            return (scheme == PartitionScheme::Gpt || image_mode == BootMode::Uefi);
+        case ClientPlatform::NativeUefi:
+            return (image_mode == BootMode::Bios || (scheme == PartitionScheme::Mbr && image_mode != BootMode::Uefi));
+        case ClientPlatform::Unknown:
+            return false;
     }
     return false;
 }
@@ -395,19 +466,32 @@ struct PlatformMismatchOptions {
 
     const unsigned seconds = (options.timeout_ms + 999U) / 1000U;
     const std::string rule(73, '=');
+    const bool is_csm_gpt = (options.client_platform == ClientPlatform::LegacyBios);
 
     std::string script;
     script += "#!ipxe\n";
+    script += "clear\n";
     script += "echo " + std::string(kAnsiWhiteOnRed) + rule + kAnsiReset + "\n";
     script += "echo " + std::string(kAnsiWhiteOnRed) +
               "=== COBDISKLESS BOOT BLOCKED: FIRMWARE / IMAGE MISMATCH ===" + kAnsiReset + "\n";
     script += "echo " + std::string(kAnsiWhiteOnRed) + rule + kAnsiReset + "\n";
     script += "echo\n";
 
-    script += "echo " + std::string(kAnsiBoldRed) + "Station name: " + station + kAnsiReset + "\n";
-    script += "echo " + std::string(kAnsiBoldRed) + "MAC address: " + mac + kAnsiReset + "\n";
-    script += "echo " + std::string(kAnsiBoldRed) + "Client firmware: " + client + kAnsiReset + "\n";
-    script += "echo " + std::string(kAnsiBoldRed) + "Assigned image: " + image + kAnsiReset + "\n";
+    if (is_csm_gpt) {
+        script += "echo " + std::string(kAnsiBoldYellow) +
+                  "FATAL: Client booted in CSM/BIOS mode, but assigned image requires UEFI (GPT). Change motherboard BIOS setting to UEFI." +
+                  kAnsiReset + "\n";
+    } else {
+        script += "echo " + std::string(kAnsiBoldYellow) +
+                  "FATAL: Client booted in UEFI mode, but assigned image requires Legacy BIOS / CSM (MBR). Change motherboard BIOS setting to CSM/Legacy." +
+                  kAnsiReset + "\n";
+    }
+    script += "echo\n";
+
+    script += "echo " + std::string(kAnsiBoldRed) + "Station name:      " + station + kAnsiReset + "\n";
+    script += "echo " + std::string(kAnsiBoldRed) + "MAC address:       " + mac + kAnsiReset + "\n";
+    script += "echo " + std::string(kAnsiBoldRed) + "Client firmware:   " + client + kAnsiReset + "\n";
+    script += "echo " + std::string(kAnsiBoldRed) + "Assigned image:    " + image + kAnsiReset + "\n";
     script += "echo " + std::string(kAnsiBoldRed) + "Image boot format: " + format + kAnsiReset + "\n";
     script += "echo\n";
 
@@ -435,12 +519,38 @@ struct PlatformMismatchOptions {
 }
 
 /**
+ * @brief The six iPXE settings lines that harvest PCI telemetry.
+ *
+ * Shared by every script that must learn the boot NIC before deciding:
+ * `ven`/`dev` (config 0x00/0x02), `rev` (0x08), `subven`/`subdev`
+ * (0x2C/0x2E). On builds/NICs without `${pci/...}` support everything
+ * expands empty and the server treats the params as absent (legacy path).
+ */
+[[nodiscard]] inline std::string pci_sniff_script_lines() {
+    std::string script;
+    script += "set busloc ${net0/busloc}\n";
+    script += "set ven ${pci/${busloc}.0.2:hex}\n";
+    script += "set dev ${pci/${busloc}.2.2:hex}\n";
+    script += "set rev ${pci/${busloc}.8.1:hex}\n";
+    script += "set subven ${pci/${busloc}.2c.2:hex}\n";
+    script += "set subdev ${pci/${busloc}.2e.2:hex}\n";
+    return script;
+}
+
+/**
  * @brief Builds the one-shot re-chain that makes `${platform}` reach the server.
  *
  * DHCP cannot expand iPXE variables, so the boot URL it hands out is bare and
  * the first /boot.ipxe request carries no `platform`. When the guard has an
  * image format to judge against, the firmware class is the only missing half --
  * ask for it once, then decide on the second hop.
+ *
+ * The same hop also harvests PCI telemetry (`ven`/`dev` from config 0x00/0x02,
+ * `rev` from 0x08, `subven`/`subdev` from 0x2C/0x2E) so the second hop can
+ * feed the hardware-enrollment route (/boot with ven/dev). Without this,
+ * stock-iPXE bare-metal stations could never enroll: nothing else in their
+ * flow reports PCI ids. Empty expansions are harmless -- the server treats
+ * absent params as "no telemetry" and keeps the legacy behavior.
  *
  * The chained request always carries the `platform` key (even if `${platform}`
  * expanded to nothing), so the second hop can never ask a third time. Failure
@@ -450,7 +560,10 @@ struct PlatformMismatchOptions {
     const std::string sep = (boot_url.find('?') == std::string::npos) ? "?" : "&";
     std::string script;
     script += "#!ipxe\n";
-    script += "chain " + boot_url + sep + "platform=${platform} || goto probe_failed\n";
+    script += pci_sniff_script_lines();
+    script += "chain " + boot_url + sep +
+               "platform=${platform}&ven=${ven}&dev=${dev}&rev=${rev}"
+               "&subven=${subven}&subdev=${subdev}&sniffed=1 || goto probe_failed\n";
     script += "goto probe_done\n";
     script += ":probe_failed\n";
     script += "echo CobDiskless did not answer the firmware check. Rebooting.\n";

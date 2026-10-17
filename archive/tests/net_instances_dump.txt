@@ -1,0 +1,11 @@
+﻿=== NET ADAPTER CLASS INSTANCES ===
+Instance: 0000
+  DriverDesc: Realtek PCIe GbE Family Controller
+  MatchingDeviceId: PCI\VEN_10EC&DEV_8168&REV_06
+  ComponentId: PCI\VEN_10EC&DEV_8168&REV_06
+  NetCfgInstanceId: {820C4568-D585-420E-94B3-AEA0E0DC3402}
+  *SpeedDuplex: 0
+  WaitAutoNegComplete: 
+  *EEE: 1
+  GigaLite: 
+  AutoPowerSave: 

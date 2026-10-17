@@ -1,0 +1,5 @@
+﻿Checking w11eufi.VHD...
+Windows drive: H:
+ntoskrnl.exe ver: 10.0.26100.2454 (WinBuild.160101.0800)
+msiscsi.sys ver: 10.0.26100.1150 (WinBuild.160101.0800)
+Done.

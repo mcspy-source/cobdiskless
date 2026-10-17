@@ -429,12 +429,10 @@ Result<void> ClientDatabase::remove_client(std::string_view mac) {
     const std::string norm_mac = normalize_mac(mac);
 
     auto res = store_->mutate([&](MachineMap& all) -> Result<void> {
-        const auto it = all.find(norm_mac);
+        auto it = all.find(norm_mac);
         if (it == all.end()) {
             return Error(ErrorCode::StorageFailure, "Client with MAC " + norm_mac + " not found");
         }
-        // One row per machine: un-enrolling forgets the machine outright,
-        // which is also what the operator sees as "remove this client".
         all.erase(it);
         return {};
     });

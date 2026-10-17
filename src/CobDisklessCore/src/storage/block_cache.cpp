@@ -125,7 +125,11 @@ void CachedBlockDevice::arc_push(ArcList which,
     where_[page_index] = {list.begin(), which};
 }
 
-void CachedBlockDevice::arc_replace(uint64_t incoming, bool incoming_in_b2) {
+// `incoming` is the page being admitted. This body selects the victim from the
+// window sizes and from `incoming_in_b2` alone, so the index itself is unread
+// here; the parameter stays because every caller already passes it.
+void CachedBlockDevice::arc_replace([[maybe_unused]] uint64_t incoming,
+                                    bool incoming_in_b2) {
     // A write-through invalidation can leave the cache short of capacity while
     // the ghost windows are still populated. Evicting in that state would push
     // the resident set below its budget, so make no room at all: there is room.

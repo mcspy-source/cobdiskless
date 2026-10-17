@@ -9,6 +9,7 @@
 #include <string>
 
 #include "CobDisklessCore/errors/result.hpp"
+#include "CobDisklessCore/storage/file_attributes.hpp"
 
 namespace cobdiskless {
 
@@ -35,12 +36,19 @@ struct RoHandleEntry;
  * many worker threads at once without serializing on a seek pointer.
  *
  * Sharing policy:
- *   - Access::ReadOnly  -> GENERIC_READ  + FILE_SHARE_READ (strict, shared)
- *   - Access::ReadWrite -> GENERIC_READ|GENERIC_WRITE + FILE_SHARE_READ|FILE_SHARE_WRITE
+ *   - Access::ReadOnly  -> GENERIC_READ + FILE_SHARE_READ (strict: no writer,
+ *     no deleter, no renamer can slip past an open master image handle)
+ *   - Access::ReadWrite -> GENERIC_READ|GENERIC_WRITE + FILE_SHARE_READ
  *     Opening read-write first *suspends* the cached read-only handle for that
  *     path so a sanctioned maintenance writer can coexist with a boot-time
  *     reader pool. The read-only handles are transparently resumed (and lazily
  *     reopened) when the read-write handle is closed.
+ *
+ * Read-only attribute policy: a read-write open of a file carrying
+ * FILE_ATTRIBUTE_READONLY FAILS with an Access Denied error unless the caller
+ * passes ReadOnlyAttributePolicy::Lift (Super Client maintenance only). The
+ * helper never clears the attribute on its own; when it was lifted, release()
+ * re-applies it.
  */
 class RandomAccessFile {
 public:
@@ -56,8 +64,14 @@ public:
 
     /**
      * @brief Opens the file. Read-only opens join the shared handle pool.
+     *
+     * @param access  Read-only or read-write.
+     * @param attribute_policy  What to do when the file carries the OS
+     *        read-only attribute: Refuse (default, Access Denied) or Lift
+     *        (explicit Super Client maintenance lift, restored on release).
      */
-    [[nodiscard]] Result<void> open(const std::filesystem::path& path, Access access);
+    [[nodiscard]] Result<void> open(const std::filesystem::path& path, Access access,
+                                    ReadOnlyAttributePolicy attribute_policy = ReadOnlyAttributePolicy::Refuse);
 
     /**
      * @brief Closes the handle (resuming any suspended read-only pool handles).
@@ -106,6 +120,11 @@ private:
     int posix_fd_{-1};
     bool win32_native_{false};
     bool owns_rw_{false};
+    // True when an explicit ReadOnlyAttributePolicy::Lift cleared the OS
+    // read-only attribute (or the POSIX write bit) for this writer: release()
+    // puts it back so the master image re-locks itself the moment the
+    // maintenance writer is gone. Never set by a plain read-write open.
+    bool restore_readonly_{false};
 };
 
 } // namespace cobdiskless

@@ -32,6 +32,20 @@ struct StationEntry {
     std::string last_seen;         // ISO 8601 timestamp of last DHCP DISCOVER
     std::string uefi_bootloader;   // Optional override (e.g. "snponly.efi")
     std::string status{"active"};  // "active", "offline", etc.
+    std::string last_arch;         // "bios" or "uefi" (detected via DHCP Option 93)
+    // --- super client (projected to/from MachineRecord.super_client) --------
+    // Operator-pinned via CLI `superclient enable`, POST
+    // /api/station/superclient, or the management console. Unlike
+    // force_sniff this flag round-trips through apply_station: every in-tree
+    // writer either read-modify-writes (DHCP adoption, HTTP PUT) or creates
+    // a fresh row (default false, correct for a new station).
+    bool super_client{false};
+    // --- strict hardware gate (projected to/from MachineRecord) ------------
+    // subsystem_id / revision_id name the exactly-enrolled board; force_sniff
+    // pins the station to the cobsniffer detour (see force_sniff on the record).
+    std::string subsystem_id;
+    std::string revision_id;
+    bool force_sniff{false};
 };
 
 /**
@@ -124,6 +138,11 @@ public:
     Result<void> add_or_update_station(const StationEntry& station);
 
     /**
+     * @brief Updates any stations assigned to old_default (or empty/default) to new_default.
+     */
+    Result<size_t> update_default_image_for_stations(const std::string& old_default, const std::string& new_default);
+
+    /**
      * @brief Removes a station by MAC.
      */
     Result<void> remove_station(std::string_view mac);
@@ -133,6 +152,12 @@ public:
      * No-op if the MAC is not registered. Thread-safe.
      */
     Result<void> update_last_seen(std::string_view mac);
+
+    /**
+     * @brief Updates the detected runtime firmware boot architecture ("bios" | "uefi")
+     * parsed from DHCP Option 93. Thread-safe.
+     */
+    Result<void> update_station_boot_arch(std::string_view mac, std::string_view arch);
 
     /**
      * @brief Overwrites the lifecycle status of an existing station ("active",

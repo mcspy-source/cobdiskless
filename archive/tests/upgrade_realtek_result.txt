@@ -1,0 +1,23 @@
+﻿=== Step 1: Mounting G:\csmw10.VHD ===
+OS Drive Letter is: I:
+=== Step 2: Current rt640x64.sys ===
+  FileVersion: 10.080.0407.2026
+  ProductVersion: 10.080.0407.2026
+  File Size: 1473064 bytes
+=== Step 3: Replacing rt640x64.sys from C:\Windows\System32\DriverStore\FileRepository\rt640x64.inf_amd64_82d53ae24f2639b8\rt640x64.sys ===
+  New FileVersion: 10.080.0407.2026
+  Replaced FileVersion: 10.080.0407.2026 (1473064 bytes)
+=== Step 4: Running DISM /Add-Driver ===
+Executing: dism.exe /Image:I:\ /Add-Driver /Driver:"C:\Windows\System32\DriverStore\FileRepository\rt640x64.inf_amd64_82d53ae24f2639b8" /Recurse
+
+Deployment Image Servicing and Management tool
+Version: 10.0.26100.1150
+
+Image Version: 10.0.17763.1637
+
+Searching for driver packages to install...
+Found 1 driver package(s) to install.
+Installing 1 of 1 - oem0.inf: The driver package was successfully installed.
+The operation completed successfully.
+=== Step 5: Dismounting G:\csmw10.VHD ===
+Dismount complete.

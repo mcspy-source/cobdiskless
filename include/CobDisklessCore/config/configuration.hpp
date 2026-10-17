@@ -63,6 +63,17 @@ public:
     void set_writeback_quota_mb(uint64_t mb) noexcept { writeback_quota_mb_ = mb; }
 
     /**
+     * @brief Per-client RAM writeback absorption budget in MiB (default 64).
+     *
+     * Dirty chunks are first accepted into this in-memory tier and only spill
+     * to the .cow file afterwards, so a boot burst is acknowledged at memory
+     * speed and the backing HDD/SATA disk sees ordered writes instead of a
+     * random-4K storm. 0 restores the legacy eager-spill behaviour.
+     */
+    [[nodiscard]] uint64_t writeback_ram_mb() const noexcept { return writeback_ram_mb_; }
+    void set_writeback_ram_mb(uint64_t mb) noexcept { writeback_ram_mb_ = mb; }
+
+    /**
      * @brief Identities (IQN or MAC) allowed to enter Super Client mode.
      *
      * A session whose initiator IQN or MAC matches an entry bypasses the COW
@@ -91,12 +102,12 @@ public:
     [[nodiscard]] uint16_t http_port() const noexcept { return http_port_; }
     void set_http_port(uint16_t port) noexcept { http_port_ = port; }
 
-    /**
-     * @brief When true, automatically scan the images directory on server startup
-     *        and arm offline SYSTEM hives in VHD images before the iSCSI target initializes.
-     */
-    [[nodiscard]] bool auto_arm_vhd_on_boot() const noexcept { return auto_arm_vhd_on_boot_; }
-    void set_auto_arm_vhd_on_boot(bool enabled) noexcept { auto_arm_vhd_on_boot_ = enabled; }
+    // There is deliberately no auto_arm_vhd_on_boot() accessor any more:
+    // arming a SYSTEM hive is an explicit command (cob_armer arm, the admin
+    // app's 1-Click button, or its arm subcommand), never something start-up
+    // does behind the operator's back. The cobdiskless.conf key of the same
+    // name is still accepted and ignored so existing files keep loading --
+    // see Configuration::load().
 
     /**
      * @brief When true the host adapter (IP, netmask, gateway) and the default
@@ -146,6 +157,12 @@ public:
     [[nodiscard]] int station_ttl_days() const noexcept { return station_ttl_days_; }
     void set_station_ttl_days(int days) noexcept { station_ttl_days_ = days; }
 
+    [[nodiscard]] const std::filesystem::path& tftp_boot_dir() const noexcept { return tftp_boot_dir_; }
+    void set_tftp_boot_dir(std::filesystem::path dir) noexcept { tftp_boot_dir_ = std::move(dir); }
+
+    [[nodiscard]] const std::string& dhcp_mode() const noexcept { return dhcp_mode_; }
+    void set_dhcp_mode(std::string mode) { dhcp_mode_ = std::move(mode); }
+
     /**
      * @brief Validates configuration sanity.
      * @return Result<void> with ErrorCode::InvalidConfiguration if any parameter is malformed.
@@ -191,6 +208,26 @@ public:
         const std::filesystem::path& exe_dir = get_executable_directory());
 
     /**
+     * @brief Returns candidate paths to search for the tftp_boot directory, in priority order:
+     *   1. Explicitly configured directory if non-empty
+     *   2. Executable-relative hierarchies (<exe_dir>/tftp_boot, <exe_dir>/../tftp_boot, etc.)
+     *   3. Working directory hierarchies (<cwd>/tftp_boot, <cwd>/../tftp_boot, etc.)
+     */
+    [[nodiscard]] static std::vector<std::filesystem::path> candidate_tftp_boot_paths(
+        const std::filesystem::path& configured_dir = "",
+        const std::filesystem::path& working_dir = ".",
+        const std::filesystem::path& exe_dir = get_executable_directory());
+
+    /**
+     * @brief Dynamically resolves the tftp_boot directory by probing candidate paths in order.
+     * Prioritizes existing directories containing core bootloader files (undionly.kpxe / ipxe.efi).
+     */
+    [[nodiscard]] static std::filesystem::path resolve_tftp_boot_directory(
+        const std::filesystem::path& configured_dir = "",
+        const std::filesystem::path& working_dir = ".",
+        const std::filesystem::path& exe_dir = get_executable_directory());
+
+    /**
      * @brief Returns the directory containing the running executable.
      */
     [[nodiscard]] static std::filesystem::path get_executable_directory();
@@ -208,15 +245,17 @@ private:
     std::filesystem::path games_dir_{"./games"};
     std::filesystem::path writeback_dir_{"./writeback"};
     std::filesystem::path cache_dir_{"./cache"};
+    std::filesystem::path tftp_boot_dir_{"./tftp_boot"};
     ByteSize default_cache_size_{512_MiB};
     LogLevel log_level_{LogLevel::Info};
     size_t max_clients_{64};
     bool first_run_completed_{false};
     uint64_t writeback_quota_mb_{0};               // 0 = unlimited
+    uint64_t writeback_ram_mb_{64};                // RAM writeback tier per client (MiB)
     std::vector<std::string> super_client_identities_;
 
     uint16_t http_port_{18080};
-    bool auto_arm_vhd_on_boot_{true};
+    bool auto_arm_vhd_on_boot_{false};
     bool network_auto_detect_{true};
     static std::string to_lower_ascii(std::string s);
     // 0.0.0.0 = "derive from the detected adapter"; an explicit value wins.
@@ -229,6 +268,7 @@ private:
     NetworkAddress ip_start_{192, 168, 1, 101};
     std::string default_master_vhd_{""};
     int station_ttl_days_{0}; // 0 = GC disabled
+    std::string dhcp_mode_{"auto"};
 };
 
 } // namespace cobdiskless

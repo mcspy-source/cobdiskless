@@ -5,6 +5,8 @@
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
 #include "CobDisklessCore/logging/logger.hpp"
+#include "CobDisklessCore/logging/io_metrics.hpp"
+#include "CobDisklessCore/storage/overlay_naming.hpp"
 #include <cstring>
 #include <vector>
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <iostream>
 #include <unordered_set>
 #include <iomanip>
+#include <cassert>
 #include <chrono>
 #include <string_view>
 #include <span>
@@ -42,6 +45,18 @@ constexpr long long kIdleTeardownMs = 60 * 1000;
 constexpr int kWorkerGraceMs = 2000;
 constexpr int kWorkerIoBreakMs = 1000;
 constexpr int kWorkerHardCloseMs = 500;
+
+// first_log_flags_ bits consumed by IscsiTarget::mark_log_once(): one bit per
+// boot stage that describes every SCSI command instead of a single
+// transition, so only the first occurrence of each stays at INFO.
+constexpr uint32_t kLogFirstScsiCommand = 1u << 0;
+constexpr uint32_t kLogFirstRead = 1u << 1;
+constexpr uint32_t kLogFirstWrite = 1u << 2;
+
+// Bound (never copied) into the stage13/stage15 lookups so the per-command
+// path does not allocate a std::string for the "no session yet" case. Both
+// operands of the ternary below must be references for that to hold.
+const std::string kNoClientSession = "unknown";
 
 inline std::string format_size_kb(size_t bytes) {
     if (bytes % 1024 == 0) {
@@ -173,6 +188,31 @@ inline bool send_all(SOCKET s, const void* data, size_t len) noexcept {
     }
     return true;
 }
+
+inline bool recv_exact(SOCKET sock, void* buffer, size_t length) noexcept {
+    uint8_t* p = static_cast<uint8_t*>(buffer);
+    size_t total_received = 0;
+    while (total_received < length) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        TIMEVAL tv{};
+        tv.tv_sec = 3;
+        tv.tv_usec = 0; // 3000ms timeout
+        int sel = select(0, &fds, nullptr, nullptr, &tv);
+        if (sel <= 0) {
+            return false; // Timeout or error
+        }
+
+        int bytes = recv(sock, reinterpret_cast<char*>(p + total_received),
+                         static_cast<int>(length - total_received), 0);
+        if (bytes <= 0) {
+            return false; // Connection closed gracefully (0) or hard error / RST (<0)
+        }
+        total_received += static_cast<size_t>(bytes);
+    }
+    return true;
+}
 #endif
 
 inline uint16_t read_be16(const uint8_t* p) noexcept {
@@ -207,7 +247,188 @@ inline void write_be64(uint8_t* p, uint64_t v) noexcept {
     write_be32(p + 4, static_cast<uint32_t>(v & 0xFFFFFFFF));
 }
 
+// RFC 3720 2.3.1 "Word Rule": every numeric iSCSI field is a 32-bit
+// big-endian word on the wire. IscsiBhs stores those words as native
+// uint32_t, so a *computed* value must be byte-swapped before the struct is
+// handed to send(), while an *echoed* value (the task tag, the LUN) already
+// round-trips byte for byte. cmd_sn/exp_stat_sn are read with read_be32() and
+// written with write_be32() for exactly this reason.
+inline uint32_t wire_cmdsn(const IscsiBhs& b) noexcept {
+    return read_be32(reinterpret_cast<const uint8_t*>(&b.cmd_sn));
+}
 
+// StatSN (bytes 24-27), ExpCmdSN (bytes 28-31) and MaxCmdSN (bytes 32-35)
+// sit at the same offsets in *every* target-originated PDU this file builds:
+// Login Response (10.13), SCSI Response (10.4), SCSI Data-In (10.7), R2T
+// (10.8), NOP-In (10.19) and Logout Response (10.15).
+//
+// Two defects used to live here. All three words were written little-endian,
+// so a conformant initiator decoded StatSN 1 as 0x01000000 -- a status
+// sequence error on the very first response. And MaxCmdSN was never written
+// at all, i.e. every response advertised a zero-length command window;
+// RFC 3720 3.2.2.1 forbids the initiator from issuing a CmdSN above MaxCmdSN,
+// so after one command it could never issue another. That is a permanent
+// stall with no error anywhere: the spinner Windows sits on.
+//
+// stat_sn is passed by value. Callers write stat_sn++ for a PDU that carries
+// a meaningful StatSN, and plain stat_sn (or 0) where the RFC says the field
+// does not advance: 10.8.3 for R2T, 10.7.3 for a Data-In with S=0.
+inline void stamp_command_window(IscsiBhs& resp, const IscsiBhs& req, uint32_t stat_sn) noexcept {
+    const uint32_t cmd_sn = wire_cmdsn(req);
+    write_be32(reinterpret_cast<uint8_t*>(&resp.cmd_sn), stat_sn);
+    write_be32(reinterpret_cast<uint8_t*>(&resp.exp_stat_sn), cmd_sn + 1);
+    // Set MaxCmdSN to cmd_sn + 1 (depth 1) to serialize commands and prevent
+    // pipelined command interleaving during synchronous SCSI execution.
+    write_be32(resp.cdb + 0, cmd_sn + 1);
+}
+
+// Read back the ExpStatSN a Login Request carries (BHS bytes 28..31).
+inline uint32_t wire_expstat_sn(const IscsiBhs& b) noexcept {
+    return read_be32(reinterpret_cast<const uint8_t*>(&b.exp_stat_sn));
+}
+
+// Depth of the command window advertised in a Login Response.
+inline constexpr uint32_t kLoginWindowDepth = 32;
+
+// The Login Phase answers with a window of its own, and three separate defects
+// used to hide behind stamp_command_window() being used there too:
+//
+//   * ExpCmdSN was reported as login_req.CmdSN + 1, i.e. the target claimed to
+//     have consumed a command the initiator never issued. A Login PDU carries
+//     the *current* CmdSN and CmdSN does not advance for the length of the
+//     Login Phase, so the response must confirm exactly that value; replying
+//     with +1 moves the initiator's next CmdSN past the number it is about to
+//     use and msiscsi walks away from the negotiation.
+//   * MaxCmdSN was CmdSN + 31 relative to a CmdSN the response claimed to have
+//     already passed, so the advertised window was off by one against the
+//     ExpCmdSN it was published with.
+//   * StatSN was a local counter that always restarted at 1, regardless of the
+//     ExpStatSN the initiator brought with it. RFC 3720 3.2.2.2 starts status
+//     numbering with the first Login Response of the connection and says any
+//     initial value is valid -- but it must be a value *this* connection
+//     agreed to, not a fixed 1 that can land below a counter a previous
+//     connection already carried past.
+//
+// So the Login Phase uses this stamp, seeded from the request it answers.
+inline void stamp_login_window(IscsiBhs& resp, const IscsiBhs& req, uint32_t stat_sn) noexcept {
+    const uint32_t cmd_sn = wire_cmdsn(req);
+    write_be32(reinterpret_cast<uint8_t*>(&resp.cmd_sn), stat_sn);            // StatSN
+    write_be32(reinterpret_cast<uint8_t*>(&resp.exp_stat_sn), cmd_sn);        // ExpCmdSN
+    write_be32(resp.cdb + 0, cmd_sn + kLoginWindowDepth);                     // MaxCmdSN
+}
+
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+// Builds and transmits a coalesced (S=1) SCSI Data-In PDU (Opcode 0x25)
+// per RFC 3720 with underflow and residual calculation and 4-byte wire padding.
+inline bool send_scsi_data_in(
+    SOCKET s,
+    const IscsiBhs& req_bhs,
+    uint32_t& stat_sn,
+    std::span<const uint8_t> payload,
+    uint8_t scsi_status = 0x00
+) noexcept {
+    const uint32_t edtl = read_be32(reinterpret_cast<const uint8_t*>(&req_bhs.data_transfer_tag));
+    const uint32_t actual_data_len = static_cast<uint32_t>(payload.size());
+
+    IscsiBhs in_bhs{};
+    in_bhs.opcode = 0x25; // SCSI Data-In
+    in_bhs.initiator_task_tag = req_bhs.initiator_task_tag;
+    in_bhs.lun = req_bhs.lun;
+    in_bhs.data_transfer_tag = 0xFFFFFFFF; // RFC 3720 10.7.3: TTT must be 0xFFFFFFFF when S=1
+
+    // Underflow & Residual Calculation (RFC 3720 10.7.1)
+    if (actual_data_len < edtl) {
+        in_bhs.flags = 0x83; // F (0x80) | U (0x02) | S (0x01)
+        const uint32_t residual = edtl - actual_data_len;
+        write_be32(in_bhs.cdb + 12, residual); // ResidualCount at offset 44..47
+    } else {
+        in_bhs.flags = 0x81; // F (0x80) | S (0x01)
+        write_be32(in_bhs.cdb + 12, 0);        // ResidualCount = 0
+    }
+
+    in_bhs.rsvd1[1] = scsi_status; // BHS[3] (Status) = 0x00 (GOOD)
+
+    // Sequence numbers and window
+    // BHS[24..27] = htonl(current_stat_sn++)
+    // BHS[28..31] = htonl(exp_cmd_sn)
+    // BHS[32..35] = htonl(max_cmd_sn)
+    stamp_command_window(in_bhs, req_bhs, stat_sn++);
+
+    // BHS[36..39] = 0x00000000 (DataSN = 0)
+    write_be32(in_bhs.cdb + 4, 0);
+    // BHS[40..43] = 0x00000000 (BufferOffset = 0)
+    write_be32(in_bhs.cdb + 8, 0);
+
+    // DataSegmentLength in BHS bytes 5..7
+    in_bhs.data_seg_len[0] = static_cast<uint8_t>((actual_data_len >> 16) & 0xFF);
+    in_bhs.data_seg_len[1] = static_cast<uint8_t>((actual_data_len >> 8) & 0xFF);
+    in_bhs.data_seg_len[2] = static_cast<uint8_t>(actual_data_len & 0xFF);
+
+    // RFC 3720 4-Byte Wire Padding
+    const size_t pad_len = (4 - (actual_data_len % 4)) % 4;
+
+    // Coalesce TCP transmission: serialize BHS + payload + pad into a single contiguous buffer
+    const size_t total_len = sizeof(IscsiBhs) + actual_data_len + pad_len;
+    std::vector<uint8_t> packet(total_len, 0);
+    std::memcpy(packet.data(), &in_bhs, sizeof(IscsiBhs));
+    if (actual_data_len > 0) {
+        std::memcpy(packet.data() + sizeof(IscsiBhs), payload.data(), actual_data_len);
+    }
+    return send_all(s, packet.data(), total_len);
+}
+#endif
+
+// Extracts a MAC address embedded in an Initiator IQN, e.g.
+//   iqn.2026-09.cobdiskless:00:11:22:33:44:aa
+//   iqn.1991-05.com.microsoft:00-11-22-33-44-aa
+// Returns the address normalized as "aa:bb:cc:dd:ee:ff" (lowercase), or an
+// empty string when the initiator name carries no MAC.
+//
+// Six groups of EXACTLY two hex digits with a uniform ':' or '-' separator are
+// required; a bare 12-hex run is deliberately not accepted so a GUID suffix in
+// a generated msiscsi IQN can never be mistaken for another machine's MAC (and
+// cross-wire this login onto someone else's session/overlay).
+std::string extract_mac_from_initiator(const std::string& name) {
+    auto is_hex = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    };
+    auto lower = [](char c) {
+        return (c >= 'A' && c <= 'F') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    if (name.size() < 17) {
+        return {};
+    }
+    for (size_t i = 0; i + 17 <= name.size(); ++i) {
+        const char sep = name[i + 2];
+        if ((sep != ':' && sep != '-') ||
+            (i > 0 && is_hex(name[i - 1])) ||
+            (i + 17 < name.size() && is_hex(name[i + 17]))) {
+            continue;
+        }
+        bool ok = true;
+        for (size_t g = 0; g < 6 && ok; ++g) {
+            const size_t p = i + g * 3;
+            if (!is_hex(name[p]) || !is_hex(name[p + 1])) {
+                ok = false;
+            } else if (g < 5 && name[p + 2] != sep) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            std::string mac;
+            mac.reserve(17);
+            for (size_t g = 0; g < 6; ++g) {
+                if (g) {
+                    mac.push_back(':');
+                }
+                mac.push_back(lower(name[i + g * 3]));
+                mac.push_back(lower(name[i + g * 3 + 1]));
+            }
+            return mac;
+        }
+    }
+    return {};
+}
 
 } // namespace
 
@@ -239,7 +460,12 @@ std::string IscsiTarget::image_for_target_suffix(const std::string& tgt_name,
     }
 
     if (stations) {
-        if (auto st = stations->find_by_name(suffix); st.has_value() && !st->image.empty()) {
+        if (auto st = stations->find_by_name(suffix); st.has_value()) {
+            // A station match wins even when the station's image is still
+            // empty: falling through would return the station NAME as a
+            // literal image id and the login would die on
+            // "Image not found in manager: PC-01". Empty means "no explicit
+            // choice" and must reach the caller's default-image chain.
             return st->image;
         }
     }
@@ -475,24 +701,45 @@ Result<std::vector<uint8_t>> IscsiTarget::handle_inquiry(const uint8_t* cdb, con
         data[4] = 31;   // Additional Length (36 - 5)
         data[7] = 0x02; // Command Queueing (CMDQUE=1)
 
-        // Vendor ID (8 bytes ASCII): "COB     "
-        std::memcpy(data.data() + 8, "COB     ", 8);
-        // Product ID (16 bytes ASCII): "CobDiskless SAN "
-        std::memcpy(data.data() + 16, "CobDiskless SAN ", 16);
-        // Product Revision (4 bytes ASCII): "1.0 "
-        std::memcpy(data.data() + 32, "1.0 ", 4);
+        // INQUIRY identification (SPC-3 6.4.2). Windows storport/partmgr read
+        // these straight off the bus: a device that reports RMB=0 and a fixed
+        // vendor/product triple is a normal fixed disk, so the volume is
+        // eligible to become C:\ -- with paging and crash dump support -- rather
+        // than a removable flash stick.
+        //
+        // Vendor ID (8 bytes ASCII): "COBDISK "
+        std::memcpy(data.data() + 8, "COBDISK ", 8);
+        // Product ID (16 bytes ASCII): "VIRTUAL SAN DISK"
+        std::memcpy(data.data() + 16, "VIRTUAL SAN DISK", 16);
+        // Product Revision (4 bytes ASCII): "0001"
+        std::memcpy(data.data() + 32, "0001", 4);
     } else {
         // Vital Product Data (VPD) Pages
         if (page_code == 0x00) {
-            // Supported VPD Pages
-            data.resize(7, 0);
-            data[0] = 0x00;
-            data[1] = 0x00;
-            data[2] = 0x00;
-            data[3] = 0x03; // 3 supported pages
-            data[4] = 0x00; // Page 0x00
-            data[5] = 0x80; // Page 0x80
-            data[6] = 0x83; // Page 0x83
+            // Supported VPD Pages (SPC-3: 8 bytes, Page Length = 4)
+            uint8_t vpd00[8] = {
+                0x00, // Peripheral Qualifier = 0, Device Type = 0 (Direct-access block device)
+                0x00, // Page Code = 0x00
+                0x00, // Page Length MSB
+                0x04, // Page Length LSB: 4 supported pages follow
+                0x00, // Supported Page 0x00
+                0x80, // Supported Page 0x80 (Unit Serial Number)
+                0x83, // Supported Page 0x83 (Device Identification)
+                0xB1  // Supported Page 0xB1 (Block Device Characteristics)
+            };
+            data.resize(8);
+            std::memcpy(data.data(), vpd00, 8);
+        } else if (page_code == 0xB1) {
+            // SCSI Inquiry VPD Page 0xB1 (Block Device Characteristics):
+            // Bytes 4-5 must return 0x0001 (Non-rotating medium / SSD) to disable client-side background defrag loops.
+            data.resize(64, 0);
+            data[0] = 0x00; // Peripheral Qualifier = 0, Device Type = 0
+            data[1] = 0xB1; // Page Code: 0xB1
+            data[2] = 0x00; // Page Length MSB
+            data[3] = 0x3C; // Page Length LSB: 60 bytes follow
+            data[4] = 0x00; // Medium Rotation Rate MSB
+            data[5] = 0x01; // Medium Rotation Rate LSB: 0x0001 = Non-rotating medium (SSD)
+            data[6] = 0x00; // Nominal Form Factor
         } else if (page_code == 0x80) {
             // Unit Serial Number
             std::string sn = serial.empty() ? "COB-SAN-00000001" : serial;
@@ -503,30 +750,54 @@ Result<std::vector<uint8_t>> IscsiTarget::handle_inquiry(const uint8_t* cdb, con
             data[3] = static_cast<uint8_t>(sn.size() & 0xFF);
             std::memcpy(data.data() + 4, sn.data(), sn.size());
         } else if (page_code == 0x83) {
-            // Device Identification Page (Essential for Windows disk.sys)
-            // Pre-allocate total size: header (4) + descriptor 1 (28) + descriptor 2 (20) = 52 bytes
-            data.resize(52, 0);
+            // Device Identification Page (SPC-3 7.7) -- what Windows disk.sys
+            // uses to decide that two paths are the same physical disk. Both
+            // descriptors are derived from the client MAC, so the identity is
+            // byte-identical on every reboot: an identification that changes
+            // between sessions is exactly what makes Windows mark the disk
+            // offline as a signature collision.
+            data.resize(44, 0);
             data[0] = 0x00;
             data[1] = 0x83;
 
-            // Descriptor 1: T10 Vendor ID (28 bytes at offset 4)
-            data[4] = 0x02; // ASCII
-            data[5] = 0x01; // T10 Vendor ID
-            data[6] = 0x00;
-            data[7] = 24;   // Length
-            std::memcpy(data.data() + 8, "COB     CobDiskless SAN ", 24);
+            std::string sn = serial.empty() ? "COB-SAN-00000001" : serial;
+            std::string sn_padded = sn;
+            if (sn_padded.size() < 16) {
+                sn_padded.append(16 - sn_padded.size(), ' ');
+            }
 
-            // Descriptor 2: NAA IEEE Registered Extended (20 bytes at offset 32)
-            data[32] = 0x01; // Binary
-            data[33] = 0x03; // NAA
-            data[34] = 0x00;
-            data[35] = 16;   // 16 bytes
-            data[36] = 0x60; // NAA Type 6
-            data[37] = 0x01;
-            data[38] = 0x44;
-            data[39] = 0xF0;
-            for (size_t i = 0; i < 12 && i < serial.size(); ++i) {
-                data[40 + i] = static_cast<uint8_t>(serial[i]);
+            // Descriptor 1: T10 Vendor ID (SPC-3 Table 176: designator type 0,
+            // ASCII code set, no protocol identifier) -- 28 bytes at offset 4.
+            data[4] = 0x02; // Code set = ASCII, Protocol Identifier = 0
+            data[5] = 0x00; // Designator type = 0 (T10 Vendor ID), PIV = 0
+            data[6] = 0x00; // Association = 0 (target device)
+            data[7] = 24;   // Length
+            std::memcpy(data.data() + 8, "COBDISK ", 8);
+            std::memcpy(data.data() + 16, sn_padded.data(), 16);
+
+            // Descriptor 2: NAA 6 (IEEE Registered), binary code set,
+            // designator type 3, 8-byte identifier -- 12 bytes at offset 32.
+            // NAA 6 is 4 bits of NAA type + 36 bits of IEEE company id + 24
+            // company-specific bits; the low 24 are a hash of the same serial
+            // so every client gets its own stable NAA. The old encoding wrote
+            // ASCII characters into a binary NAA field with the wrong
+            // designator type and a 16-byte length, i.e. an identifier no
+            // initiator could parse.
+            uint64_t fnv = 14695981039346656037ull; // FNV-1a 64 offset basis
+            for (unsigned char c : sn) {
+                fnv ^= static_cast<uint64_t>(c);
+                fnv *= 1099511628211ull;            // FNV-1a 64 prime
+            }
+            constexpr uint64_t kCompany36 = 0x0C0BD15C0ull; // 36-bit IEEE company id
+            const uint64_t naa = 0x6000000000000000ull |
+                                 ((kCompany36 & 0xFFFFFFFFFull) << 24) |
+                                 (fnv & 0xFFFFFFull);
+            data[32] = 0x01; // Code set = binary, Protocol Identifier = 0
+            data[33] = 0x30; // Designator type = 3 (NAA), PIV = 0
+            data[34] = 0x00; // Association = 0 (target device)
+            data[35] = 8;    // NAA identifiers are 64 bits
+            for (int i = 0; i < 8; ++i) {
+                data[36 + i] = static_cast<uint8_t>((naa >> (56 - i * 8)) & 0xFF);
             }
 
             uint16_t page_len = static_cast<uint16_t>(data.size() - 4);
@@ -644,11 +915,12 @@ Result<std::vector<uint8_t>> IscsiTarget::handle_mode_sense(const uint8_t* cdb) 
     return data;
 }
 
-Result<std::vector<uint8_t>> IscsiTarget::handle_request_sense() {
+Result<std::vector<uint8_t>> IscsiTarget::handle_request_sense(uint8_t sense_key, uint8_t asc) {
     std::vector<uint8_t> sense(18, 0);
     sense[0] = 0x70; // Current error
-    sense[2] = 0x00; // NO SENSE
+    sense[2] = sense_key;
     sense[7] = 10;   // Additional length
+    sense[12] = asc;
     return sense;
 }
 
@@ -677,47 +949,48 @@ std::unordered_map<std::string, std::string> IscsiTarget::parse_text_parameters(
     return params;
 }
 
-std::vector<uint8_t> IscsiTarget::build_login_response_parameters(const std::unordered_map<std::string, std::string>& req_params) {
+std::vector<uint8_t> IscsiTarget::build_login_response_parameters(
+    const std::unordered_map<std::string, std::string>& req_params,
+    uint8_t stage,
+    bool final_accept) {
     std::string text;
-    auto it_target = req_params.find("TargetName");
-    if (it_target != req_params.end()) {
-        text += "TargetName=" + it_target->second;
-    } else {
-        text += "TargetName=iqn.2026-09.com.cobdiskless:storage";
-    }
-    text.push_back('\0');
-
-    text += "TargetPortalGroupTag=1";
-    text.push_back('\0');
-
-    auto it_auth = req_params.find("AuthMethod");
-    if (it_auth != req_params.end()) {
-        text += "AuthMethod=None";
+    // Every key this function can emit is written through here so the payload
+    // is a plain NUL-separated list and no branch can forget the terminator.
+    auto emit = [&text](const char* kv) {
+        text += kv;
         text.push_back('\0');
+    };
+
+    if (stage == 0 && !final_accept) {
+        // RFC 3720 5.3.2 / 5.3.1: Security Negotiation Stage (CSG == 0 -> NSG == 1).
+        // Strictly only AuthMethod and TargetPortalGroupTag.
+        // Stripped: InitiatorName, SessionType, TargetName, and all operational parameters.
+        emit("AuthMethod=None");
+        emit("TargetPortalGroupTag=1");
+        return std::vector<uint8_t>(text.begin(), text.end());
     }
 
-    text += "HeaderDigest=None";
-    text.push_back('\0');
-    text += "DataDigest=None";
-    text.push_back('\0');
-    text += "InitialR2T=Yes";
-    text.push_back('\0');
-    text += "ImmediateData=Yes";
-    text.push_back('\0');
-    text += "MaxRecvDataSegmentLength=65536";
-    text.push_back('\0');
-    text += "DefaultTime2Wait=0";
-    text.push_back('\0');
-    text += "DefaultTime2Retain=0";
-    text.push_back('\0');
-    text += "MaxOutstandingR2T=1";
-    text.push_back('\0');
-    text += "DataPDUInOrder=Yes";
-    text.push_back('\0');
-    text += "DataSequenceInOrder=Yes";
-    text.push_back('\0');
-    text += "ErrorRecoveryLevel=0";
-    text.push_back('\0');
+    if (final_accept || stage == 1) {
+        // If the initiator offered AuthMethod in a single-PDU login, answer it per RFC 3720 5.3.2.
+        const auto it_auth = req_params.find("AuthMethod");
+        if (it_auth != req_params.end()) {
+            emit("AuthMethod=None");
+        }
+
+        // RFC 3720 5.3.3 / Chapter 12: Operational Parameter Negotiation (CSG == 1 -> NSG == 3)
+        // or single-PDU login skipping straight to Full Feature Phase.
+        emit("HeaderDigest=None");
+        emit("DataDigest=None");
+        emit("MaxRecvDataSegmentLength=262144");
+        emit("FirstBurstLength=262144");
+        emit("MaxBurstLength=262144");
+        emit("InitialR2T=No");
+        emit("ImmediateData=Yes");
+        emit("MaxOutstandingR2T=1");
+        emit("DefaultTime2Wait=0");
+        emit("DefaultTime2Retain=0");
+        emit("TargetPortalGroupTag=1");
+    }
 
     return std::vector<uint8_t>(text.begin(), text.end());
 }
@@ -753,6 +1026,66 @@ Result<size_t> IscsiTarget::execute_read(
     return res;
 }
 
+namespace {
+
+// Maps a failed execute_write() onto the SCSI sense key / ASC the initiator
+// should be shown for that failure.
+//
+// The previous code answered *every* failure with DATA PROTECT / WRITE
+// PROTECTED (0x07 / 0x27). Windows msiscsi takes that literally: it stops
+// retrying and reports the disk as write-protected, so a transient overlay
+// I/O error, a writeback quota exhaustion or a full writeback volume surfaced
+// as "the disk is write protected" and the boot wedged with no usable
+// diagnostics. Genuine protection violations still say WRITE PROTECTED; a
+// short Data-Out or an internal buffer fault says ABORTED COMMAND; everything
+// else reports the medium error it actually was, which is what lets the
+// initiator retry instead of giving up.
+void map_write_error_to_sense(const Error& err, uint8_t& key, uint8_t& asc) {
+    const std::string_view msg = err.message();
+
+    // An initiator addressing a LUN we do not expose: not a medium fault.
+    if (err.code() == ErrorCode::UnsupportedOperation ||
+        msg.find("No block device attached") != std::string_view::npos) {
+        key = 0x05; // ILLEGAL REQUEST
+        asc = 0x25; // LOGICAL UNIT NOT SUPPORTED
+        return;
+    }
+
+    // The master-image immutability guards: the target really is refusing to
+    // write, and saying so is the whole point of them.
+    if (msg.find("Direct base writes forbidden") != std::string_view::npos ||
+        msg.find("immutability") != std::string_view::npos) {
+        key = 0x07; // DATA PROTECT
+        asc = 0x27; // WRITE PROTECTED
+        return;
+    }
+
+    // Past the end of the medium: an addressing fault, not a media fault.
+    if (msg.find("exceeds device capacity") != std::string_view::npos ||
+        msg.find("out of bounds") != std::string_view::npos) {
+        key = 0x05; // ILLEGAL REQUEST
+        asc = 0x21; // LOGICAL BLOCK ADDRESS OUT OF RANGE
+        return;
+    }
+
+    // The target never got a complete command payload -- an internal fault or
+    // a caller bug, not something the initiator should retry.
+    if (msg.find("Source buffer smaller") != std::string_view::npos ||
+        msg.find("Null write buffer") != std::string_view::npos) {
+        key = 0x0B; // ABORTED COMMAND
+        asc = 0x00; // NO ADDITIONAL SENSE INFORMATION
+        return;
+    }
+
+    // Everything else -- overlay file I/O failure, writeback quota exceeded,
+    // no space left on the writeback volume, a stalled writeback ring -- is a
+    // medium error the initiator is allowed to retry.
+    key = 0x03; // MEDIUM ERROR
+    asc = 0x0C; // WRITE ERROR
+}
+
+} // namespace
+
 Result<size_t> IscsiTarget::execute_write(
     ClientSession& session,
     uint64_t start_lba,
@@ -764,15 +1097,26 @@ Result<size_t> IscsiTarget::execute_write(
         return Error(ErrorCode::UnsupportedOperation, "LUN " + std::to_string(lun) + " is read-only protected storage");
     }
 
-    auto dev = session.cow_device();
+    auto dev = session.get_device_for_lun(lun);
     if (!dev) {
-        return Error(ErrorCode::StorageFailure, "No block device attached to client session");
+        return Error(ErrorCode::StorageFailure, "No block device attached to client session for LUN 0");
     }
 
-    uint64_t offset = start_lba * 512;
-    size_t req_bytes = static_cast<size_t>(sector_count) * 512;
+    auto cow_dev = session.cow_block_device();
+    if (cow_dev) {
+        // Strict invariant: standard client sessions must NEVER write directly to base master VHD!
+        assert(session.is_super_client() || !cow_dev->direct_base_writes());
+        if (!session.is_super_client() && cow_dev->direct_base_writes()) {
+            Logger::default_logger().error("iSCSI",
+                "[CRITICAL] Standard client attempted direct write to base image! Failing closed.");
+            return Error(ErrorCode::StorageFailure, "Direct base writes forbidden for non-superclient");
+        }
+    }
 
-    if (offset + req_bytes > dev->size()) {
+    const uint64_t bsize = dev->block_size();
+    size_t req_bytes = static_cast<size_t>(sector_count) * bsize;
+
+    if (start_lba * bsize + req_bytes > dev->size()) {
         return Error(ErrorCode::StorageFailure, "SCSI write exceeds device capacity");
     }
 
@@ -780,8 +1124,13 @@ Result<size_t> IscsiTarget::execute_write(
         return Error(ErrorCode::StorageFailure, "Source buffer smaller than write sectors");
     }
 
-    auto write_span = source.subspan(0, req_bytes);
-    auto res = dev->write(offset, write_span);
+    // Strict 2-Tier: a session write lands in Tier 1 (wb_<mac>.cow) through the
+    // TieredBlockDevice. A session holding only a raw UnifiedCowDevice -- one
+    // bound before that binding existed -- writes through its overlay directly.
+    // Nothing on this path ever reaches Tier 0: the master image stays read-only.
+    Result<size_t> res = (cow_dev && !session.tiered_device())
+        ? cow_dev->write_blocks(start_lba, sector_count, source.subspan(0, req_bytes))
+        : dev->write(start_lba * bsize, source.subspan(0, req_bytes));
     if (res.is_ok()) {
         session.record_write(res.value());
     }
@@ -789,30 +1138,82 @@ Result<size_t> IscsiTarget::execute_write(
 }
 
 Result<void> IscsiTarget::execute_sync_cache(ClientSession& session, uint64_t lun) {
-    if (lun == 0 && session.cow_device()) {
-        return session.cow_device()->flush();
+    auto dev = session.get_device_for_lun(lun);
+    if (dev) {
+        return dev->flush();
     }
     return {};
 }
 
+// Wake -- never free -- a socket the session is being taken away from.
+//
+// The owning worker is parked in recv() on that handle. Closing a socket out
+// from under a thread blocked on it is what strands that worker: it never
+// returns from recv(), never runs release_session_connection(), and the
+// session's connection reference is then held forever, so the COW overlay and
+// the golden image are never handed back. shutdown(SD_BOTH) makes recv()
+// return promptly instead, and the owner does its own teardown -- erase from
+// client_sockets_, then close -- inside SocketGuard.
+//
+// The membership test runs under that same lock, and it is what makes the
+// shutdown safe: SocketGuard erases *before* it closes, so a handle that has
+// already been freed is no longer in the set. Without the test, active_socket()
+// could be read one instant before the owner retires the handle and shutdown()
+// one instant after Windows hands that value to an unrelated connection --
+// severing a socket that has nothing to do with this session.
+//
+// `keep_sock` is this connection's own handle: waking it would be a no-op at
+// best. Returns false when there was nothing to wake, so callers can keep their
+// per-site reinstatement logging.
+bool IscsiTarget::retire_stale_socket(uintptr_t old_sock, uintptr_t keep_sock) {
+    if (old_sock == ~static_cast<uintptr_t>(0) || old_sock == keep_sock) return false;
+    std::lock_guard<std::mutex> sock_lock(client_sockets_mutex_);
+    if (client_sockets_.find(old_sock) == client_sockets_.end()) return false; // already retired
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    ::shutdown(static_cast<SOCKET>(old_sock), SD_BOTH);
+    return true;
+#else
+    return false;
+#endif
+}
+
 int IscsiTarget::retain_session_connection(const std::shared_ptr<ClientSession>& session) {
     if (!session) return 0;
+    session->retain_connection();
     std::lock_guard<std::mutex> lock(conn_mutex_);
     return ++session_conn_refs_[session->id().value()];
 }
 
 int IscsiTarget::release_session_connection(const std::shared_ptr<ClientSession>& session) {
     if (!session) return 0;
-    std::lock_guard<std::mutex> lock(conn_mutex_);
-    auto it = session_conn_refs_.find(session->id().value());
-    if (it == session_conn_refs_.end()) {
-        return 0;
+    uint32_t remaining = session->release_connection();
+    int target_refs = 0;
+    {
+        std::lock_guard<std::mutex> lock(conn_mutex_);
+        auto it = session_conn_refs_.find(session->id().value());
+        if (it != session_conn_refs_.end()) {
+            if (it->second > 1) {
+                target_refs = --it->second;
+            } else {
+                session_conn_refs_.erase(it);
+                target_refs = 0;
+            }
+        }
     }
-    if (it->second > 1) {
-        return --it->second;
+    if (remaining == 0 && session->has_pending_swap() && session_mgr_) {
+        Logger::default_logger().info("SESSION",
+            "Connections dropped to 0 for " + session->id().value() +
+            ". Executing pending swap to " + session->pending_swap_image_id().value());
+        ImageId new_img = session->pending_swap_image_id();
+        session->clear_pending_swap();
+        (void)session_mgr_->get_or_create_session(
+            session->id(),
+            session->ip(),
+            new_img,
+            session->initiator_iqn()
+        );
     }
-    session_conn_refs_.erase(it);
-    return 0;
+    return target_refs;
 }
 
 int IscsiTarget::session_connection_count(const std::shared_ptr<ClientSession>& session) const noexcept {
@@ -820,6 +1221,14 @@ int IscsiTarget::session_connection_count(const std::shared_ptr<ClientSession>& 
     std::lock_guard<std::mutex> lock(conn_mutex_);
     auto it = session_conn_refs_.find(session->id().value());
     return it == session_conn_refs_.end() ? 0 : it->second;
+}
+
+bool IscsiTarget::mark_log_once(const std::string& client_id, uint32_t bit) {
+    std::lock_guard<std::mutex> stage_lock(stage_mutex_);
+    uint32_t& flags = first_log_flags_[client_id];
+    const bool first_time = (flags & bit) == 0;
+    flags |= bit;
+    return first_time;
 }
 
 void IscsiTarget::run_accept_loop() {
@@ -925,6 +1334,35 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
 #if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
     SOCKET s = static_cast<SOCKET>(client_sock);
 
+    // Entry stamp. A connection that never sees a PDU used to leave nothing
+    // but silence behind, which is indistinguishable from a worker stuck
+    // before recv(); this lets the close log say how long the worker really
+    // spent in the read path.
+    const auto conn_start = std::chrono::steady_clock::now();
+
+    // Socket Configuration: TCP_NODELAY = 1, SO_SNDBUF & SO_RCVBUF = 262144 (256 KiB)
+    int nodelay = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    int sndbuf = 262144; // 256 KiB
+    int rcvbuf = 262144; // 256 KiB
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+
+    // Enable TCP Keep-Alive
+    int keepalive = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&keepalive), sizeof(keepalive));
+
+    // Set aggressive Win32 keep-alive timings (detect dead clients in seconds, not hours)
+    struct tcp_keepalive settings{};
+    settings.onoff = 1;
+    settings.keepalivetime = 5000;    // 5 seconds idle before probing
+    settings.keepaliveinterval = 1000; // 1 second retry interval
+    DWORD bytes_returned = 0;
+    if (WSAIoctl(s, SIO_KEEPALIVE_VALS, &settings, sizeof(settings), NULL, 0, &bytes_returned, NULL, NULL) == 0) {
+        Logger::default_logger().info("iSCSI",
+            "[iSCSI TCP] Keepalive armed: idle=5s interval=1s (PHY renegotiation guard)");
+    }
+
     // Publish this socket so shutdown() can interrupt blocking recv()/send()
     // on it. Registered before any I/O; unregistered + closed exactly once by
     // the guard below (normal return *and* exception path), under the same lock
@@ -933,27 +1371,114 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
         std::lock_guard<std::mutex> sock_lock(client_sockets_mutex_);
         client_sockets_.insert(client_sock);
     }
+    // `session` is *authorization*: bound only once the login has resolved an
+    // authorized client, and only that binding lets the fail-closed gate below
+    // pass. `socket_owner` is *ownership*: whichever session this frame has
+    // claimed `client_sock` for -- claimed as early as accept() when a session
+    // for this peer IP is already sitting in its disconnect grace window.
+    //
+    // Both sit above SocketGuard, which is constructed after them and is
+    // therefore destroyed first: the guard can still read them, so the handle
+    // and the session's claim on it are released together in a single step on
+    // every exit path, exceptions included.
+    std::shared_ptr<ClientSession> session;
+    std::shared_ptr<ClientSession> socket_owner;
+
     struct SocketGuard {
         IscsiTarget* self;
         uintptr_t handle;
         SOCKET sock;
+        std::shared_ptr<ClientSession>* owner;
         ~SocketGuard() {
             std::lock_guard<std::mutex> sock_lock(self->client_sockets_mutex_);
             auto it = self->client_sockets_.find(handle);
             if (it != self->client_sockets_.end()) {
                 self->client_sockets_.erase(it);
                 closesocket(sock);
+                // The handle value is back in Windows' pool and may already be
+                // the next connection's socket, so the session must stop
+                // claiming it here: active_socket() is exactly what the next
+                // reinstatement reads to decide which socket to retire, and
+                // retiring a recycled value would shutdown() a connection that
+                // has nothing to do with this session.
+                if (owner && *owner) {
+                    (void)(*owner)->release_active_socket(handle);
+                }
             }
         }
-    } socket_guard{this, client_sock, s};
+    } socket_guard{this, client_sock, s, &socket_owner};
     (void)socket_guard;
+
+    // The one place a socket claim is taken, so claim and ownership are always
+    // recorded together and SocketGuard can always give the claim back. It is
+    // safe to call repeatedly (each Login Request re-confirms), and it releases
+    // the previous session's claim if this frame ever adopts a different one.
+    auto claim_socket = [&](const std::shared_ptr<ClientSession>& sess) {
+        if (!sess) return;
+        if (socket_owner && socket_owner != sess) {
+            (void)socket_owner->release_active_socket(client_sock);
+        }
+        socket_owner = sess;
+        sess->set_active_socket(client_sock);
+    };
 
     Logger::default_logger().info("BOOT", "[BOOT STAGE 11] iSCSI TCP connection received: Client=" + client_ip.ip_string() + ":" + std::to_string(client_ip.port()));
 
-    std::shared_ptr<ClientSession> session;
+    // Dispatch is unconditional: run_accept_loop() spawns a worker for every
+    // accept() and this read loop is entered whatever the session state says.
+    // The reconnect work therefore happens *here*, up front, rather than only
+    // once a Login Request happens to arrive: wake the socket the session is
+    // still bound to, revive the session out of Disconnected, bind this socket
+    // to it, and say so in the log.
+    //
+    // Authorization is untouched by any of this: `session` stays null until
+    // resolve_session() runs on the first Login Request, and the fail-closed
+    // gate is still the only thing that decides whether a LUN is exposed.
+    if (session_mgr_) {
+        if (auto existing_session = session_mgr_->find_session_by_ip(client_ip)) {
+            const bool was_disconnected = existing_session->is_disconnected();
+            const auto gone_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - existing_session->disconnect_time()).count();
+
+            const uintptr_t old_sock = existing_session->active_socket();
+            const bool woke_old = retire_stale_socket(old_sock, client_sock);
+
+            existing_session->set_state(ClientState::Online);
+            existing_session->ensure_storage_ready();
+            claim_socket(existing_session);
+
+            Logger::default_logger().info("iSCSI",
+                std::string("[SESSION REINSTATEMENT] Peer ") + client_ip.ip_string() +
+                " reconnected while session [" + existing_session->id().value() + "] was " +
+                (was_disconnected
+                    ? ("Disconnected for " + std::to_string(gone_ms) + "ms")
+                    : std::string(to_string(existing_session->state()))) +
+                ". Revived to Online, bound to socket " + std::to_string(client_sock) +
+                (woke_old ? (", woke stale socket " + std::to_string(old_sock)) : std::string()) +
+                ". Entering the Login read loop.");
+        }
+    }
+
+    // Brackets the only two locks taken between accept() and recv(): the session
+    // manager's mutex (find_session_by_ip) and client_sockets_mutex_
+    // (registration + retire_stale_socket). A non-trivial duration here means a
+    // lock blocked the worker before it ever reached the loop; a small one plus
+    // a following "[DEBUG] ... Worker reading from socket" line means it did not.
+    {
+        const auto dispatch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - conn_start).count();
+        Logger::default_logger().info("iSCSI",
+            "[DEBUG] [iSCSI] Dispatch for client " + client_ip.ip_string() +
+            ": session lookup and socket registration done in " +
+            std::to_string(dispatch_ms) + "ms; no session-state gate on dispatch");
+    }
+
     std::string initiator_name;
     std::string target_name;
     std::string client_mac;
+    // Why session resolution was refused (fail-closed login reporting only).
+    // Empty while the connection is (or may still become) authorized.
+    std::string session_deny_reason;
 
     auto resolve_session = [&](const std::string& init_name, const std::string& tgt_name) {
         if (session) {
@@ -965,8 +1490,17 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
             }
             return;
         }
+        session_deny_reason.clear();
         ClientId cid;
         std::string resolved_img;
+
+        // Identity step 1: a MAC embedded in the Initiator IQN (iPXE-style
+        // "...:00:11:22:33:44:aa"). Windows' msiscsi sends a generated IQN
+        // with no MAC at all -> empty, and resolution falls through to the
+        // peer-IP based lookups below.
+        if (client_mac.empty()) {
+            client_mac = extract_mac_from_initiator(init_name);
+        }
 
         // First, try to resolve the client MAC from DHCP lease table using the incoming IP.
         // This handles the case where the client got a dynamic IP via DHCP instead of its static IP.
@@ -978,7 +1512,14 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
             }
         }
 
-        // If we found a MAC via DHCP lease, try to get the station record
+        // Direct StationManager lookup by client IP if MAC was not found via DHCP
+        if (client_mac.empty() && station_manager_) {
+            if (auto st_by_ip = station_manager_->find_by_ip(client_ip); st_by_ip.has_value()) {
+                client_mac = st_by_ip->mac;
+            }
+        }
+
+        // If we found a MAC via DHCP lease or StationManager IP, get the station record
         if (!client_mac.empty() && station_manager_) {
             if (auto st = station_manager_->find_by_mac(client_mac); st.has_value()) {
                 cid = ClientId(st->mac);
@@ -1013,6 +1554,26 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     }
                 }
             }
+            // Identity step 2: no MAC anywhere (generated msiscsi IQN, no
+            // DHCP lease, no client record) -- look the session up by the
+            // incoming TCP peer IP and re-attach to it (and its existing
+            // wb_<cleanmac>.cow) instead of minting a separate ip_-keyed
+            // session for the same machine.
+            if (cid.value().empty() && session_mgr_ && client_mac.empty()) {
+                if (auto existing = session_mgr_->find_session_by_ip(client_ip)) {
+                    Logger::default_logger().info("iSCSI",
+                        "[iSCSI] Peer " + client_ip.ip_string() + " re-attached to existing session [" +
+                        existing->id().value() + "] by IP (InitiatorName='" + init_name +
+                        "' carries no MAC). Reusing its writeback overlay.");
+                    cid = existing->id();
+                    if (overlay_naming::looks_like_mac(existing->id().value())) {
+                        client_mac = existing->id().value();
+                    }
+                    if (resolved_img.empty()) {
+                        resolved_img = existing->os_image_id().value();
+                    }
+                }
+            }
             if (cid.value().empty()) {
                 cid = ClientId("ip_" + client_ip.ip_string());
             }
@@ -1041,6 +1602,8 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 resolved_img = config_.default_os_image_id.value();
             } else {
                 // No default image configured anywhere - reject unknown client
+                session_deny_reason =
+                    "no OS image assigned for client " + client_mac + " and no default OS image configured";
                 Logger::default_logger().error("iSCSI", "[FATAL] [iSCSI] No image assigned for client " + client_mac + " (" + client_ip.ip_string() + ") and no default OS image configured. Rejecting iSCSI login.");
                 return; // Abort connection - no session created, login will fail
             }
@@ -1051,17 +1614,32 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
             if (sess_res.is_ok()) {
                 session = sess_res.value();
                 session->set_state(ClientState::Online);
-                // This is the only place `session` is ever assigned, and the lambda
-                // returns early once it is set, so the connection is retained exactly
-                // once per TCP connection -- including when a second connection is
-                // handed back the session a previous connection already created.
+                // Adopting: claim this connection's socket and restart the
+                // idle clock. get_or_create_session() can hand back a session a
+                // previous connection created, whose last_scsi_time() predates
+                // this TCP connection -- without the re-clock the first recv
+                // timeout here would be judged against that history.
+                //
+                // This lambda returns early once `session` is set, so it
+                // retains exactly once per TCP connection; the two
+                // reinstatement branches above are guarded the same way. One
+                // reference in, one reference back out in the epilogue.
+                claim_socket(session);
+                session->note_connection_bound();
                 (void)retain_session_connection(session);
                 if (client_mac.empty() && session) {
                     client_mac = session->id().value();
                 }
             } else {
+                // Fail-closed: record why, so the login handler can answer the
+                // initiator with an explicit rejection instead of proceeding
+                // session-less (or worse, exposing discovery answers).
+                session_deny_reason =
+                    "session/COW overlay refused: " + sess_res.error().to_string();
                 Logger::default_logger().error("iSCSI", "[ERROR] [iSCSI] Failed to resolve/create session for client: " + sess_res.error().to_string());
             }
+        } else {
+            session_deny_reason = "no ClientSessionManager configured on this target";
         }
     };
 
@@ -1078,37 +1656,7 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
     // TCP stack sends periodic probes while the Realtek NIC re-negotiates PHY link
     // speed (1.5–2.5s blackout). Without keepalive the first recv() timeout after
     // the blackout returns WSAETIMEDOUT which looks like a dead connection and tears
-    // down the iSCSI session, triggering a 0x7B INACCESSIBLE_BOOT_DEVICE bugcheck.
-    //
-    // SIO_KEEPALIVE_VALS (mstcpip.h) overrides the per-socket keepalive timers
-    // without touching the system-wide registry values (default idle=2h).
-    // Parameters chosen to survive a 2.5s PHY blackout with margin:
-    //   keepalivetime    = 3000 ms  (idle before first probe)
-    //   keepaliveinterval = 1000 ms (interval between probes)
-    // The per-socket probe count is governed by TCP_KEEPCNT (if available).
-    {
-        BOOL ka_on = TRUE;
-        if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
-                       reinterpret_cast<const char*>(&ka_on), sizeof(ka_on)) == 0) {
-            struct tcp_keepalive ka_cfg{};
-            ka_cfg.onoff             = 1;
-            ka_cfg.keepalivetime     = 3000;   // ms idle before first probe
-            ka_cfg.keepaliveinterval = 1000;   // ms between subsequent probes
-            DWORD bytes_returned = 0;
-            if (WSAIoctl(s, SIO_KEEPALIVE_VALS,
-                         &ka_cfg, sizeof(ka_cfg),
-                         nullptr, 0,
-                         &bytes_returned, nullptr, nullptr) == 0) {
-                Logger::default_logger().info("iSCSI",
-                    "[iSCSI TCP] Keepalive armed: idle=3s interval=1s (PHY renegotiation guard)");
-            }
-#ifdef TCP_KEEPCNT
-            DWORD ka_cnt = 60;   // 60 probes × 1s = 60s tolerance
-            setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT,
-                       reinterpret_cast<const char*>(&ka_cnt), sizeof(ka_cnt));
-#endif
-        }
-    }
+
 #endif
 
 
@@ -1117,6 +1665,34 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
     // can spin on a socket we are about to close. Declared before the recv
     // helper below because that lambda captures it by reference.
     bool idle_teardown = false;
+    bool connection_broken = false;
+
+    // This connection's own receive clock, started when the connection starts.
+    // The watchdog measures from here rather than from the session's shared
+    // last_scsi_time:
+    //
+    //   * a reinstated session inherits the socket it replaced. On the shared
+    //     clock the brand-new connection reads "idle for 112538ms" a few
+    //     hundred milliseconds after the login completed and is closed before
+    //     it has moved a single byte, leaving the initiator spinning on
+    //     unacknowledged I/O;
+    //   * the shared clock is written by every connection attached to the
+    //     session, so one live socket would mask a dead one -- or, right after
+    //     a rebind, the other way around.
+    //
+    // Starting at now() is also the grace period the watchdog needs: `elapsed`
+    // can never exceed this connection's own age, so a connection younger than
+    // any grace window -- reinstated or not -- can never be judged on history
+    // it did not participate in.
+    auto last_rx = std::chrono::steady_clock::now();
+
+    // Counts recv() timeouts on this connection. A worker that reaches recv()
+    // but whose initiator never sends used to be indistinguishable in the log
+    // from one stuck before recv(): the timeout branch below was silent
+    // whenever `session` was still null, which is exactly the pre-login window
+    // where a reconnect goes wrong. Bounded reporting (first, then every 10th
+    // ~= 5s) keeps the reconnect loop from flooding the log.
+    uint32_t recv_timeouts = 0;
 
     auto get_client_tag = [&]() -> std::string {
         if (!client_mac.empty()) return client_mac;
@@ -1128,14 +1704,15 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
         char* p = static_cast<char*>(dest);
         size_t total = 0;
         while (total < len && running_) {
-            if (idle_teardown) {
+            if (idle_teardown || connection_broken) {
                 return -1;
             }
             int r = recv(s, p + total, static_cast<int>(len - total), 0);
             if (r > 0) {
                 total += static_cast<size_t>(r);
+                last_rx = std::chrono::steady_clock::now();
                 if (session) {
-                    session->set_last_scsi_time(std::chrono::steady_clock::now());
+                    session->set_last_scsi_time(last_rx);
                     session->set_watchdog_warned(false);
                 }
             } else if (r == 0) {
@@ -1144,7 +1721,7 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 Logger::default_logger().info("iSCSI", "[iSCSI TCP] Client [" + tag + "] disconnected cleanly (TCP FIN received).");
                 if (session) {
                     auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - session->last_scsi_time()).count();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rx).count();
                     if (elapsed >= 3000) {
                         Logger::default_logger().warn("WATCHDOG",
                             "[WATCHDOG] Client [" + tag + "] silent for 3000ms. Last active LBA: " + std::to_string(session->last_active_lba()) +
@@ -1156,9 +1733,20 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 int err = WSAGetLastError();
                 if (err == WSAETIMEDOUT) {
                     // Socket timed out while waiting for next PDU/data chunk
+                    ++recv_timeouts;
+                    if (recv_timeouts == 1 || (recv_timeouts % 10) == 0) {
+                        const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - last_rx).count();
+                        Logger::default_logger().info("iSCSI",
+                            "[DEBUG] [iSCSI] recv timeout #" + std::to_string(recv_timeouts) +
+                            " on socket " + std::to_string(client_sock) + " for client " +
+                            client_ip.ip_string() + " after " + std::to_string(waited_ms) +
+                            "ms with no PDU yet; session " +
+                            (session ? "bound" : "not yet bound") + ".");
+                    }
                     if (session && (session->state() == ClientState::Booting || session->state() == ClientState::Online)) {
                         auto now = std::chrono::steady_clock::now();
-                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - session->last_scsi_time()).count();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rx).count();
 
                         // Idle watchdog teardown: a diskless client that has been
                         // silent this long is gone. Tear its session down so the
@@ -1198,14 +1786,34 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 } else if (err == WSAECONNRESET || err == WSAECONNABORTED) {
                     std::string tag = get_client_tag();
                     Logger::default_logger().warn("iSCSI", "[iSCSI TCP] Client [" + tag + "] connection reset by peer (TCP RST received).");
+                    connection_broken = true;
                     if (session) {
                         auto now = std::chrono::steady_clock::now();
-                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - session->last_scsi_time()).count();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rx).count();
                         if (elapsed >= 3000) {
                             Logger::default_logger().warn("WATCHDOG",
                                 "[WATCHDOG] Client [" + tag + "] silent for 3000ms. Last active LBA: " + std::to_string(session->last_active_lba()) +
                                 " (" + std::to_string(session->last_active_sectors()) + " sectors). TCP Socket Status: Closed");
                         }
+                        // No teardown here, deliberately.
+                        //
+                        // By the time a stale socket's RST arrives the session
+                        // may already have been reinstated onto a replacement
+                        // socket, and it may still have other connections
+                        // attached. mark_disconnected() plus a COW flush from
+                        // whichever socket happened to die first would sever the
+                        // live connection mid-boot and flush the overlay
+                        // underneath its in-flight I/O -- the same failure the
+                        // epilogue's refcount rule at the bottom of this
+                        // function was written to prevent, still live on this
+                        // branch. The epilogue at the bottom of this function
+                        // decides by connection count: the last connection out
+                        // marks the session Disconnected and flushes; anything
+                        // else leaves it running.
+                        //
+                        // Handing the handle over is likewise SocketGuard's job,
+                        // so the erasure-and-close that used to sit here goes
+                        // with it -- one owner for the socket, on every path.
                     }
                     return -1;
                 } else {
@@ -1220,18 +1828,75 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
         return 1;
     };
 
+    // StatSN is per *connection* (RFC 3720 3.2.2.2): status numbering starts
+    // with the first Login Response of the connection and runs until it drops.
+    // It is therefore seeded, not guessed -- the first Login Response reads the
+    // ExpStatSN its request carried and counts on from there, so a fixed 1 can
+    // never land below a counter an earlier connection already carried past.
+    // Everything between the seed and this statement is per-connection too:
+    // `stat_sn` is a local of this worker, so nothing survives a reconnect.
     uint32_t stat_sn = 1;
+    bool stat_sn_seeded = false;
+    auto stamp_login = [&](IscsiBhs& resp, const IscsiBhs& req) {
+        if (!stat_sn_seeded) {
+            stat_sn = wire_expstat_sn(req);
+            stat_sn_seeded = true;
+        }
+        stamp_login_window(resp, req, stat_sn++);
+    };
+    uint8_t last_sense_key = 0;
+    uint8_t last_asc = 0;
 
     // Raised when a PDU could not be written to the socket in full. The connection
     // is dropped rather than continuing on a stream the initiator has already lost
     // sync with, so a partial Data-In can never be mistaken for good data.
-    bool connection_broken = false;
+
+    // Distinguishes the two failure shapes seen on the wire: a connection that
+    // opens and then goes silent until the peer resets it (never a Login
+    // Request in sight) versus one that logged in and then broke. Before this
+    // counter the two were indistinguishable in the log.
+    bool saw_any_pdu = false;
+    uint32_t pdus_handled = 0;
+
+    // Absolute fail-closed login rejection (RFC 3720 10.13): answers with a
+    // Login Response whose Status-Class/Status-Detail live in bytes 36/37 of
+    // the BHS (cdb[4]/cdb[5] in IscsiBhs), after which the caller closes the
+    // TCP socket. A connection that cannot be resolved to an authorized client
+    // session with a mounted sandbox overlay is refused outright -- it must
+    // never see a LUN, and above all never the raw base VHD.
+    //   0x02/0x01 -- Initiator Error / authentication-authorization failure
+    //   0x02/0x02 -- Initiator Error / target forbidden (sandbox not mounted)
+    auto reject_login = [&](const IscsiBhs& req, uint8_t status_class, uint8_t status_detail) {
+        IscsiBhs resp{};
+        resp.opcode = 0x23;                                   // Login Response
+        resp.flags = static_cast<uint8_t>(req.flags & 0x0Cu); // CSG echoed, T=0: no transit
+        resp.initiator_task_tag = req.initiator_task_tag;
+        resp.lun = req.lun;   // ISID echoed; TSIH stays 0 (no session was granted)
+        reinterpret_cast<uint8_t*>(&resp.lun)[6] = 0x00;
+        reinterpret_cast<uint8_t*>(&resp.lun)[7] = 0x00;
+        stamp_login(resp, req);
+        resp.cdb[4] = status_class;   // byte 36: Status-Class
+        resp.cdb[5] = status_detail;  // byte 37: Status-Detail
+        (void)send_all(s, &resp, sizeof(resp));
+    };
+
+    // Emitted at Info rather than via Logger::debug(): the default min level is
+    // Info, so a debug() here would be silently dropped -- and a dropped marker
+    // cannot tell us whether the worker ever reached recv(). This is the line
+    // that separates "blocked on a mutex before the loop" from "in recv(), PDU
+    // never arrived": if it appears and no recv-timeout line follows, the
+    // worker never entered the loop at all.
+    Logger::default_logger().info("iSCSI",
+        "[DEBUG] [iSCSI] Worker reading from socket " + std::to_string(client_sock) +
+        " for client " + client_ip.ip_string() + " (waiting for the first PDU)");
 
     while (running_) {
         IscsiBhs bhs{};
         if (read_exact_with_watchdog(&bhs, sizeof(IscsiBhs)) <= 0) {
             break;
         }
+        saw_any_pdu = true;
+        pdus_handled++;
 
         if (session) {
             session->set_last_scsi_time(std::chrono::steady_clock::now());
@@ -1254,6 +1919,22 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
         if (!session && opcode != 0x03) {
             // Initiator skipped (or has not finished) the login sequence.
             resolve_session(initiator_name, target_name);
+            if (!session) {
+                // Fail-closed: an unauthenticated connection must never reach
+                // the SCSI command path -- even the discovery fallbacks
+                // (Inquiry/ReportLUNs/ReadCapacity) answer without a session.
+                const std::string why = session_deny_reason.empty()
+                    ? std::string("peer does not resolve to an authorized session")
+                    : session_deny_reason;
+                std::ostringstream op_hex;
+                op_hex << "0x" << std::hex << std::uppercase
+                       << static_cast<int>(opcode);
+                Logger::default_logger().error("iSCSI",
+                    "[FATAL] [iSCSI] Closing connection from " + client_ip.ip_string() +
+                    ": PDU opcode " + op_hex.str() + " arrived before a successful login (" +
+                    why + "). No LUN is exposed.");
+                break;
+            }
         }
 
         if (opcode == 0x03) { // Login Request
@@ -1266,7 +1947,144 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
             if (it_tgt != params.end()) {
                 target_name = it_tgt->second;
             }
-            resolve_session(initiator_name, target_name);
+            // RFC 3720 Section 5.3.5 / Section 10.12: Extract ISID from BHS (bytes 8..13)
+            uint64_t req_isid = extract_isid(bhs);
+            std::string isid_key;
+            if (!initiator_name.empty()) {
+                char isid_buf[32];
+                std::snprintf(isid_buf, sizeof(isid_buf), "%012llX", static_cast<unsigned long long>(req_isid));
+                isid_key = initiator_name + "#" + isid_buf;
+            }
+
+            // Session Reinstatement Check (RFC 3720 Section 5.3.5)
+            // If an active session exists matching (InitiatorName, ISID), do NOT reject or spawn duplicate.
+            // Wake the old socket so its worker lets go of the handle and its
+            // connection reference, then rebind this connection onto the session.
+            if (!isid_key.empty()) {
+                std::lock_guard<std::mutex> r_lock(reinstatement_mutex_);
+                auto it = sessions_by_isid_.find(isid_key);
+                if (it != sessions_by_isid_.end() && it->second) {
+                    auto existing_session = it->second;
+                    // A login exchange is several Login Requests sharing one
+                    // ISID, so this branch runs once per PDU rather than once
+                    // per connection. Adopting -- and therefore retaining --
+                    // only when no session is bound yet is what keeps the
+                    // "exactly one reference per TCP connection" contract: doing
+                    // it unconditionally leaked a reference on every extra
+                    // Login Request, the epilogue could never drive the count
+                    // back to zero, and the session plus its COW overlay were
+                    // then never released.
+                    const bool first_binding = (session == nullptr);
+                    const uintptr_t old_sock = existing_session->active_socket();
+                    if (retire_stale_socket(old_sock, client_sock)) {
+                        Logger::default_logger().warn("iSCSI",
+                            "[SESSION REINSTATEMENT] RFC 3720 §5.3.5: Active session [" + existing_session->id().value() +
+                            "] found for Initiator='" + initiator_name + "' ISID=" + isid_key +
+                            " with stale socket " + std::to_string(old_sock) +
+                            ". Waking the dead connection and reinstating.");
+                    }
+                    session = existing_session;
+                    claim_socket(session);
+                    session->set_state(ClientState::Online);
+                    session->ensure_storage_ready();
+                    if (first_binding) {
+                        (void)retain_session_connection(session);
+                        // The silence belonged to the socket being replaced;
+                        // this connection starts its own clock here.
+                        session->note_connection_bound();
+                        Logger::default_logger().info("iSCSI",
+                            "[SESSION REINSTATEMENT] Rebound existing session [" + session->id().value() +
+                            "] and COW overlay to socket " + std::to_string(client_sock));
+                    }
+                }
+            }
+
+            if (!session && session_mgr_) {
+                std::lock_guard<std::mutex> r_lock(reinstatement_mutex_);
+                if (auto existing_session = session_mgr_->find_session_by_ip(client_ip)) {
+                    const uintptr_t old_sock = existing_session->active_socket();
+                    if (retire_stale_socket(old_sock, client_sock)) {
+                        Logger::default_logger().warn("iSCSI",
+                            "[SESSION REINSTATEMENT] Active session [" + existing_session->id().value() +
+                            "] found for IP=" + client_ip.ip_string() + " with stale socket " +
+                            std::to_string(old_sock) + ". Waking the dead connection and reinstating.");
+                    }
+                    // Guarded by `!session`, so this is the first -- and only --
+                    // time this connection adopts a session: take the single
+                    // reference the epilogue will give back, and start the idle
+                    // clock from now instead of from the socket that went away.
+                    session = existing_session;
+                    claim_socket(session);
+                    session->set_state(ClientState::Online);
+                    session->ensure_storage_ready();
+                    (void)retain_session_connection(session);
+                    session->note_connection_bound();
+                    Logger::default_logger().info("iSCSI",
+                        "[SESSION REINSTATEMENT] Rebound existing session [" + session->id().value() +
+                        "] and COW overlay to socket " + std::to_string(client_sock));
+                }
+            }
+
+            if (!session) {
+                resolve_session(initiator_name, target_name);
+            }
+
+            if (session) {
+                // Re-confirm the binding on every Login Request. Nothing to
+                // retain or to re-clock here: both happened at first binding
+                // above, and doing them again on each PDU of the same login
+                // exchange is what leaked the connection reference.
+                const uintptr_t old_sock = session->active_socket();
+                if (retire_stale_socket(old_sock, client_sock)) {
+                    Logger::default_logger().warn("iSCSI",
+                        "[SESSION REINSTATEMENT] Rebinding session [" + session->id().value() +
+                        "] from old socket " + std::to_string(old_sock) + " to new socket " + std::to_string(client_sock));
+                }
+                claim_socket(session);
+                session->set_isid(req_isid);
+                session->set_state(ClientState::Online);
+                session->ensure_storage_ready();
+                if (!isid_key.empty()) {
+                    // Published under the same lock the lookup reads it under.
+                    // The scope ends here, before the Login Response is sent:
+                    // no lock is ever held across a send() or a recv(), so a
+                    // connection cannot queue behind a peer that is itself
+                    // blocked on I/O.
+                    std::lock_guard<std::mutex> r_lock(reinstatement_mutex_);
+                    sessions_by_isid_[isid_key] = session;
+                }
+            }
+
+            // ---- ABSOLUTE FAIL-CLOSED LOGIN GATE (security invariant) -----
+            // The connection proceeds ONLY when it resolved to an authorized
+            // client session whose Tier 1 writeback overlay is mounted. Anything
+            // else (unidentified initiator, refused session/COW creation, or a
+            // non-super session without a mounted overlay) gets an explicit
+            // Login Response failure and the socket is closed immediately. A raw
+            // base LUN is never served to an unidentified or un-sandboxed
+            // initiator.
+            if (!session) {
+                const std::string why = session_deny_reason.empty()
+                    ? ("unresolvable initiator (InitiatorName='" + initiator_name +
+                       "', TargetName='" + target_name + "')")
+                    : session_deny_reason;
+                Logger::default_logger().error("iSCSI",
+                    "[FATAL] [iSCSI] LOGIN REJECTED for " + client_ip.ip_string() +
+                    ": " + why + ". Closing connection; no LUN is exposed.");
+                reject_login(bhs, 0x02 /* Initiator Error */,
+                             0x01 /* authentication/authorization failure */);
+                break;
+            }
+            if (!session->is_super_client() && !session->cow_block_device() && !session->tiered_device()) {
+                Logger::default_logger().error("iSCSI",
+                    "[FATAL] [iSCSI] LOGIN REJECTED for " + client_ip.ip_string() +
+                    ": session [" + session->id().value() +
+                    "] has no mounted Tier 1 writeback overlay (wb_<mac>.cow failed to mount). "
+                    "Closing connection; the base image is never served raw.");
+                reject_login(bhs, 0x02 /* Initiator Error */,
+                             0x02 /* target forbidden: sandbox not mounted */);
+                break;
+            }
 
             // Dynamic target resolution log (no hardcoded image paths):
             // the VHD below is resolved from the active image set in config.json
@@ -1284,17 +2102,55 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
 
             IscsiBhs resp{};
             resp.opcode = 0x23; // Login Response
-            resp.flags = static_cast<uint8_t>(0x80 | (bhs.flags & 0x0C) | 0x03); // Transit to Full Feature phase (T=1, NSG=3)
+
+            // RFC 3720 10.12.3: NSG is only meaningful when the request's T bit
+            // is set; otherwise it is reserved. And 5.3.1 defines a *final*
+            // accept as T=1 with NSG=FullFeaturePhase in BOTH PDUs -- anything
+            // else is a partial response that keeps the Login Phase going.
+            //
+            // This used to be an unconditional "T=1, NSG=3" on every request.
+            // That is a legal answer only when the initiator also offered
+            // NSG=3. msiscsi routinely offers T=0 (still negotiating) or
+            // NSG=1 (wants the operational stage next); answering either with
+            // a jump to Full Feature is a protocol violation it recovers from
+            // by resetting the TCP connection, which is exactly the login ->
+            // RST 211ms later seen on the wire. iPXE never noticed because it
+            // offers NSG=3 on its first PDU, so the bug only ever hit Windows.
+            const bool req_transit = (bhs.flags & 0x80) != 0;
+            // CSG lives in byte 1 bits 4-5 (masks 0x08|0x04) and NSG in bits
+            // 6-7 (0x02|0x01), both MSB-first per RFC 3720 10.12's Byte Rule,
+            // so the field value is (flags & mask) >> 2 for a two-bit field.
+            const uint8_t req_csg = static_cast<uint8_t>((bhs.flags & 0x0C) >> 2);
+            uint8_t req_nsg = static_cast<uint8_t>(bhs.flags & 0x03);
+            if (req_nsg == 2) {
+                req_nsg = 0; // NSG=2 is Reserved (10.12.6): never echo it back.
+            }
+            const bool final_accept = req_transit && req_nsg == 3;
+            if (req_transit && req_csg == 0 && req_nsg == 1) {
+                resp.flags = 0x81; // T=1, CSG=0, NSG=1 (Security -> Operational)
+            } else if (req_transit && req_csg == 1 && req_nsg == 3) {
+                resp.flags = 0x87; // T=1, CSG=1, NSG=3 (Operational -> Full Feature)
+            } else {
+                resp.flags = static_cast<uint8_t>(
+                    (req_transit ? 0x80u : 0x00u) | (bhs.flags & 0x0Cu) |
+                    (req_transit ? req_nsg : 0x00u));
+            }
             resp.initiator_task_tag = bhs.initiator_task_tag;
-            resp.cmd_sn = stat_sn++;
-            resp.exp_stat_sn = bhs.cmd_sn + 1;
-            // Echo ISID and return valid non-zero TSIH (RFC 3720 Section 10.13.5)
+            // The Login Phase has its own window (RFC 3720 10.13.5): StatSN
+            // seeded from this request, ExpCmdSN confirming *this* request's
+            // CmdSN rather than CmdSN+1, MaxCmdSN counted from the same base.
+            stamp_login(resp, bhs);
+            // Echo ISID and set TSIH strictly per RFC 3720 Sections 10.13.3 & 10.13.5:
+            // TSIH MUST be 0 in all intermediate Login Response PDUs (T=0 or NSG!=3),
+            // and MUST be non-zero ONLY in the Login Final-Response (T=1 and NSG=3).
             resp.lun = bhs.lun;
             reinterpret_cast<uint8_t*>(&resp.lun)[6] = 0x00;
-            reinterpret_cast<uint8_t*>(&resp.lun)[7] = 0x01; // TSIH = 1
+            reinterpret_cast<uint8_t*>(&resp.lun)[7] = final_accept ? 0x01 : 0x00;
 
-            Logger::default_logger().info("BOOT", "[BOOT STAGE 12] iSCSI login completed: Initiator='" + initiator_name +
-                         "' Target='" + config_.target_iqn + "' ClientSession=" + (session ? session->id().value() : "unknown"));
+            if (final_accept) {
+                Logger::default_logger().info("BOOT", "[BOOT STAGE 12] iSCSI login completed: Initiator='" + initiator_name +
+                             "' Target='" + config_.target_iqn + "' ClientSession=" + (session ? session->id().value() : "unknown"));
+            }
 
             std::string phys_path = (session && !session->physical_image_path().empty())
                                         ? session->physical_image_path().string()
@@ -1304,33 +2160,107 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
             Logger::default_logger().info("iSCSI", "[iSCSI] Client [" + client_ip.ip_string() + "/" +
                 log_mac + "] requested target: " + log_tgt + " -> Bound to physical image: " + phys_path);
 
-            if (data_seg_len > 0) {
-                auto resp_params = build_login_response_parameters(params);
-                uint32_t r_len = static_cast<uint32_t>(resp_params.size());
+            // RFC 3720 5.3.1: TargetPortalGroupTag is the target's confirmation
+            // during connection establishment, and it is owed on every stage
+            // transition -- even one the initiator sent with no parameters of
+            // its own. So the text segment comes back both when the initiator
+            // proposed keys and when it transited with none.
+            const bool wants_text = (data_seg_len > 0) || req_transit;
+            std::vector<uint8_t> resp_params;
+            if (wants_text) {
+                // The offered stage decides which keys may legally appear in
+                // the answer: security keys while CSG=0, operational keys once
+                // the initiator has reached CSG=1 (or is skipping straight to
+                // Full Feature). Handing MaxBurstLength/InitialR2T back inside
+                // a SecurityNegotiation PDU is an irreverent-key violation that
+                // a strict initiator rejects the login over.
+                //
+                // TargetName is deliberately absent from every stage: RFC 3720
+                // 12.4 forbids redeclaring it within the login phase, and the
+                // confirmation 5.3.1 actually asks for is the portal group tag.
+                resp_params = build_login_response_parameters(params, req_csg, final_accept);
+                const uint32_t r_len = static_cast<uint32_t>(resp_params.size());
                 resp.data_seg_len[0] = static_cast<uint8_t>((r_len >> 16) & 0xFF);
                 resp.data_seg_len[1] = static_cast<uint8_t>((r_len >> 8) & 0xFF);
                 resp.data_seg_len[2] = static_cast<uint8_t>(r_len & 0xFF);
+            }
 
-                send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
-                if (r_len > 0) {
-                    send(s, reinterpret_cast<const char*>(resp_params.data()), resp_params.size(), 0);
-                    uint32_t pad = (4 - (r_len % 4)) % 4;
-                    if (pad > 0) {
-                        const char pad_bytes[4] = {0};
-                        send(s, pad_bytes, pad, 0);
-                    }
+            // Log both halves of the negotiation. "Offered" is what the
+            // initiator proposed; "sent" is what we actually said. The old line
+            // named only the first, so a leaky response and a clean one looked
+            // identical from the log -- the exact ambiguity this line exists to
+            // settle on the next boot.
+            {
+                std::string offered_keys;
+                for (const auto& kv : params) {
+                    offered_keys += (offered_keys.empty() ? "" : ",") + kv.first;
                 }
-            } else {
-                send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
+                std::string sent_keys;
+                for (size_t i = 0; i < resp_params.size();) {
+                    size_t j = i;
+                    while (j < resp_params.size() && resp_params[j] != 0) ++j;
+                    const std::string kv(
+                        reinterpret_cast<const char*>(resp_params.data() + i), j - i);
+                    const size_t eq = kv.find('=');
+                    if (eq != std::string::npos) {
+                        sent_keys += (sent_keys.empty() ? "" : ",") + kv.substr(0, eq);
+                    }
+                    i = j + 1;
+                }
+                Logger::default_logger().info("iSCSI",
+                    "[iSCSI] Login PDU T=" + std::to_string(req_transit ? 1 : 0) +
+                    " CSG=" + std::to_string(req_csg) + " NSG=" + std::to_string(req_nsg) +
+                    " -> replying T=" + std::to_string((resp.flags & 0x80) ? 1 : 0) +
+                    " CSG=" + std::to_string((resp.flags & 0x0C) >> 2) +
+                    " NSG=" + std::to_string(resp.flags & 0x03) +
+                    " (" + std::to_string(resp_params.size()) + " bytes, offered keys: " +
+                    (offered_keys.empty() ? "none" : offered_keys) +
+                    "; sent keys: " + (sent_keys.empty() ? "none" : sent_keys) + ")");
+            }
+
+            // Coalesce Login Response PDU into a single contiguous segment
+            // (BHS + padded text segment) to prevent TCP packet fragmentation.
+            const uint32_t r_len = (wants_text && !resp_params.empty()) ? static_cast<uint32_t>(resp_params.size()) : 0;
+            const uint32_t pad = r_len ? ((4 - (r_len % 4)) % 4) : 0;
+            const size_t total_pdu_len = sizeof(IscsiBhs) + r_len + pad;
+            std::vector<uint8_t> pdu_packet(total_pdu_len, 0);
+            std::memcpy(pdu_packet.data(), &resp, sizeof(IscsiBhs));
+            if (r_len > 0) {
+                std::memcpy(pdu_packet.data() + sizeof(IscsiBhs), resp_params.data(), r_len);
+            }
+            if (!send_all(s, pdu_packet.data(), total_pdu_len)) {
+                connection_broken = true;
+                break;
             }
         } else if (opcode == 0x06) { // Logout Request
+            Logger::default_logger().info("iSCSI",
+                "[iSCSI] Logout Request received from " + client_ip.ip_string() +
+                (session ? (" for session [" + session->id().value() + "]") : "") +
+                ". Flushing writeback overlay; retaining COW state within reboot grace window.");
             IscsiBhs resp{};
             resp.opcode = 0x26; // Logout Response
             resp.flags = 0x80;
             resp.initiator_task_tag = bhs.initiator_task_tag;
-            resp.cmd_sn = stat_sn++;
-            resp.exp_stat_sn = bhs.cmd_sn + 1;
+            stamp_command_window(resp, bhs, stat_sn++);
             send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
+            if (session) {
+                if (session->cow_block_device()) {
+                    auto fl_res = session->cow_block_device()->flush();
+                    if (!fl_res.is_ok()) {
+                        Logger::default_logger().error("iSCSI",
+                            "[iSCSI] Failed to drain writeback overlay on logout for [" +
+                            get_client_tag() + "]: " + fl_res.error().to_string());
+                    }
+                }
+                std::lock_guard<std::mutex> r_lock(reinstatement_mutex_);
+                for (auto it = sessions_by_isid_.begin(); it != sessions_by_isid_.end(); ) {
+                    if (it->second == session) {
+                        it = sessions_by_isid_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             break;
         } else if (opcode == 0x00 || opcode == 0x1C) { // NOP-Out (Ping)
             if (bhs.initiator_task_tag != 0xFFFFFFFF) {
@@ -1338,9 +2268,23 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 resp.opcode = 0x20; // NOP-In
                 resp.flags = 0x80;
                 resp.initiator_task_tag = bhs.initiator_task_tag;
-                resp.cmd_sn = stat_sn++;
-                resp.exp_stat_sn = bhs.cmd_sn + 1;
+                stamp_command_window(resp, bhs, stat_sn++);
                 send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
+            }
+        } else if (opcode == 0x02) { // Task Management Function Request
+            uint8_t tmf_func = bhs.flags & 0x7F;
+            Logger::default_logger().info("iSCSI", "[iSCSI TMF] Task Management Function Request: Func=0x" +
+                to_hex_u8(tmf_func) + " TaskTag=0x" + format_hex_u32(bhs.initiator_task_tag));
+
+            IscsiBhs resp{};
+            resp.opcode = 0x22;   // Task Management Function Response
+            resp.flags = 0x80;    // Reserved / 1
+            resp.rsvd1[0] = 0x00; // Response = 0x00 (Function Complete)
+            resp.initiator_task_tag = bhs.initiator_task_tag;
+            stamp_command_window(resp, bhs, stat_sn++);
+            if (!send_all(s, &resp, sizeof(resp))) {
+                connection_broken = true;
+                break;
             }
         } else if (opcode == 0x01) { // SCSI Command
             uint8_t scsi_op = bhs.cdb[0];
@@ -1350,9 +2294,20 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 req_lun = (bhs.lun & 0xFFFF);
             }
 
-            Logger::default_logger().info("BOOT", "[BOOT STAGE 13] SCSI command received: " + scsi_op_name(scsi_op) +
-                         " (0x" + to_hex_u8(scsi_op) + ") InitiatorTaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
-                         " LUN=" + std::to_string(req_lun));
+            // Fires for every single SCSI command, so the stage line is kept
+            // at INFO only for the first command of the session and demoted
+            // to TRACE after that (see mark_log_once).
+            const std::string& stage13_client = session ? session->id().value()
+                                                        : kNoClientSession;
+            if (mark_log_once(stage13_client, kLogFirstScsiCommand)) {
+                Logger::default_logger().info("BOOT", "[BOOT STAGE 13] SCSI command received: " + scsi_op_name(scsi_op) +
+                             " (0x" + to_hex_u8(scsi_op) + ") InitiatorTaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
+                             " LUN=" + std::to_string(req_lun));
+            } else if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("BOOT", "[BOOT STAGE 13] SCSI command received: " + scsi_op_name(scsi_op) +
+                             " (0x" + to_hex_u8(scsi_op) + ") InitiatorTaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
+                             " LUN=" + std::to_string(req_lun));
+            }
 
             auto target_device = session ? session->get_device_for_lun(req_lun) : nullptr;
 
@@ -1377,6 +2332,12 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 scsi_op != static_cast<uint8_t>(ScsiOpcode::ReportLUNs)) {
                 const uint8_t sense_key = session ? 0x05 : 0x02; // LUN NOT SUPPORTED : NOT READY
                 const uint8_t sense_asc  = session ? 0x25 : 0x04;
+                // The sense also rides in the Response's data segment below,
+                // but the initiator is free to ask again with REQUEST SENSE
+                // after a CHECK CONDITION. Without this that follow-up came
+                // back NO SENSE, which reads as "nothing actually went wrong".
+                last_sense_key = sense_key;
+                last_asc = sense_asc;
                 Logger::default_logger().error("iSCSI", "[ERROR] [iSCSI] SCSI " + scsi_op_name(scsi_op) +
                              " rejected for LUN " + std::to_string(req_lun) + ": " +
                              (session ? "no target device (LUN NOT SUPPORTED)" : "no client session (NOT READY)") +
@@ -1397,8 +2358,7 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 resp.rsvd1[0] = 0x00; // iSCSI response: COMMAND_COMPLETE
                 resp.rsvd1[1] = 0x02; // SCSI status: CHECK CONDITION
                 resp.initiator_task_tag = bhs.initiator_task_tag;
-                resp.cmd_sn = stat_sn++;
-                resp.exp_stat_sn = bhs.cmd_sn + 1;
+                stamp_command_window(resp, bhs, stat_sn++);
                 resp.data_seg_len[0] = 0;
                 resp.data_seg_len[1] = 0;
                 resp.data_seg_len[2] = 20;
@@ -1414,114 +2374,84 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 resp.rsvd1[0] = 0x00; // Command Completed at Target
                 resp.rsvd1[1] = 0x00; // Status: SAM_STAT_GOOD (0x00)
                 resp.initiator_task_tag = bhs.initiator_task_tag;
-                resp.cmd_sn = stat_sn++;
-                resp.exp_stat_sn = bhs.cmd_sn + 1;
-                resp.cdb[0] = 0x00;
-                Logger::default_logger().info("iSCSI", "[iSCSI I/O] TEST UNIT READY TaskTag=0x" +
-                    format_hex_u32(bhs.initiator_task_tag) + " -> Status=GOOD");
+                stamp_command_window(resp, bhs, stat_sn++);
+                // Pure polling heartbeat: the initiator repeats this while
+                // idle, so it never earns an INFO line.
+                if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    Logger::default_logger().trace("iSCSI", "[iSCSI I/O] TEST UNIT READY TaskTag=0x" +
+                        format_hex_u32(bhs.initiator_task_tag) + " -> Status=GOOD");
+                }
                 send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Inquiry)) {
                 std::string sn = client_mac.empty() ? "COB-SAN-00000001" : ("COB-SAN-" + client_mac);
                 auto inq_data = handle_inquiry(bhs.cdb, sn).value();
-
-                IscsiBhs in_bhs{};
-                in_bhs.opcode = 0x25; // SCSI Data-In
-                in_bhs.flags = 0x81;  // Final + Status
-                in_bhs.initiator_task_tag = bhs.initiator_task_tag;
-                in_bhs.cmd_sn = stat_sn++;
-                in_bhs.exp_stat_sn = bhs.cmd_sn + 1;
-                in_bhs.data_seg_len[0] = static_cast<uint8_t>((inq_data.size() >> 16) & 0xFF);
-                in_bhs.data_seg_len[1] = static_cast<uint8_t>((inq_data.size() >> 8) & 0xFF);
-                in_bhs.data_seg_len[2] = static_cast<uint8_t>(inq_data.size() & 0xFF);
-
-                send(s, reinterpret_cast<const char*>(&in_bhs), sizeof(in_bhs), 0);
-                send(s, reinterpret_cast<const char*>(inq_data.data()), inq_data.size(), 0);
-                uint32_t pad = (4 - (inq_data.size() % 4)) % 4;
-                if (pad > 0) {
-                    const char pad_bytes[4] = {0};
-                    send(s, pad_bytes, pad, 0);
+                if (!send_scsi_data_in(s, bhs, stat_sn, inq_data)) {
+                    connection_broken = true;
+                    break;
                 }
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::ReportLUNs)) {
                 uint32_t alloc_len = read_be32(bhs.cdb + 6);
                 auto luns_data = handle_report_luns(session.get(), alloc_len).value();
-
-                IscsiBhs in_bhs{};
-                in_bhs.opcode = 0x25;
-                in_bhs.flags = 0x81;
-                in_bhs.initiator_task_tag = bhs.initiator_task_tag;
-                in_bhs.cmd_sn = stat_sn++;
-                in_bhs.exp_stat_sn = bhs.cmd_sn + 1;
-                in_bhs.data_seg_len[0] = static_cast<uint8_t>((luns_data.size() >> 16) & 0xFF);
-                in_bhs.data_seg_len[1] = static_cast<uint8_t>((luns_data.size() >> 8) & 0xFF);
-                in_bhs.data_seg_len[2] = static_cast<uint8_t>(luns_data.size() & 0xFF);
-
-                send(s, reinterpret_cast<const char*>(&in_bhs), sizeof(in_bhs), 0);
-                send(s, reinterpret_cast<const char*>(luns_data.data()), luns_data.size(), 0);
-                uint32_t pad = (4 - (luns_data.size() % 4)) % 4;
-                if (pad > 0) {
-                    const char pad_bytes[4] = {0};
-                    send(s, pad_bytes, pad, 0);
+                if (!send_scsi_data_in(s, bhs, stat_sn, luns_data)) {
+                    connection_broken = true;
+                    break;
                 }
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::ReadCapacity10)) {
                 uint64_t total_sectors = target_device ? target_device->size() / 512 : 2097152;
                 auto cap_data = handle_read_capacity(total_sectors, 512).value();
-
-                IscsiBhs in_bhs{};
-                in_bhs.opcode = 0x25;
-                in_bhs.flags = 0x81;
-                in_bhs.initiator_task_tag = bhs.initiator_task_tag;
-                in_bhs.cmd_sn = stat_sn++;
-                in_bhs.exp_stat_sn = bhs.cmd_sn + 1;
-                in_bhs.data_seg_len[2] = static_cast<uint8_t>(cap_data.size());
-
-                send(s, reinterpret_cast<const char*>(&in_bhs), sizeof(in_bhs), 0);
-                send(s, reinterpret_cast<const char*>(cap_data.data()), cap_data.size(), 0);
+                if (!send_scsi_data_in(s, bhs, stat_sn, cap_data)) {
+                    connection_broken = true;
+                    break;
+                }
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::ServiceActionIn16) && (bhs.cdb[1] & 0x1F) == 0x10) {
                 uint64_t total_sectors = target_device ? target_device->size() / 512 : 2097152;
                 auto cap_data = handle_read_capacity16(total_sectors, 512).value();
-
-                IscsiBhs in_bhs{};
-                in_bhs.opcode = 0x25;
-                in_bhs.flags = 0x81;
-                in_bhs.initiator_task_tag = bhs.initiator_task_tag;
-                in_bhs.cmd_sn = stat_sn++;
-                in_bhs.exp_stat_sn = bhs.cmd_sn + 1;
-                in_bhs.data_seg_len[2] = static_cast<uint8_t>(cap_data.size());
-
-                send(s, reinterpret_cast<const char*>(&in_bhs), sizeof(in_bhs), 0);
-                send(s, reinterpret_cast<const char*>(cap_data.data()), cap_data.size(), 0);
+                if (!send_scsi_data_in(s, bhs, stat_sn, cap_data)) {
+                    connection_broken = true;
+                    break;
+                }
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::ModeSense6) || scsi_op == static_cast<uint8_t>(ScsiOpcode::ModeSense10)) {
                 auto mode_data = handle_mode_sense(bhs.cdb).value();
-
-                IscsiBhs in_bhs{};
-                in_bhs.opcode = 0x25;
-                in_bhs.flags = 0x81;
-                in_bhs.initiator_task_tag = bhs.initiator_task_tag;
-                in_bhs.cmd_sn = stat_sn++;
-                in_bhs.exp_stat_sn = bhs.cmd_sn + 1;
-                in_bhs.data_seg_len[0] = static_cast<uint8_t>((mode_data.size() >> 16) & 0xFF);
-                in_bhs.data_seg_len[1] = static_cast<uint8_t>((mode_data.size() >> 8) & 0xFF);
-                in_bhs.data_seg_len[2] = static_cast<uint8_t>(mode_data.size() & 0xFF);
-
-                send(s, reinterpret_cast<const char*>(&in_bhs), sizeof(in_bhs), 0);
-                send(s, reinterpret_cast<const char*>(mode_data.data()), mode_data.size(), 0);
-                uint32_t pad = (4 - (mode_data.size() % 4)) % 4;
-                if (pad > 0) {
-                    const char pad_bytes[4] = {0};
-                    send(s, pad_bytes, pad, 0);
+                if (!send_scsi_data_in(s, bhs, stat_sn, mode_data)) {
+                    connection_broken = true;
+                    break;
                 }
-            } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Read10) || scsi_op == static_cast<uint8_t>(ScsiOpcode::Read16)) {
-                uint64_t lba = (scsi_op == static_cast<uint8_t>(ScsiOpcode::Read10)) ? read_be32(bhs.cdb + 2) : read_be64(bhs.cdb + 2);
-                uint32_t sectors = (scsi_op == static_cast<uint8_t>(ScsiOpcode::Read10)) ? read_be16(bhs.cdb + 7) : read_be32(bhs.cdb + 10);
-                size_t byte_len = static_cast<size_t>(sectors) * 512;
+            } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Read6) ||
+                       scsi_op == static_cast<uint8_t>(ScsiOpcode::Read10) ||
+                       scsi_op == static_cast<uint8_t>(ScsiOpcode::Read16)) {
+                uint64_t lba = 0;
+                uint32_t sectors = 0;
                 bool is_16 = (scsi_op == static_cast<uint8_t>(ScsiOpcode::Read16));
+                if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Read6)) {
+                    lba = ((static_cast<uint64_t>(bhs.cdb[1] & 0x1F)) << 16) |
+                          (static_cast<uint64_t>(bhs.cdb[2]) << 8) |
+                          static_cast<uint64_t>(bhs.cdb[3]);
+                    sectors = bhs.cdb[4];
+                    if (sectors == 0) sectors = 256;
+                } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Read10)) {
+                    lba = read_be32(bhs.cdb + 2);
+                    sectors = read_be16(bhs.cdb + 7);
+                } else {
+                    lba = read_be64(bhs.cdb + 2);
+                    sectors = read_be32(bhs.cdb + 10);
+                }
+                size_t byte_len = static_cast<size_t>(sectors) * 512;
 
                 if (session) {
                     session->record_scsi_activity(lba, sectors);
                 }
 
-                Logger::default_logger().info("BOOT", "[BOOT STAGE 15] SCSI READ request: LUN=" + std::to_string(req_lun) +
-                             " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors));
+                // One line per READ otherwise -- a boot issues tens of
+                // thousands. Keep the first one as the stage milestone.
+                const std::string& stage15_client = session ? session->id().value()
+                                                            : kNoClientSession;
+                if (mark_log_once(stage15_client, kLogFirstRead)) {
+                    Logger::default_logger().info("BOOT", "[BOOT STAGE 15] SCSI READ request: LUN=" + std::to_string(req_lun) +
+                                 " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors));
+                } else if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    Logger::default_logger().trace("BOOT", "[BOOT STAGE 15] SCSI READ request: LUN=" + std::to_string(req_lun) +
+                                 " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors));
+                }
 
                 if (req_lun == 0) {
                     // Boot-progress tracker: LOGGING ONLY. It never gates SCSI
@@ -1529,7 +2459,9 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     // thread, so reaching a stage has no effect on I/O handling.
                     // Guarded by stage_mutex_ because concurrent connections used to
                     // share this map through an unsynchronised function-local static.
-                    const std::string s_id = session ? session->id().value() : "unknown";
+                    // Bound, not copied: this runs on every READ.
+                    const std::string& s_id = session ? session->id().value()
+                                                      : kNoClientSession;
                     uint32_t triggered = 0;
                     {
                         std::lock_guard<std::mutex> stage_lock(stage_mutex_);
@@ -1568,25 +2500,25 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     if (!read_res.is_ok()) {
                         read_failed = true;
                         Logger::default_logger().error("iSCSI",
-                            "[iSCSI] READ(10/16) failed: LBA=" + std::to_string(lba) +
+                            "[iSCSI] READ failed: LBA=" + std::to_string(lba) +
                             " Sectors=" + std::to_string(sectors) + " -> " +
                             read_res.error().to_string());
                     }
+                } else {
+                    read_failed = true;
                 }
 
                 if (read_failed) {
-                    // Payload-free CHECK CONDITION: no data-in phase is started,
-                    // so the initiator sees a single SCSI Response carrying the
-                    // error status instead of stale zero-filled sectors.
+                    last_sense_key = 0x03; // MEDIUM ERROR
+                    last_asc = 0x11;       // UNRECOVERED READ ERROR
+
                     IscsiBhs resp{};
                     resp.opcode = 0x21; // SCSI Response
                     resp.flags = 0x80;
                     resp.rsvd1[0] = 0x00;
                     resp.rsvd1[1] = 0x02; // SCSI Status: Check Condition
                     resp.initiator_task_tag = bhs.initiator_task_tag;
-                    resp.cmd_sn = stat_sn++;
-                    resp.exp_stat_sn = bhs.cmd_sn + 1;
-                    resp.cdb[0] = 0x02;
+                    stamp_command_window(resp, bhs, stat_sn++);
                     send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
                     continue;
                 }
@@ -1607,27 +2539,38 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     }
                 }
 
-                std::string mode_tag = build_mode_tag(sectors);
-                std::string boot_map = build_semantic_boot_tags(lba, session.get());
-                std::string sig_tags = build_signature_tags(payload);
+                // Counted rather than logged: the per-read line below is now
+                // TRACE-only, and IoMetrics turns these counts into a single
+                // aggregated throughput line every couple of seconds.
+                IoMetrics::instance().record_read(byte_len);
 
-                std::string tags = mode_tag;
-                if (!boot_map.empty()) {
-                    tags += " " + boot_map;
-                }
-                if (!sig_tags.empty()) {
-                    tags += " " + sig_tags;
-                }
+                // The tags below exist only to explain that trace line, and
+                // build_signature_tags walks the whole payload to produce
+                // them -- work the read path must not pay unless tracing is
+                // actually switched on.
+                if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    std::string tags = build_mode_tag(sectors);
+                    const std::string boot_map = build_semantic_boot_tags(lba, session.get());
+                    if (!boot_map.empty()) {
+                        tags += " " + boot_map;
+                    }
+                    const std::string sig_tags = build_signature_tags(payload);
+                    if (!sig_tags.empty()) {
+                        tags += " " + sig_tags;
+                    }
 
-                std::string io_op = is_16 ? "READ(16)" : "READ(10)";
-                std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
-                                      " Count=" + std::to_string(sectors) +
-                                      " (" + format_size_kb(byte_len) + " KB) TaskTag=0x" +
-                                      format_hex_u32(bhs.initiator_task_tag) + " " + tags;
-                Logger::default_logger().info("iSCSI", io_line);
+                    const std::string io_op = is_16 ? "READ(16)"
+                        : ((scsi_op == static_cast<uint8_t>(ScsiOpcode::Read6)) ? "READ(6)" : "READ(10)");
+                    std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
+                                          " Count=" + std::to_string(sectors) +
+                                          " (" + format_size_kb(byte_len) + " KB) TaskTag=0x" +
+                                          format_hex_u32(bhs.initiator_task_tag) + " " + tags;
+                    Logger::default_logger().trace("iSCSI", io_line);
+                }
 
                 size_t max_burst = 65536;
                 size_t sent_bytes = 0;
+                uint32_t data_sn = 0; // DataSN for this command's Data-In PDUs (10.7.5)
                 while (sent_bytes < byte_len || byte_len == 0) {
                     size_t chunk = std::min(max_burst, byte_len - sent_bytes);
                     bool is_final = (sent_bytes + chunk >= byte_len);
@@ -1636,34 +2579,34 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     in_bhs.opcode = 0x25;
                     in_bhs.flags = is_final ? 0x81 : 0x00;
                     in_bhs.initiator_task_tag = bhs.initiator_task_tag;
-                    in_bhs.data_transfer_tag = 0;
-                    in_bhs.cmd_sn = stat_sn++;
-                    in_bhs.exp_stat_sn = bhs.cmd_sn + 1;
+                    in_bhs.data_transfer_tag = is_final ? 0xFFFFFFFF : 0;
+                    // 10.7.3: StatSN/Status/Residual only carry meaning when the
+                    // S bit (0x01) is set. A mid-transfer Data-In has S=0, so its
+                    // StatSN is reserved and must not consume a status sequence
+                    // number -- otherwise the status-bearing final PDU arrives
+                    // with a gap and the initiator asks for a StatSN SNACK.
+                    stamp_command_window(in_bhs, bhs, is_final ? stat_sn++ : 0);
+                    // 10.7.5: DataSN is the input PDU number within this command.
+                    // Leaving it at 0 repeated the number on every burst of a
+                    // multi-burst read.
+                    write_be32(in_bhs.cdb + 4, data_sn++);
+                    write_be32(in_bhs.cdb + 8, static_cast<uint32_t>(sent_bytes));
                     in_bhs.data_seg_len[0] = static_cast<uint8_t>((chunk >> 16) & 0xFF);
                     in_bhs.data_seg_len[1] = static_cast<uint8_t>((chunk >> 8) & 0xFF);
                     in_bhs.data_seg_len[2] = static_cast<uint8_t>(chunk & 0xFF);
 
-                    // send_all() rather than send(): a short write here would silently
-                    // truncate the Data-In with SAM_STAT_GOOD already claimed in the
-                    // header, and the initiator would wait forever for the missing
-                    // sectors instead of seeing an error it could retry.
-                    if (!send_all(s, &in_bhs, sizeof(in_bhs))) {
+                    // Coalesce TCP transmission: serialize BHS + chunk + pad into a single contiguous buffer
+                    // Eliminates split TCP segments and reduces syscall overhead to saturate wire.
+                    const uint32_t pad = (4 - (chunk % 4)) % 4;
+                    const size_t pdu_len = sizeof(IscsiBhs) + chunk + pad;
+                    std::vector<uint8_t> pdu_packet(pdu_len, 0);
+                    std::memcpy(pdu_packet.data(), &in_bhs, sizeof(IscsiBhs));
+                    if (chunk > 0) {
+                        std::memcpy(pdu_packet.data() + sizeof(IscsiBhs), payload.data() + sent_bytes, chunk);
+                    }
+                    if (!send_all(s, pdu_packet.data(), pdu_len)) {
                         connection_broken = true;
                         break;
-                    }
-                    if (chunk > 0) {
-                        if (!send_all(s, payload.data() + sent_bytes, chunk)) {
-                            connection_broken = true;
-                            break;
-                        }
-                        uint32_t pad = (4 - (chunk % 4)) % 4;
-                        if (pad > 0) {
-                            const char pad_bytes[4] = {0};
-                            if (!send_all(s, pad_bytes, pad)) {
-                                connection_broken = true;
-                                break;
-                            }
-                        }
                     }
                     sent_bytes += chunk;
                     if (is_final) break;
@@ -1675,45 +2618,74 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                         "/" + std::to_string(byte_len) + " bytes. Dropping connection so the initiator retries.");
                     break;
                 }
-            } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Write10) || scsi_op == static_cast<uint8_t>(ScsiOpcode::Write16)) {
-                uint64_t lba = (scsi_op == static_cast<uint8_t>(ScsiOpcode::Write10)) ? read_be32(bhs.cdb + 2) : read_be64(bhs.cdb + 2);
-                uint32_t sectors = (scsi_op == static_cast<uint8_t>(ScsiOpcode::Write10)) ? read_be16(bhs.cdb + 7) : read_be32(bhs.cdb + 10);
-                size_t req_bytes = static_cast<size_t>(sectors) * 512;
+            } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Write6) ||
+                       scsi_op == static_cast<uint8_t>(ScsiOpcode::Write10) ||
+                       scsi_op == static_cast<uint8_t>(ScsiOpcode::Write16)) {
+                uint64_t lba = 0;
+                uint32_t sectors = 0;
                 bool is_16 = (scsi_op == static_cast<uint8_t>(ScsiOpcode::Write16));
+                if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Write6)) {
+                    lba = ((static_cast<uint64_t>(bhs.cdb[1] & 0x1F)) << 16) |
+                          (static_cast<uint64_t>(bhs.cdb[2]) << 8) |
+                          static_cast<uint64_t>(bhs.cdb[3]);
+                    sectors = bhs.cdb[4];
+                    if (sectors == 0) sectors = 256;
+                } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::Write10)) {
+                    // QEMU BDRV_O_NO_FLUSH & FUA Neutralization: Mask off Bit 3 (0x08, Force Unit Access)
+                    bhs.cdb[1] &= ~0x08;
+                    lba = read_be32(bhs.cdb + 2);
+                    sectors = read_be16(bhs.cdb + 7);
+                } else {
+                    bhs.cdb[1] &= ~0x08;
+                    lba = read_be64(bhs.cdb + 2);
+                    sectors = read_be32(bhs.cdb + 10);
+                }
+                size_t req_bytes = static_cast<size_t>(sectors) * 512;
 
                 if (session) {
                     session->record_scsi_activity(lba, sectors);
                 }
 
                 if (req_lun != 0) {
+                    // Matches execute_write()'s mapping for the same condition
+                    // (ErrorCode::UnsupportedOperation): there is no such LUN,
+                    // so say so instead of claiming a write-protected disk
+                    // lives there. Two paths disagreeing on the sense key for
+                    // one condition is exactly what made failures unreadable.
+                    last_sense_key = 0x05; // ILLEGAL REQUEST
+                    last_asc = 0x25;       // LOGICAL UNIT NOT SUPPORTED
+
                     IscsiBhs resp{};
                     resp.opcode = 0x21; // SCSI Response
                     resp.flags = 0x80;
                     resp.rsvd1[0] = 0x00;
                     resp.rsvd1[1] = 0x02; // SCSI Status: Check Condition
                     resp.initiator_task_tag = bhs.initiator_task_tag;
-                    resp.cmd_sn = stat_sn++;
-                    resp.exp_stat_sn = bhs.cmd_sn + 1;
-                    resp.cdb[0] = 0x02; // Check Condition (Data Protect)
+                    stamp_command_window(resp, bhs, stat_sn++);
                     send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
                     continue;
                 }
 
-                std::vector<std::byte> write_buf;
-                write_buf.reserve(req_bytes);
+                std::vector<std::byte> write_buf(req_bytes, std::byte{0});
+                size_t bytes_received = 0;
 
                 // Extract immediate data if present in Command PDU
                 if (!data_seg.empty()) {
                     size_t imm_len = std::min(data_seg.size(), req_bytes);
-                    const auto* p = reinterpret_cast<const std::byte*>(data_seg.data());
-                    write_buf.insert(write_buf.end(), p, p + imm_len);
+                    std::memcpy(write_buf.data(), data_seg.data(), imm_len);
+                    bytes_received = imm_len;
                 }
+
+                Logger::default_logger().info("iSCSI", "[DEBUG] [iSCSI WRITE] TaskTag=0x" +
+                    format_hex_u32(bhs.initiator_task_tag) + " req_bytes=" + std::to_string(req_bytes) +
+                    " data_seg.size=" + std::to_string(data_seg.size()) +
+                    " bytes_received=" + std::to_string(bytes_received));
 
                 // If immediate data was absent or incomplete, request Data-Out via R2T
                 uint32_t r2t_sn = 0;
-                while (write_buf.size() < req_bytes && !idle_teardown) {
-                    uint32_t desired = static_cast<uint32_t>(std::min<size_t>(req_bytes - write_buf.size(), 65536));
-                    uint32_t buf_offset = static_cast<uint32_t>(write_buf.size());
+                while (bytes_received < req_bytes && !idle_teardown && !connection_broken) {
+                    uint32_t desired = static_cast<uint32_t>(std::min<size_t>(req_bytes - bytes_received, 65536));
+                    uint32_t buf_offset = static_cast<uint32_t>(bytes_received);
 
                     IscsiBhs r2t{};
                     r2t.opcode = 0x31; // R2T (Ready To Transfer, Opcode 0x31)
@@ -1721,149 +2693,303 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                     r2t.lun = bhs.lun;
                     r2t.initiator_task_tag = bhs.initiator_task_tag;
                     r2t.data_transfer_tag = 0x00000001; // Target Transfer Tag
-                    r2t.cmd_sn = stat_sn++;             // StatSN
-                    r2t.exp_stat_sn = bhs.cmd_sn + 1;   // ExpCmdSN
-                    write_be32(r2t.cdb + 0, bhs.cmd_sn + 32); // MaxCmdSN
-                    write_be32(r2t.cdb + 4, r2t_sn++);        // R2TSN
-                    write_be32(r2t.cdb + 8, buf_offset);      // Buffer Offset
-                    write_be32(r2t.cdb + 12, desired);        // Desired Data Transfer Length
+                    // RFC 3720 10.8 -- the R2T BHS tail is (cdb starts at
+                    // byte 32, so cdb+N is byte 32+N):
+                    //   Byte 32..35 (cdb + 0): MaxCmdSN  (stamp_command_window)
+                    //   Byte 36..39 (cdb + 4): R2TSN
+                    //   Byte 40..43 (cdb + 8): Buffer Offset
+                    //   Byte 44..47 (cdb + 12): Desired Data Transfer Length
+                    // Writing these one word too early (cdb + 0/+4/+8) left
+                    // Desired = 0 on the wire: the initiator then has nothing
+                    // to send, answers with a zero-length Data-Out, and the
+                    // target re-arms R2T forever -- the R2T storm that stalls
+                    // the Windows boot write.
+                    stamp_command_window(r2t, bhs, stat_sn);
+                    write_be32(r2t.cdb + 4, r2t_sn++);        // R2TSN (Byte 36..39)
+                    write_be32(r2t.cdb + 8, buf_offset);      // Buffer Offset (Byte 40..43)
+                    write_be32(r2t.cdb + 12, desired);        // Desired Data Transfer Length (Byte 44..47)
 
-                    if (send(s, reinterpret_cast<const char*>(&r2t), sizeof(r2t), 0) <= 0) {
+                    Logger::default_logger().info("iSCSI", "[DEBUG] [iSCSI WRITE] Sending R2T: desired=" +
+                        std::to_string(desired) + " buf_offset=" + std::to_string(buf_offset) + " r2t_sn=" + std::to_string(r2t_sn - 1));
+
+                    if (!send_all(s, &r2t, sizeof(r2t))) {
+                        Logger::default_logger().warn("iSCSI", "[DEBUG] [iSCSI WRITE] send_all R2T failed");
+                        connection_broken = true;
                         break;
                     }
 
                     size_t burst_received = 0;
-                    while (burst_received < desired && write_buf.size() < req_bytes) {
+                    while (burst_received < desired && bytes_received < req_bytes) {
                         IscsiBhs dout_bhs{};
-                        if (read_exact_with_watchdog(&dout_bhs, sizeof(IscsiBhs)) <= 0) {
+                        Logger::default_logger().info("iSCSI", "[DEBUG] [iSCSI WRITE] Waiting for Data-Out PDU on socket " + std::to_string(s));
+                        if (!recv_exact(s, &dout_bhs, sizeof(IscsiBhs))) {
+                            Logger::default_logger().warn("iSCSI", "[DEBUG] [iSCSI WRITE] recv_exact Data-Out BHS timed out or failed on socket " + std::to_string(s));
+                            connection_broken = true;
                             break;
                         }
                         uint8_t dout_op = dout_bhs.opcode & 0x3F;
                         if (dout_op != 0x05) { // 0x05: SCSI Data-Out
                             Logger::default_logger().warn("iSCSI", "[iSCSI] Unexpected PDU opcode during Data-Out: 0x" + to_hex_u8(dout_op));
+                            connection_broken = true;
                             break;
                         }
                         uint32_t d_len = (static_cast<uint32_t>(dout_bhs.data_seg_len[0]) << 16) |
                                          (static_cast<uint32_t>(dout_bhs.data_seg_len[1]) << 8)  |
                                          static_cast<uint32_t>(dout_bhs.data_seg_len[2]);
-                        uint32_t p_len = (d_len + 3) & ~3;
-                        std::vector<uint8_t> d_payload(p_len, 0);
-                        if (p_len > 0) {
-                            if (read_exact_with_watchdog(d_payload.data(), p_len) <= 0) {
+                        uint32_t pad_len = (4 - (d_len % 4)) % 4;
+                        // RFC 3720 10.7:
+                        // Byte 36..39 (cdb + 0): DataSN
+                        // Byte 40..43 (cdb + 8): Buffer Offset
+                        // (Reading cdb + 4 took the DataSN as the offset, so
+                        // every Data-Out after the first was placed one byte
+                        // further into the buffer per PDU number.)
+                        uint32_t offset = read_be32(dout_bhs.cdb + 8);
+
+                        if (offset + d_len <= req_bytes) {
+                            if (!recv_exact(s, reinterpret_cast<uint8_t*>(write_buf.data()) + offset, d_len)) {
+                                connection_broken = true;
+                                break;
+                            }
+                        } else {
+                            std::vector<uint8_t> drop_buf(d_len);
+                            if (!recv_exact(s, drop_buf.data(), d_len)) {
+                                connection_broken = true;
                                 break;
                             }
                         }
-                        size_t needed = req_bytes - write_buf.size();
-                        size_t to_copy = std::min(static_cast<size_t>(d_len), needed);
-                        const auto* p = reinterpret_cast<const std::byte*>(d_payload.data());
-                        write_buf.insert(write_buf.end(), p, p + to_copy);
+
+                        if (pad_len > 0) {
+                            uint8_t dummy_pad[4] = {0};
+                            if (!recv_exact(s, dummy_pad, pad_len)) {
+                                connection_broken = true;
+                                break;
+                            }
+                        }
+
+                        if (session) {
+                            session->set_last_scsi_time(std::chrono::steady_clock::now());
+                            session->set_watchdog_warned(false);
+                        }
+
                         burst_received += d_len;
-                        if (dout_bhs.flags & 0x80) { // Final PDU in burst
+                        if (offset + d_len > bytes_received) {
+                            bytes_received = offset + d_len;
+                        } else {
+                            bytes_received += d_len;
+                        }
+
+                        if ((dout_bhs.flags & 0x80) || bytes_received >= req_bytes) { // Final PDU in burst or all bytes received
                             break;
                         }
                     }
+
+                    if (connection_broken || bytes_received >= req_bytes) {
+                        break;
+                    }
                 }
 
-                bool write_failed = false;
-                if (session && write_buf.size() >= req_bytes) {
+                if (connection_broken) {
+                    break;
+                }
+
+                bool write_failed = (session == nullptr);
+                // Sense reported with the CHECK CONDITION below. Defaults to
+                // the "no session attached" case, which is a protection
+                // refusal: no session means no LUN was ever exposed.
+                uint8_t write_sense_key = 0x07; // DATA PROTECT
+                uint8_t write_sense_asc  = 0x27; // WRITE PROTECTED
+                if (session && bytes_received >= req_bytes) {
                     auto write_res = execute_write(*session, lba, sectors, write_buf, req_lun);
                     if (!write_res.is_ok()) {
                         write_failed = true;
+                        map_write_error_to_sense(write_res.error(), write_sense_key, write_sense_asc);
                         Logger::default_logger().error("iSCSI",
-                            "[iSCSI] WRITE(10/16) failed: LBA=" + std::to_string(lba) +
+                            "[iSCSI] WRITE failed: LBA=" + std::to_string(lba) +
                             " Sectors=" + std::to_string(sectors) + " -> " +
-                            write_res.error().to_string());
+                            write_res.error().to_string() +
+                            " (sense key=0x" + to_hex_u8(write_sense_key) +
+                            " asc=0x" + to_hex_u8(write_sense_asc) + ")");
+                    }
+                } else if (!session) {
+                    Logger::default_logger().error("iSCSI",
+                        "[iSCSI] WRITE rejected: no session attached for LBA=" + std::to_string(lba));
+                }
+
+                if (session && bytes_received >= req_bytes && !write_failed) {
+                    // Counted rather than logged -- see the matching READ
+                    // path: IoMetrics emits one aggregated line per window.
+                    IoMetrics::instance().record_write(bytes_received);
+
+                    // One line per WRITE otherwise. Keep the first as the
+                    // stage milestone, demote everything after it.
+                    const std::string& stage16_client = session->id().value();
+                    if (mark_log_once(stage16_client, kLogFirstWrite)) {
+                        Logger::default_logger().info("BOOT", "[BOOT STAGE 16] SCSI WRITE request: LUN=" + std::to_string(req_lun) +
+                                     " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors) + " committed to COW overlay");
+                    } else if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                        Logger::default_logger().trace("BOOT", "[BOOT STAGE 16] SCSI WRITE request: LUN=" + std::to_string(req_lun) +
+                                     " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors) + " committed to COW overlay");
+                    }
+
+                    // Same as the READ path: these tags only decorate the
+                    // trace line, and build_signature_tags scans the whole
+                    // buffer, so skip the scan when tracing is off.
+                    if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                        std::string tags = build_mode_tag(sectors);
+                        const std::string boot_map = build_semantic_boot_tags(lba, session.get());
+                        if (!boot_map.empty()) {
+                            tags += " " + boot_map;
+                        }
+                        const std::string sig_tags = build_signature_tags(write_buf);
+                        if (!sig_tags.empty()) {
+                            tags += " " + sig_tags;
+                        }
+
+                        const std::string io_op = is_16 ? "WRITE(16)"
+                            : ((scsi_op == static_cast<uint8_t>(ScsiOpcode::Write6)) ? "WRITE(6)" : "WRITE(10)");
+                        std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
+                                              " Count=" + std::to_string(sectors) +
+                                              " TaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
+                                              " -> Status=GOOD (Written to COW overlay)";
+                        if (!tags.empty()) {
+                            io_line += " " + tags;
+                        }
+                        Logger::default_logger().trace("iSCSI", io_line);
                     }
                 }
 
-                if (session && write_buf.size() >= req_bytes && !write_failed) {
-                    Logger::default_logger().info("BOOT", "[BOOT STAGE 16] SCSI WRITE request: LUN=" + std::to_string(req_lun) +
-                                 " LBA=" + std::to_string(lba) + " Sectors=" + std::to_string(sectors) + " committed to COW overlay");
-
-                    std::string mode_tag = build_mode_tag(sectors);
-                    std::string boot_map = build_semantic_boot_tags(lba, session.get());
-                    std::string sig_tags = build_signature_tags(write_buf);
-
-                    std::string tags = mode_tag;
-                    if (!boot_map.empty()) {
-                        tags += " " + boot_map;
-                    }
-                    if (!sig_tags.empty()) {
-                        tags += " " + sig_tags;
+                if (write_failed || bytes_received < req_bytes) {
+                    if (write_failed) {
+                        last_sense_key = write_sense_key;
+                        last_asc = write_sense_asc;
+                    } else {
+                        // A short Data-Out burst on a live connection: the
+                        // command never reached the device, so the initiator
+                        // must not treat this as a media fault either.
+                        last_sense_key = 0x0B; // ABORTED COMMAND
+                        last_asc = 0x00;       // NO ADDITIONAL SENSE INFORMATION
                     }
 
-                    std::string io_op = is_16 ? "WRITE(16)" : "WRITE(10)";
-                    std::string io_line = "[iSCSI I/O] " + io_op + " LBA=" + std::to_string(lba) +
-                                          " Count=" + std::to_string(sectors) +
-                                          " TaskTag=0x" + format_hex_u32(bhs.initiator_task_tag) +
-                                          " -> Status=GOOD (Written to COW overlay)";
-                    if (!tags.empty()) {
-                        io_line += " " + tags;
+                    // Always answered: a failed write must never leave the
+                    // initiator waiting for a SCSI Response that will not
+                    // arrive. Sense rides in `last_sense_key`/`last_asc` and
+                    // is handed back by the REQUEST SENSE handler below.
+                    IscsiBhs resp{};
+                    resp.opcode = 0x21; // SCSI Response
+                    resp.flags = 0x80;  // Final
+                    resp.rsvd1[0] = 0x00; // Command completed at target
+                    resp.rsvd1[1] = 0x02; // CHECK CONDITION
+                    resp.initiator_task_tag = bhs.initiator_task_tag;
+                    stamp_command_window(resp, bhs, stat_sn++);
+                    if (!send_all(s, &resp, sizeof(resp))) {
+                        connection_broken = true;
+                        break;
                     }
-                    Logger::default_logger().info("iSCSI", io_line);
+                } else {
+                    IscsiBhs resp{};
+                    resp.opcode = 0x21; // SCSI Response
+                    resp.flags = 0x80;  // Final
+                    resp.rsvd1[0] = 0x00; // Command completed at target
+                    resp.rsvd1[1] = 0x00; // SAM_STAT_GOOD
+                    resp.initiator_task_tag = bhs.initiator_task_tag;
+                    stamp_command_window(resp, bhs, stat_sn++);
+                    if (!send_all(s, &resp, sizeof(resp))) {
+                        connection_broken = true;
+                        break;
+                    }
                 }
-
-                IscsiBhs resp{};
-                resp.opcode = 0x21; // SCSI Response
-                resp.flags = 0x80;  // Final
-                resp.rsvd1[0] = 0x00; // Command completed at target
-                resp.rsvd1[1] = (!write_failed && write_buf.size() >= req_bytes)
-                                    ? 0x00  // SAM_STAT_GOOD
-                                    : 0x02; // CHECK CONDITION (short or failed write)
-                resp.initiator_task_tag = bhs.initiator_task_tag;
-                resp.cmd_sn = stat_sn++;
-                resp.exp_stat_sn = bhs.cmd_sn + 1;
-                resp.cdb[0] = resp.rsvd1[1];
-                send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::SynchronizeCache10) || scsi_op == static_cast<uint8_t>(ScsiOpcode::SynchronizeCache16)) {
-                bool sync_ok = true;
+                // SYNCHRONIZE CACHE is a durability command, not a no-op.
+                // Mode Sense advertises WCE=1 so that Windows will happily
+                // fire asynchronous writes into the L1 RAM cache and defer
+                // persistence to this command -- FlushFileBuffers, volume
+                // dismount, shutdown. The old "QEMU cache=unsafe / BDRV_O_NO_FLUSH"
+                // branch answered GOOD without writing a byte, which is exactly
+                // the promise the write-illusion engine has to keep.
+                //
+                // UnifiedCowDevice::flush() signals the background elevator
+                // flusher to wake up, drains the dirty 64 KiB clusters into the
+                // .cow file and flushes the file itself. Only once that has
+                // completed does the SAM_STAT_GOOD below go on the wire, so the
+                // initiator never sees success for data that still lives only
+                // in RAM. A failed drain is reported as CHECK CONDITION with a
+                // MEDIUM ERROR, which is what lets the initiator retry instead
+                // of believing the data was written.
+                bool sync_failed = false;
                 if (session) {
                     auto sync_res = execute_sync_cache(*session, req_lun);
                     if (!sync_res.is_ok()) {
-                        sync_ok = false;
+                        sync_failed = true;
+                        last_sense_key = 0x03; // MEDIUM ERROR
+                        last_asc = 0x0C;       // WRITE ERROR
                         Logger::default_logger().error("iSCSI",
-                            "[iSCSI] SYNCHRONIZE_CACHE failed for session " + session->id().value() +
-                            ": " + std::string(sync_res.error().message()));
+                            "[iSCSI] SYNCHRONIZE CACHE failed: LUN=" + std::to_string(req_lun) +
+                            " -> " + sync_res.error().to_string());
                     }
                 }
                 IscsiBhs resp{};
-                resp.opcode = 0x21;
+                resp.opcode = 0x21; // SCSI Response
                 resp.flags = 0x80;
-                resp.rsvd1[1] = sync_ok ? 0x00 : 0x02; // 0x00 = SAM_STAT_GOOD, 0x02 = CHECK CONDITION
+                resp.rsvd1[0] = 0x00; // Command completed at target
+                resp.rsvd1[1] = sync_failed ? 0x02 : 0x00; // CHECK CONDITION : SAM_STAT_GOOD
                 resp.initiator_task_tag = bhs.initiator_task_tag;
-                resp.cmd_sn = stat_sn++;
-                resp.exp_stat_sn = bhs.cmd_sn + 1;
-                resp.cdb[0] = resp.rsvd1[1];
-                send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
+                stamp_command_window(resp, bhs, stat_sn++);
+                if (!send_all(s, &resp, sizeof(resp))) {
+                    connection_broken = true;
+                    break;
+                }
             } else if (scsi_op == static_cast<uint8_t>(ScsiOpcode::RequestSense)) {
-                auto sense_data = handle_request_sense().value();
-                IscsiBhs in_bhs{};
-                in_bhs.opcode = 0x25;
-                in_bhs.flags = 0x81;
-                in_bhs.initiator_task_tag = bhs.initiator_task_tag;
-                in_bhs.cmd_sn = stat_sn++;
-                in_bhs.exp_stat_sn = bhs.cmd_sn + 1;
-                in_bhs.data_seg_len[2] = static_cast<uint8_t>(sense_data.size());
-
-                send(s, reinterpret_cast<const char*>(&in_bhs), sizeof(in_bhs), 0);
-                send(s, reinterpret_cast<const char*>(sense_data.data()), sense_data.size(), 0);
+                auto sense_data = handle_request_sense(last_sense_key, last_asc).value();
+                last_sense_key = 0;
+                last_asc = 0;
+                if (!send_scsi_data_in(s, bhs, stat_sn, sense_data)) {
+                    connection_broken = true;
+                    break;
+                }
             } else {
                 IscsiBhs resp{};
                 resp.opcode = 0x21;
                 resp.flags = 0x80;
                 resp.initiator_task_tag = bhs.initiator_task_tag;
-                resp.cmd_sn = stat_sn++;
-                resp.exp_stat_sn = bhs.cmd_sn + 1;
+                stamp_command_window(resp, bhs, stat_sn++);
                 send(s, reinterpret_cast<const char*>(&resp), sizeof(resp), 0);
             }
         }
+        if (connection_broken) {
+            break;
+        }
+    }
+
+    if (!saw_any_pdu) {
+        const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - conn_start).count();
+        // The discriminator for the "silent 15 seconds" report: how long the
+        // worker was actually in the read path, and whether recv() was even
+        // reached. Read together with the [DEBUG] lines above it, this separates
+        // a worker blocked before the loop from one that sat in recv() while the
+        // initiator never sent a Login PDU.
+        Logger::default_logger().info("iSCSI",
+            "[iSCSI] Connection from " + client_ip.ip_string() + ":" +
+            std::to_string(client_ip.port()) + " closed before any PDU arrived " +
+            "(no Login Request was ever sent); the worker was in the read path for " +
+            std::to_string(waited_ms) + "ms" +
+            (recv_timeouts > 0
+                ? (", recv() timed out " + std::to_string(recv_timeouts) +
+                   " time(s) waiting for data -- the initiator never sent the Login PDU")
+                : std::string(", with no recv() timeout -- the connection was reset or closed before any byte arrived")) + ".");
+    } else {
+        Logger::default_logger().info("iSCSI",
+            "[iSCSI] Connection from " + client_ip.ip_string() + ":" +
+            std::to_string(client_ip.port()) + " closed after " +
+            std::to_string(pdus_handled) + " PDU(s)" +
+            (initiator_name.empty() ? "" : ", Initiator='" + initiator_name + "'") + ".");
     }
 
     if (session) {
         // Session teardown is now driven by the connection refcount, NOT by which
         // connection happens to close first. get_or_create_session() hands the same
         // ClientSession to every connection from this initiator/IP, so terminating it
-        // unconditionally here used to CowBlockDevice::close() + purge_overlay() and
+        // unconditionally here used to UnifiedCowDevice::close() + purge_overlay() and
         // ImageManager::release_image() underneath a still-live second connection
         // (Windows' msiscsi), which then failed every READ -> 0x7B.
         const int remaining = release_session_connection(session);
@@ -1873,16 +2999,37 @@ void IscsiTarget::handle_client_connection(uintptr_t client_sock, NetworkAddress
                 session->id().value() + "] retained for " + std::to_string(remaining) +
                 " remaining connection(s).");
         } else {
-            session->set_state(ClientState::Offline);
-            if (session_mgr_) {
-                (void)session_mgr_->terminate_session(session->id());
+            // A socket drop during active boot is a normal reconnect attempt, not a client shutdown.
+            // Flush dirty writes to disk so reconnecting sockets find durable data.
+            // Retain the session and COW overlay in memory and on disk within 60s grace window.
+            session->mark_disconnected();
+            Logger::default_logger().info("iSCSI",
+                "[iSCSI] Connection for [" + get_client_tag() + "] closed (0 active connections). "
+                "Marking session Disconnected. Retaining COW overlay within 60s grace window for reconnect.");
+            if (session->cow_block_device()) {
+                // SYNCHRONIZE-style hard drain: the L1 cache must reach the
+                // .cow file before this thread walks away, because the session
+                // (and its overlay) is retained for the 60s reconnect grace
+                // window and the next socket has to find durable data. The
+                // single-class engine owns the file, the allocation table and
+                // the RAM cache, so there is no second writer left to route
+                // this through -- and clusters start at file offset 65536, so
+                // nothing can ever stamp over the header block.
+                auto drained = session->cow_block_device()->flush();
+                if (!drained.is_ok()) {
+                    Logger::default_logger().error("iSCSI",
+                        "[iSCSI] Failed to drain writeback overlay for [" + get_client_tag() +
+                        "]: " + drained.error().to_string());
+                }
             }
         }
     }
 
-    // The client socket is unregistered and closed by SocketGuard above
-    // (declared first, therefore destroyed last) -- exactly once, and skipped if
-    // shutdown() already force-closed it.
+    // The client socket is unregistered and closed here -- exactly once, and
+    // skipped only when shutdown()'s hard-close pass already took the handle
+    // over. It is constructed after `session`, so it is destroyed first and
+    // still runs while `session` is alive: that is what lets it drop the
+    // session's claim on the handle in the same step that frees it.
 #else
     (void)client_sock;
     (void)client_ip;

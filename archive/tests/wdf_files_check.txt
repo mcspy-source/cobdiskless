@@ -1,0 +1,15 @@
+﻿
+
+    Directory: I:\
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+d--hs-         9/22/2026   3:12 AM                $RECYCLE.BIN                                                         
+d--hs-         9/22/2026   3:05 AM                System Volume Information                                            
+-a----         9/29/2026   1:45 AM     4353609216 csmw10.VHD                                                           
+-a----         9/29/2026   1:45 AM     6012861440 w11eufi.VHD                                                          
+
+
+
+

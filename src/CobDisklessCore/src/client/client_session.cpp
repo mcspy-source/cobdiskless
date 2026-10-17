@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "CobDisklessCore/client/client_session.hpp"
-#include "CobDisklessCore/image/pnp_driver_armer.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/storage/storage_manager.hpp"
@@ -9,6 +8,8 @@
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
 #include "CobDisklessCore/storage/raw_image_backend.hpp"
 #include "CobDisklessCore/storage/vhdx_image_backend.hpp"
+#include "CobDisklessCore/storage/overlay_naming.hpp"
+#include "CobDisklessCore/storage/game_disk_engine.hpp"
 #include <algorithm>
 
 namespace cobdiskless {
@@ -17,29 +18,35 @@ namespace {
 
 // Opens a base image backend in either sharing mode. Read-only opens join the
 // strict shared handle pool; read-write opens suspend it (Super Client paths).
+// The attribute policy decides what happens when the file carries the OS
+// read-only attribute: Refuse (default, Access Denied) or Lift -- the lift is
+// reserved for the two Super Client call sites below (direct mode + commit).
 Result<std::shared_ptr<BlockDevice>> open_image_backend(
     ImageFormat fmt,
     const std::filesystem::path& path,
-    bool read_only
+    bool read_only,
+    ReadOnlyAttributePolicy attribute_policy = ReadOnlyAttributePolicy::Refuse
 ) {
     std::shared_ptr<BlockDevice> dev;
     switch (fmt) {
         case ImageFormat::VhdFixed:
         case ImageFormat::VhdDynamic:
         case ImageFormat::VhdDifferencing: {
-            auto r = VhdImageBackend::open(path, read_only);
+            auto r = VhdImageBackend::open(path, read_only, attribute_policy);
             if (!r.is_ok()) return r.error();
             dev = r.value();
             break;
         }
         case ImageFormat::Vhdx: {
+            // The VHDX backend never opens for writing (its write() is
+            // prohibited outright), so there is no attribute policy to apply.
             auto r = VhdxImageBackend::open(path, read_only);
             if (!r.is_ok()) return r.error();
             dev = r.value();
             break;
         }
         default: {
-            auto r = RawImageBackend::open(path, read_only);
+            auto r = RawImageBackend::open(path, read_only, attribute_policy);
             if (!r.is_ok()) return r.error();
             dev = r.value();
             break;
@@ -63,11 +70,29 @@ ClientSession::ClientSession(
     ClientId id,
     NetworkAddress ip,
     ImageId os_image_id,
-    std::shared_ptr<CowBlockDevice> cow_device
+    std::shared_ptr<UnifiedCowDevice> cow_device
 ) : id_(std::move(id)),
     ip_(ip),
     os_image_id_(std::move(os_image_id)),
-    cow_device_(std::move(cow_device)) {}
+    cow_device_(std::move(cow_device)) {
+    uint64_t total_vhd_sectors = cow_device_ ? (cow_device_->size() / 512) : 268435456ULL;
+    uint64_t total_clusters = (total_vhd_sectors + 127) / 128;
+    if (total_clusters == 0) total_clusters = 1024;
+    cow_cluster_map.assign(total_clusters, 0xFFFFFFFF);
+    next_free_cluster.store(0);
+}
+
+void ClientSession::set_game_device(std::shared_ptr<BlockDevice> dev) noexcept {
+    if (!dev) {
+        game_device_.reset();
+        return;
+    }
+    if (std::dynamic_pointer_cast<GameDiskEngine>(dev)) {
+        game_device_ = std::move(dev);
+    } else {
+        game_device_ = std::make_shared<GameDiskEngine>(std::move(dev));
+    }
+}
 
 Result<void> ClientSession::reset() noexcept {
     state_ = ClientState::Resetting;
@@ -94,33 +119,6 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
     const std::string& initiator_iqn
 ) {
     std::lock_guard<std::mutex> lock(mutex_);
-
-    // One logical initiator owns exactly one overlay: the IQN index wins so a
-    // reconnect (possibly with a different IP or MAC) reuses the same session.
-    if (!initiator_iqn.empty()) {
-        auto iqn_it = sessions_by_iqn_.find(initiator_iqn);
-        if (iqn_it != sessions_by_iqn_.end()) {
-            auto s_it = sessions_.find(ClientId(iqn_it->second));
-            if (s_it != sessions_.end()) {
-                return s_it->second;
-            }
-            sessions_by_iqn_.erase(iqn_it);
-        }
-    }
-
-    auto it = sessions_.find(client_id);
-    if (it != sessions_.end()) {
-        auto existing = it->second;
-        if (!initiator_iqn.empty() && existing->initiator_iqn().empty()) {
-            existing->set_initiator_iqn(initiator_iqn);
-            sessions_by_iqn_[initiator_iqn] = existing->id().value();
-        }
-        return existing;
-    }
-
-    if (!image_manager_) {
-        return Error(ErrorCode::InitializationFailure, "Image manager not configured");
-    }
 
     ImageId effective_img_id = os_image_id;
     std::filesystem::path effective_wb_dir = writeback_dir_;
@@ -155,16 +153,16 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
         }
     }
 
-    // Config-driven Super Client identities: an initiator IQN, MAC or IP listed
-    // in super_client_identity= always runs in maintenance mode.
-    if (!is_super &&
-        (is_super_identity_locked(initiator_iqn) ||
-         is_super_identity_locked(client_id.value()))) {
-        is_super = true;
+    if (station_manager_) {
+        if (auto st = station_manager_->find_by_mac(client_id.value()); st.has_value() && !st->image.empty()) {
+            effective_img_id = ImageId(st->image);
+        } else if (auto st_ip = station_manager_->find_by_ip(client_ip); st_ip.has_value() && !st_ip->image.empty()) {
+            effective_img_id = ImageId(st_ip->image);
+        }
     }
 
     auto is_generic_token = [](const std::string& k) -> bool {
-        if (k.empty() || k == "default" || k == "default_os" || k == "master_os" ||
+        if (k.empty() || k == "default" || k == "default_os" ||
             k == "boot" || k == "storage" || k == "target:boot") {
             return true;
         }
@@ -174,7 +172,9 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
         return false;
     };
 
-    if (is_generic_token(effective_img_id.value())) {
+    if (image_manager_ && image_manager_->has_image(effective_img_id)) {
+        // Image is directly registered in image_manager, do not treat as generic token
+    } else if (is_generic_token(effective_img_id.value())) {
         if (image_manager_ && !image_manager_->default_os_image_id().empty()) {
             effective_img_id = ImageId(image_manager_->default_os_image_id());
         } else if (client_manager_ && !client_manager_->default_profile().os_image_id.empty() &&
@@ -183,17 +183,129 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
         }
     }
 
+    // Lookup existing session: either by stable initiator IQN or ClientId
+    std::shared_ptr<ClientSession> existing;
+    if (!initiator_iqn.empty()) {
+        auto iqn_it = sessions_by_iqn_.find(initiator_iqn);
+        if (iqn_it != sessions_by_iqn_.end()) {
+            auto s_it = sessions_.find(ClientId(iqn_it->second));
+            if (s_it != sessions_.end()) {
+                existing = s_it->second;
+            } else {
+                sessions_by_iqn_.erase(iqn_it);
+            }
+        }
+    }
+
+    if (!existing) {
+        auto it = sessions_.find(client_id);
+        if (it != sessions_.end()) {
+            existing = it->second;
+        }
+    }
+
+    // Identity fallback 1 -- MAC, normalized (case/separator insensitive): the
+    // same machine may present "AA:BB:CC:.." while its session was indexed as
+    // "aabbcc.." or "AA-BB-.." (station record vs. DHCP lease vs. initiator
+    // IQN spellings). All of them must resolve to ONE session so the machine
+    // never ends up with a second one -- and a second wb_<cleanmac>.cow.
+    if (!existing && overlay_naming::looks_like_mac(client_id.value())) {
+        auto m_it = sessions_by_mac_.find(overlay_naming::sanitize_mac(client_id.value()));
+        if (m_it != sessions_by_mac_.end()) {
+            auto s_it = sessions_.find(ClientId(m_it->second));
+            if (s_it != sessions_.end()) {
+                existing = s_it->second;
+            } else {
+                sessions_by_mac_.erase(m_it);
+            }
+        }
+    }
+
+    // Identity fallback 2 -- incoming TCP peer IP. Windows' msiscsi logs in
+    // after the NDIS handover with a generated IQN that carries no MAC, so the
+    // peer address is the only stable identity left: re-attach to the session
+    // this host already owns -- with its existing wb_<cleanmac>.cow overlay --
+    // instead of minting a separate ip_-keyed session on the same base.
+    if (!existing) {
+        auto ip_it = sessions_by_ip_.find(client_ip.ip_string());
+        if (ip_it != sessions_by_ip_.end()) {
+            auto s_it = sessions_.find(ClientId(ip_it->second));
+            if (s_it != sessions_.end()) {
+                existing = s_it->second;
+            } else {
+                sessions_by_ip_.erase(ip_it);
+            }
+        }
+    }
+
+    if (existing) {
+        bool image_changed = false;
+        if (!effective_img_id.value().empty() && existing->os_image_id() != effective_img_id) {
+            image_changed = true;
+        }
+        if (!image_changed && image_manager_ && !effective_img_id.value().empty()) {
+            if (auto info = image_manager_->get_image_info(effective_img_id); info.is_ok()) {
+                if (!existing->physical_image_path().empty() &&
+                    !info.value().file_path.empty() &&
+                    existing->physical_image_path() != info.value().file_path) {
+                    image_changed = true;
+                }
+            }
+        }
+
+        if (image_changed) {
+            if (existing->live_connections() == 0) {
+                Logger::default_logger().info("SESSION",
+                    "Image change detected for client " + existing->id().value() + " (" +
+                    existing->os_image_id().value() + " -> " + effective_img_id.value() +
+                    ") with 0 active connections. Hot-swapping session.");
+                (void)terminate_session_locked(existing->id());
+                existing.reset();
+            } else {
+                Logger::default_logger().warn("SESSION",
+                    "Image change requested for client " + existing->id().value() + " (" +
+                    existing->os_image_id().value() + " -> " + effective_img_id.value() +
+                    ") but session has " + std::to_string(existing->live_connections()) +
+                    " active connection(s). Guarding against mid-session teardown.");
+                existing->set_pending_swap(effective_img_id);
+                return Error(ErrorCode::UnsupportedOperation,
+                    "Cannot hot-swap assigned image while client has " +
+                    std::to_string(existing->live_connections()) + " active connection(s). Swap queued as pending.");
+            }
+        } else {
+            if (!initiator_iqn.empty() && existing->initiator_iqn().empty()) {
+                existing->set_initiator_iqn(initiator_iqn);
+                sessions_by_iqn_[initiator_iqn] = existing->id().value();
+            }
+            // Publish the identities this login presented (MAC spelling, peer
+            // IP) so the next reconnect -- msiscsi's generated IQN, a
+            // differently cased MAC -- hits this session directly.
+            index_session_identity_locked(existing, client_id, client_ip);
+            return existing;
+        }
+    }
+
     if (storage_manager_ && effective_wb_dir == writeback_dir_) {
-        if (!storage_manager_->is_role_assigned(StorageRole::Writeback)) {
-            return Error(ErrorCode::InvalidConfiguration,
-                "Writeback storage role is unassigned. Administrator must explicitly assign and confirm Writeback storage in Storage Roles.");
+        if (storage_manager_->is_role_assigned(StorageRole::Writeback)) {
+            auto assigned_wb = storage_manager_->get_role_path(StorageRole::Writeback);
+            if (!assigned_wb.empty()) {
+                effective_wb_dir = assigned_wb;
+            }
         }
-        auto assigned_wb = storage_manager_->get_role_path(StorageRole::Writeback);
-        if (!assigned_wb.empty()) {
-            effective_wb_dir = assigned_wb;
-            std::error_code ec;
-            std::filesystem::create_directories(effective_wb_dir, ec);
-        }
+    }
+    std::error_code ec_dir;
+    std::filesystem::create_directories(effective_wb_dir, ec_dir);
+
+    if (!image_manager_) {
+        return Error(ErrorCode::InitializationFailure, "Image manager not configured");
+    }
+
+    // Config-driven Super Client identities: an initiator IQN, MAC or IP listed
+    // in super_client_identity= always runs in maintenance mode.
+    if (!is_super &&
+        (is_super_identity_locked(initiator_iqn) ||
+         is_super_identity_locked(client_id.value()))) {
+        is_super = true;
     }
 
     // A Super Client in direct-write mode owns the base image exclusively.
@@ -242,30 +354,71 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
         }
     }
 
-    // Sanitize client id for filename (e.g. replace ':' with '_')
-    std::string safe_name = client_id.value();
-    std::replace(safe_name.begin(), safe_name.end(), ':', '_');
-    std::replace(safe_name.begin(), safe_name.end(), '/', '_');
-    std::replace(safe_name.begin(), safe_name.end(), '\\', '_');
+    // Overlay filename: a MAC id is stripped to bare lowercase hex so the
+    // colons never reach the Windows filesystem ("wb_0011223344aa.cow");
+    // any other id only loses characters NTFS forbids. An overlay left under
+    // the legacy colon-sanitized name is migrated, not orphaned.
     std::error_code ec_wb;
     std::filesystem::create_directories(effective_wb_dir, ec_wb);
 
-    auto wb_path = effective_wb_dir / ("wb_" + safe_name + ".cow");
+    auto wb_path = overlay_naming::resolve_writeback_overlay(effective_wb_dir,
+                                                             client_id.value());
 
-    auto cow_res = CowBlockDevice::create(golden_img->device(), wb_path);
+    // For anonymous IP sessions or stale IP-keyed overlays from previous crashes,
+    // unconditionally purge the IP overlay to prevent dirty chunk reloading.
+    if (!is_super) {
+        std::error_code ec_rem;
+        if (client_id.value().rfind("ip_", 0) == 0) {
+            if (std::filesystem::exists(wb_path, ec_rem)) {
+                std::filesystem::remove(wb_path, ec_rem);
+                Logger::default_logger().info("SESSION",
+                    "[COW] Purged stale anonymous IP writeback overlay: " + wb_path.string());
+            }
+        }
+        if (!client_ip.is_any()) {
+            std::vector<std::filesystem::path> alt_dirs = {
+                effective_wb_dir,
+                "E:\\writeback",
+                "E:\\",
+                "./writeback"
+            };
+            for (const auto& ad : alt_dirs) {
+                std::filesystem::path ip_cow = ad / ("wb_ip_" + client_ip.ip_string() + ".cow");
+                if (ip_cow != wb_path && std::filesystem::exists(ip_cow, ec_rem)) {
+                    std::filesystem::remove(ip_cow, ec_rem);
+                    Logger::default_logger().info("SESSION",
+                        "[COW] Purged stale IP writeback overlay: " + ip_cow.string());
+                }
+            }
+        }
+    }
+
+    auto cow_res = UnifiedCowDevice::create(golden_img->device(), wb_path, 4096, client_id.value());
     if (!cow_res.is_ok()) {
         // Crash / corruption recovery: quarantine corrupted file and retry with a clean one
-        (void)CowBlockDevice::quarantine_corrupted_overlay(wb_path);
-        cow_res = CowBlockDevice::create(golden_img->device(), wb_path);
+        Logger::default_logger().warn("SESSION",
+            "[COW] Overlay open failed (" + cow_res.error().to_string() + "), attempting quarantine recovery for " + wb_path.string());
+        (void)UnifiedCowDevice::quarantine_corrupted_overlay(wb_path);
+        cow_res = UnifiedCowDevice::create(golden_img->device(), wb_path, 4096, client_id.value());
         if (!cow_res.is_ok()) {
+            // Fail closed: without a writable overlay the boot must stop here.
+            // There is deliberately no fallback to writing the base image --
+            // that would let a standard client dirty the master VHD.
+            Logger::default_logger().error("SESSION",
+                "[FATAL] [COW] Aborting session creation for client " + client_id.value() +
+                ": failed to initialize writeback overlay at " + wb_path.string() + " -> " + cow_res.error().to_string() +
+                ". Boot terminated (no fallback to base image).");
             (void)image_manager_->release_image(effective_img_id);
             return cow_res.error();
         }
     }
 
-    std::shared_ptr<CowBlockDevice> cow = cow_res.value();
+    std::shared_ptr<UnifiedCowDevice> cow = cow_res.value();
     if (writeback_quota_bytes_ > 0) {
         cow->set_writeback_quota(writeback_quota_bytes_);
+    }
+    if (writeback_ram_bytes_ > 0) {
+        cow->set_ram_writeback_bytes(writeback_ram_bytes_);
     }
 
     auto session = std::make_shared<ClientSession>(
@@ -277,8 +430,17 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
     session->set_physical_image_path(golden_img->path());
     session->set_base_image(golden_img);
 
-    // Automated PNP driver arming check before iSCSI mounts or serves blocks
-    (void)PnpDriverArmer::ensure_image_armed(golden_img->path());
+    // Strict 2-Tier storage:
+    //   Tier 0 -- csmw10.vhd, the master, opened read-only and never written.
+    //   Tier 1 -- wb_<mac>.cow, the only writable layer, discarded at boot.
+    //
+    // There is deliberately no hardware-profile layer between them. NIC
+    // bindings live inside the master image itself (hardware_manifest.json
+    // records which ones have been baked in), so a per-MAC middle layer would
+    // only be a second place for the same fact to drift out of sync.
+    auto tiered = std::make_shared<TieredBlockDevice>(golden_img->device(), nullptr, cow);
+    session->set_tiered_device(tiered);
+
     if (!initiator_iqn.empty()) {
         session->set_initiator_iqn(initiator_iqn);
     }
@@ -328,11 +490,17 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
             } else {
                 auto info_res = image_manager_->get_image_info(effective_img_id);
                 if (info_res.is_ok()) {
+                    // Authenticated Super Client maintenance mode: the explicit
+                    // ReadOnlyAttributePolicy::Lift is what makes the master
+                    // image writable here; every other read-write open of the
+                    // same file fails with Access Denied.
                     auto rw = open_image_backend(info_res.value().format,
                                                  info_res.value().file_path,
-                                                 /*read_only=*/false);
+                                                 /*read_only=*/false,
+                                                 ReadOnlyAttributePolicy::Lift);
                     if (rw.is_ok()) {
                         cow->set_base_device(rw.value());
+                        cow->set_super_client(true);
                         cow->set_direct_base_writes(true);
                         session->set_super_direct_mode(true);
                         Logger::default_logger().info("SUPER_CLIENT",
@@ -369,6 +537,7 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
     if (!initiator_iqn.empty()) {
         sessions_by_iqn_[initiator_iqn] = client_id.value();
     }
+    index_session_identity_locked(session, client_id, client_ip);
     return session;
 }
 
@@ -392,6 +561,65 @@ std::shared_ptr<ClientSession> ClientSessionManager::find_session_by_iqn(const s
     }
     auto it = sessions_.find(ClientId(iqn_it->second));
     return it != sessions_.end() ? it->second : nullptr;
+}
+
+std::shared_ptr<ClientSession> ClientSessionManager::find_session_by_ip(const NetworkAddress& client_ip) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto ip_it = sessions_by_ip_.find(client_ip.ip_string());
+    if (ip_it == sessions_by_ip_.end()) {
+        return nullptr;
+    }
+    auto it = sessions_.find(ClientId(ip_it->second));
+    return it != sessions_.end() ? it->second : nullptr;
+}
+
+std::shared_ptr<ClientSession> ClientSessionManager::find_session_by_mac(const std::string& mac) const {
+    if (!overlay_naming::looks_like_mac(mac)) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto m_it = sessions_by_mac_.find(overlay_naming::sanitize_mac(mac));
+    if (m_it == sessions_by_mac_.end()) {
+        return nullptr;
+    }
+    auto it = sessions_.find(ClientId(m_it->second));
+    return it != sessions_.end() ? it->second : nullptr;
+}
+
+void ClientSessionManager::index_session_identity_locked(
+    const std::shared_ptr<ClientSession>& session,
+    const ClientId& queried_id,
+    const NetworkAddress& queried_ip
+) {
+    const std::string& sid = session->id().value();
+    if (overlay_naming::looks_like_mac(sid)) {
+        sessions_by_mac_[overlay_naming::sanitize_mac(sid)] = sid;
+    }
+    // The id the login was *looked up* with may be a different spelling (or a
+    // different identity altogether, e.g. "ip_..") of the same machine: map it
+    // to the session it actually resolved to.
+    if (overlay_naming::looks_like_mac(queried_id.value())) {
+        sessions_by_mac_[overlay_naming::sanitize_mac(queried_id.value())] = sid;
+    }
+    sessions_by_ip_[session->ip().ip_string()] = sid;
+    sessions_by_ip_[queried_ip.ip_string()] = sid;
+}
+
+void ClientSessionManager::unindex_session_identity_locked(const ClientId& client_id) {
+    for (auto it = sessions_by_mac_.begin(); it != sessions_by_mac_.end();) {
+        if (it->second == client_id.value()) {
+            it = sessions_by_mac_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = sessions_by_ip_.begin(); it != sessions_by_ip_.end();) {
+        if (it->second == client_id.value()) {
+            it = sessions_by_ip_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 Result<void> ClientSessionManager::bind_initiator_iqn(const ClientId& client_id, const std::string& iqn) {
@@ -445,10 +673,102 @@ bool ClientSessionManager::is_super_identity_locked(const std::string& identity)
 Result<void> ClientSessionManager::reset_client(const ClientId& client_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = sessions_.find(client_id);
-    if (it == sessions_.end()) {
-        return Error(ErrorCode::StorageFailure, "Client session not found: " + client_id.value());
+    if (it == sessions_.end() && overlay_naming::looks_like_mac(client_id.value())) {
+        auto m_it = sessions_by_mac_.find(overlay_naming::sanitize_mac(client_id.value()));
+        if (m_it != sessions_by_mac_.end()) {
+            it = sessions_.find(ClientId(m_it->second));
+        }
     }
-    return it->second->reset();
+    if (it == sessions_.end()) {
+        auto ip_it = sessions_by_ip_.find(client_id.value());
+        if (ip_it == sessions_by_ip_.end() && client_id.value().rfind("ip_", 0) == 0) {
+            ip_it = sessions_by_ip_.find(client_id.value().substr(3));
+        }
+        if (ip_it != sessions_by_ip_.end()) {
+            it = sessions_.find(ClientId(ip_it->second));
+        }
+    }
+
+    Result<void> reset_res = {};
+    if (it != sessions_.end()) {
+        reset_res = it->second->reset();
+    }
+
+    // Super Client retention: a super client's overlay is uncommitted work.
+    // reset() is invoked on every cold /boot (and on shutdown paths), so an
+    // unconditional purge here would silently destroy updates the operator
+    // has not committed yet. Retain the files; the explicit commit path
+    // (CLI `commit`, API, console) is what consumes them.
+    bool retain_overlay = (it != sessions_.end() && it->second &&
+                           it->second->is_super_client());
+    if (!retain_overlay && station_manager_) {
+        std::string mac_probe = client_id.value();
+        if (mac_probe.rfind("ip_", 0) == 0) {
+            mac_probe = mac_probe.substr(3);
+        }
+        if (auto st = station_manager_->find_by_mac(mac_probe);
+            st.has_value() && st->super_client) {
+            retain_overlay = true;
+        }
+    }
+    if (retain_overlay) {
+        Logger::default_logger().warn("SESSION",
+            "[SESSION] Retaining writeback overlay for Super Client " +
+                client_id.value() +
+                " (reset does not purge; commit it explicitly)");
+        if (it != sessions_.end()) {
+            return reset_res;
+        }
+        return {};
+    }
+
+    // Always check and remove on-disk writeback overlays to prevent dirty chunk reloading
+    std::filesystem::path effective_wb_dir = writeback_dir_;
+    if (storage_manager_ && storage_manager_->is_role_assigned(StorageRole::Writeback)) {
+        auto assigned_wb = storage_manager_->get_role_path(StorageRole::Writeback);
+        if (!assigned_wb.empty()) {
+            effective_wb_dir = assigned_wb;
+        }
+    }
+
+    std::vector<std::filesystem::path> check_dirs = {
+        effective_wb_dir,
+        writeback_dir_,
+        "E:\\writeback",
+        "E:\\",
+        "./writeback"
+    };
+
+    std::vector<std::string> target_names;
+    const std::string raw_id = client_id.value();
+    target_names.push_back(overlay_naming::overlay_file_name(raw_id));
+    target_names.push_back("wb_" + raw_id + ".cow");
+    target_names.push_back("wb_ip_" + raw_id + ".cow");
+    if (raw_id.rfind("ip_", 0) == 0) {
+        target_names.push_back("wb_" + raw_id.substr(3) + ".cow");
+        target_names.push_back("wb_ip_" + raw_id.substr(3) + ".cow");
+    }
+    if (overlay_naming::looks_like_mac(raw_id)) {
+        target_names.push_back("wb_" + overlay_naming::sanitize_mac(raw_id) + ".cow");
+    }
+
+    for (const auto& d : check_dirs) {
+        if (d.empty()) continue;
+        for (const auto& name : target_names) {
+            std::filesystem::path cow_path = d / name;
+            std::error_code ec;
+            if (std::filesystem::exists(cow_path, ec)) {
+                std::filesystem::remove(cow_path, ec);
+                Logger::default_logger().info("SESSION",
+                    "[SESSION] Purged on-disk writeback overlay: " + cow_path.string());
+            }
+        }
+    }
+
+    if (it != sessions_.end()) {
+        return reset_res;
+    }
+    return {};
 }
 
 Result<void> ClientSessionManager::commit_super_client_session_locked(std::shared_ptr<ClientSession> session) {
@@ -502,7 +822,11 @@ Result<void> ClientSessionManager::commit_super_client_session_locked(std::share
     (void)image_manager_->evict_cached_image(img_id);
 
     // 5. Open image backend read-write (suspends the shared read-only pool).
-    auto target_backend = open_image_backend(fmt, img_path, /*read_only=*/false);
+    //    Super Client commit: the ONLY sanctioned way to write a master image,
+    //    so the read-only attribute is lifted explicitly and re-applied when
+    //    the writer is released.
+    auto target_backend = open_image_backend(fmt, img_path, /*read_only=*/false,
+                                             ReadOnlyAttributePolicy::Lift);
     if (!target_backend.is_ok()) {
         (void)image_manager_->reload_image(img_id);  // restore a readable copy
         return target_backend.error();
@@ -518,16 +842,6 @@ Result<void> ClientSessionManager::commit_super_client_session_locked(std::share
 
     (void)target_backend.value()->flush();
     target_backend.value().reset();
-
-    // Post-merge PNP driver re-arm sweep:
-    auto arm_res = PnpDriverArmer::ensure_image_armed(img_path);
-    if (!arm_res.is_ok()) {
-        Logger::default_logger().warn("SUPER_CLIENT",
-            "Post-merge driver re-arm warning on " + img_path.string() + ": " + std::string(arm_res.error().message()));
-    } else {
-        Logger::default_logger().info("SUPER_CLIENT",
-            "Post-merge driver re-arm sweep completed on " + img_path.string());
-    }
 
     // 7. Reset writeback overlay file
     auto reset_res = cow->reset();
@@ -558,8 +872,7 @@ Result<void> ClientSessionManager::commit_super_client(const ClientId& client_id
     return commit_super_client_session_locked(it->second);
 }
 
-Result<void> ClientSessionManager::terminate_session(const ClientId& client_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+Result<void> ClientSessionManager::terminate_session_locked(const ClientId& client_id) {
     auto it = sessions_.find(client_id);
     if (it == sessions_.end()) {
         return Error(ErrorCode::StorageFailure, "Client session not found: " + client_id.value());
@@ -584,6 +897,7 @@ Result<void> ClientSessionManager::terminate_session(const ClientId& client_id) 
             // later read-only reopen of this path waits for the writer count
             // to reach zero, so the ordering here is what avoids a deadlock.
             (void)cow->flush();
+            cow->set_super_client(false);
             cow->set_direct_base_writes(false);
             if (session->base_image()) {
                 cow->set_base_device(session->base_image()->device());
@@ -604,13 +918,17 @@ Result<void> ClientSessionManager::terminate_session(const ClientId& client_id) 
         }
     }
 
-    // Clean teardown: close handles and drop the overlay so the next login of
-    // this client always starts from a pristine baseline.
+    // Clean teardown: close handles, then purge overlay files.
+    if (session->tiered_device()) {
+        session->tiered_device()->close();
+        session->set_tiered_device(nullptr);
+    }
     if (cow) {
         (void)cow->flush();
         cow->close();
         (void)cow->purge_overlay();
     }
+
 
     if (image_manager_) {
         (void)image_manager_->release_image(img_id);
@@ -623,9 +941,22 @@ Result<void> ClientSessionManager::terminate_session(const ClientId& client_id) 
             ++iqn_it;
         }
     }
+    unindex_session_identity_locked(client_id);
 
     sessions_.erase(it);
     return {};
+}
+
+Result<void> ClientSessionManager::terminate_session_locked(std::shared_ptr<ClientSession> session) {
+    if (!session) {
+        return Error(ErrorCode::StorageFailure, "Null session");
+    }
+    return terminate_session_locked(session->id());
+}
+
+Result<void> ClientSessionManager::terminate_session(const ClientId& client_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return terminate_session_locked(client_id);
 }
 
 std::vector<std::shared_ptr<ClientSession>> ClientSessionManager::list_sessions() const {

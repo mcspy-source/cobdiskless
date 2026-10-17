@@ -4,7 +4,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #endif
+#if defined(__CYGWIN__) || defined(__MSYS__)
+#include <sys/cygwin.h>
+#endif
+#include <sys/stat.h>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -18,6 +23,10 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <random>
+#include <mutex>
+#include <condition_variable>
+#include <array>
 
 #include "CobDisklessCore/core.hpp"
 #include "CobDisklessCore/types/common_types.hpp"
@@ -36,10 +45,15 @@
 #include "CobDisklessCore/image/golden_image.hpp"
 #include "CobDisklessCore/image/image_registry.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
-#include "CobDisklessCore/image/pnp_driver_armer.hpp"
+#include "CobDisklessCore/image/reg_bootstart.hpp"
+#include "CobDisklessCore/image/hardware_manifest.hpp"
+#include "CobDisklessCore/image/cob_armer.hpp"
 #include "CobDisklessCore/storage/storage_tester.hpp"
-#include "CobDisklessCore/storage/cow_block_device.hpp"
-#include "CobDisklessCore/storage/writeback_context.hpp"
+#include "CobDisklessCore/storage/unified_cow_device.hpp"
+#include "CobDisklessCore/storage/file_attributes.hpp"
+#include "CobDisklessCore/storage/overlay_naming.hpp"
+#include "CobDisklessCore/storage/random_access_file.hpp"
+#include "CobDisklessCore/storage/base_cache.hpp"
 #include "CobDisklessCore/client/client_session.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/client/machine_store.hpp"
@@ -53,6 +67,9 @@
 #include "CobDisklessCore/network/ipxe_script.hpp"
 #include "CobDisklessCore/network/cob_rename_script.hpp"
 #include "CobDisklessCore/client/client_database.hpp"
+#include "CobDisklessCore/storage/game_disk_engine.hpp"
+#include "CobDisklessCore/storage/tiered_storage_engine.hpp"
+#include "CobDisklessCore/storage/vhdx_image_backend.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/config/simple_json.hpp"
 
@@ -147,6 +164,19 @@ private:
 // =============================================================================
 // Synthesis Helpers for Disk Structures
 // =============================================================================
+
+// REG_SZ payload bytes exactly as Windows stores them: UTF-16LE. A raw byte
+// search for a *value's* data has to look for the wide form -- value names and
+// key names are inline ANSI, values are not.
+inline std::string wide_bytes(const std::string& ascii) {
+    std::string out;
+    out.reserve(ascii.size() * 2);
+    for (const char c : ascii) {
+        out.push_back(c);
+        out.push_back('\0');
+    }
+    return out;
+}
 
 inline void write_le16(uint8_t* p, uint16_t val) {
     p[0] = static_cast<uint8_t>(val & 0xFF);
@@ -774,9 +804,15 @@ void test_vhd_image_backend() {
 
     assert(VhdImageBackend::is_vhd(temp_vhd));
 
-    auto vhd_res = VhdImageBackend::open(temp_vhd, true);
-    assert(vhd_res.is_ok());
-    auto vhd = vhd_res.value();
+    // Scope the Result so its shared_ptr copy dies here: with the strict
+    // FILE_SHARE_READ-only handle, a lingering backend keeps the file locked
+    // (no FILE_SHARE_DELETE) and the remove below would fail.
+    std::shared_ptr<VhdImageBackend> vhd;
+    {
+        auto vhd_res = VhdImageBackend::open(temp_vhd, true);
+        assert(vhd_res.is_ok());
+        vhd = vhd_res.value();
+    }
 
     assert(vhd->size() == virtual_size);
     assert(vhd->metadata().format == ImageFormat::VhdFixed);
@@ -790,7 +826,7 @@ void test_vhd_image_backend() {
     assert(sector0[510] == 0x55);
     assert(sector0[511] == 0xAA);
 
-    vhd.reset();
+    vhd.reset(); // last reference -> pooled handle released before the remove
     std::filesystem::remove(temp_vhd);
 
     std::cout << "  PASS: test_vhd_image_backend\n";
@@ -1130,8 +1166,8 @@ void test_cow_block_device_lifecycle() {
     assert(base_dev_res.is_ok());
     auto base_dev = base_dev_res.value();
 
-    // 2. Create CowBlockDevice
-    auto cow_res = CowBlockDevice::create(base_dev, cow_path, 4096);
+    // 2. Create UnifiedCowDevice
+    auto cow_res = UnifiedCowDevice::create(base_dev, cow_path, 4096);
     assert(cow_res.is_ok());
     auto cow = cow_res.value();
 
@@ -1312,7 +1348,8 @@ void test_dhcp_architecture_detection_and_pxe_provisioning() {
     auto bios_reply = server.build_reply(bios_hdr, bios_parse.value(), 2, NetworkAddress(192, 168, 1, 100));
     assert(bios_reply.is_ok());
     const auto* reply_hdr = reinterpret_cast<const DhcpHeader*>(bios_reply.value().data());
-    assert(std::string(reinterpret_cast<const char*>(reply_hdr->file)) == "undionly.kpxe");
+    std::string bios_file = reinterpret_cast<const char*>(reply_hdr->file);
+    assert(bios_file == "cobpxe.kpxe" || bios_file == "undionly.kpxe");
 
     // 2. UEFI Client (Arch 7): DHCPDISCOVER with Option 93 = 7
     DhcpHeader uefi_hdr{};
@@ -1339,7 +1376,8 @@ void test_dhcp_architecture_detection_and_pxe_provisioning() {
     auto uefi_reply = server.build_reply(uefi_hdr, uefi_parse.value(), 2, NetworkAddress(192, 168, 1, 101));
     assert(uefi_reply.is_ok());
     const auto* uefi_reply_hdr = reinterpret_cast<const DhcpHeader*>(uefi_reply.value().data());
-    assert(std::string(reinterpret_cast<const char*>(uefi_reply_hdr->file)) == "ipxe.efi");
+    std::string uefi_file = reinterpret_cast<const char*>(uefi_reply_hdr->file);
+    assert(uefi_file == "cobpxe.efi" || uefi_file == "ipxe.efi");
 
     // 3. iPXE Client Stage 2: DHCPREQUEST with Option 175
     DhcpHeader ipxe_hdr{};
@@ -1367,7 +1405,7 @@ void test_dhcp_architecture_detection_and_pxe_provisioning() {
     const auto* ipxe_reply_hdr = reinterpret_cast<const DhcpHeader*>(ipxe_reply.value().data());
     assert(std::string(reinterpret_cast<const char*>(ipxe_reply_hdr->file)) == "boot.ipxe");
 
-    // 4. IA32 UEFI Client (Arch 6): must receive ipxe.efi, NOT undionly.kpxe
+    // 4. IA32 UEFI Client (Arch 6): must receive cobpxe.efi, NOT cobpxe.kpxe
     DhcpHeader uefi32_hdr = uefi_hdr;
     std::vector<uint8_t> uefi32_packet(reinterpret_cast<const uint8_t*>(&uefi32_hdr),
                                         reinterpret_cast<const uint8_t*>(&uefi32_hdr) + sizeof(DhcpHeader));
@@ -1381,7 +1419,7 @@ void test_dhcp_architecture_detection_and_pxe_provisioning() {
     auto uefi32_reply = server.build_reply(uefi32_hdr, uefi32_parse.value(), 2, NetworkAddress(192, 168, 1, 102));
     assert(uefi32_reply.is_ok());
     const auto* uefi32_reply_hdr = reinterpret_cast<const DhcpHeader*>(uefi32_reply.value().data());
-    assert(std::string(reinterpret_cast<const char*>(uefi32_reply_hdr->file)) == "ipxe.efi");
+    assert(std::string(reinterpret_cast<const char*>(uefi32_reply_hdr->file)) == "cobpxe.efi");
 
     std::cout << "  PASS: test_dhcp_architecture_detection_and_pxe_provisioning\n";
 }
@@ -1391,19 +1429,25 @@ void test_tftp_server_virtual_payloads_and_ipxe_script() {
 
     TftpServer server(NetworkAddress(192, 168, 1, 1));
 
-    // 1. Dynamic iPXE script generation (single clean sanboot - no sanhook pair)
+    // 1. Dynamic iPXE script generation (PCI sniffing enrollment chain)
     std::string script = server.generate_ipxe_script("iqn.2026-09.com.cobdiskless:storage");
     assert(script.find("#!ipxe") != std::string::npos);
-    assert(script.find("sanboot iscsi:192.168.1.1::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
     assert(script.find("dhcp") != std::string::npos);
-    assert(script.find("set keep-san 1") != std::string::npos);
-    // Exactly ONE SAN attach: no 'sanhook' and no hardcoded '--drive 0x80'
-    // (duplicate attaches produce iPXE error 0x03232019 / EADDRINUSE).
-    assert(script.find("sanhook") == std::string::npos);
-    assert(script.find("--drive 0x80") == std::string::npos);
-    assert(script.find("iscsi:") == script.rfind("iscsi:")); // single iscsi reference
+    assert(script.find("set busloc ${net0/busloc}") != std::string::npos);
+    assert(script.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(script.find("set dev ${pci/${busloc}.2.2:hex}") != std::string::npos);
+    assert(script.find("set rev ${pci/${busloc}.8.1:hex}") != std::string::npos);
+    assert(script.find("set subven ${pci/${busloc}.2c.2:hex}") != std::string::npos);
+    assert(script.find("set subdev ${pci/${busloc}.2e.2:hex}") != std::string::npos);
+    assert(script.find("chain http://192.168.1.1:18080/boot.ipxe?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&platform=${platform}") != std::string::npos);
 
-    // 2. Virtual file content checks
+
+    // 2. Virtual file content checks (hermetic: registered here so this
+    //    test does not depend on real boot assets on disk -- the DHCP
+    //    filename test a few suites up requires undionly.kpxe to be absent,
+    //    so on-disk presence can never satisfy both).
+    server.register_virtual_file("undionly.kpxe", std::vector<uint8_t>{0x55, 0xAA});
+    server.register_virtual_file("ipxe.efi", std::vector<uint8_t>{0x4D, 0x5A});
     auto ipxe_res = server.get_file_content("boot.ipxe");
     assert(ipxe_res.is_ok());
     assert(!ipxe_res.value().empty());
@@ -1449,8 +1493,10 @@ void test_iscsi_target_scsi_emulation_and_client_dispatch() {
     const auto& inq = inq_res.value();
     assert(inq.size() == 36);
     assert(inq[0] == 0x00); // Direct access block device
-    assert(std::string(reinterpret_cast<const char*>(inq.data() + 8), 8) == "COB     ");
-    assert(std::string(reinterpret_cast<const char*>(inq.data() + 16), 16) == "CobDiskless SAN ");
+    assert(inq[1] == 0x00); // RMB = 0: a fixed disk, never a removable one
+    assert(std::string(reinterpret_cast<const char*>(inq.data() + 8), 8) == "COBDISK ");
+    assert(std::string(reinterpret_cast<const char*>(inq.data() + 16), 16) == "VIRTUAL SAN DISK");
+    assert(std::string(reinterpret_cast<const char*>(inq.data() + 32), 4) == "0001");
 
     // 2. Test READ CAPACITY (10)
     // 1000 sectors, 512 bytes each
@@ -1824,19 +1870,21 @@ static void test_arc_adaptive_replacement() {
     std::cout << "  PASS: test_arc_adaptive_replacement\n";
 }
 
-// Subsystem E2: the async writeback ring. An iSCSI WRITE is acknowledged once
-// the chunk image is in RAM; a background worker carries it to the overlay
-// file. The invariants worth proving are that the ring never serves a stale
-// byte, that it stays bounded, and that every drain point really lands the
-// data on disk.
+// Subsystem E2: the L1 RAM cache and its background lazy flusher. An iSCSI
+// WRITE is acknowledged once the 64 KiB chunk image is in RAM; a background
+// worker carries it to the .cow file. The invariants worth proving are that
+// the cache never serves a stale or torn byte, that flush()/close() are real
+// drain points, and that the on-disk layout keeps data clusters clear of the
+// header block no matter how the flusher schedules its batches.
 static void test_async_writeback_ring() {
     std::cout << "Running test_async_writeback_ring...\n";
     std::error_code ec;
     auto test_dir = std::filesystem::current_path() / "test_scratch_writeback_ring";
+    std::filesystem::remove_all(test_dir, ec);
     std::filesystem::create_directories(test_dir, ec);
 
-    const uint32_t chunk = 4096;
-    const uint64_t base_size = 1024 * 1024;
+    const uint32_t chunk = kCowChunkBytes;
+    const uint64_t base_size = 1024 * 1024; // exactly 16 x 64 KiB chunks
 
     auto base_path = test_dir / "ring_base.raw";
     {
@@ -1852,102 +1900,120 @@ static void test_async_writeback_ring() {
     std::vector<std::byte> chunk_buf(chunk);
     std::vector<std::byte> read_buf(chunk);
 
-    auto overlay_of = [&](const char* name) { return test_dir / name; };
+    // Parses the metadata cluster exactly the way a fresh session would.
+    auto read_meta = [&](const std::filesystem::path& p) {
+        CowFileHeader hdr{};
+        std::vector<CowTableEntry> table;
+        std::ifstream ifs(p, std::ios::binary);
+        assert(ifs.is_open());
+        ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        assert(ifs.gcount() == static_cast<std::streamsize>(sizeof(hdr)));
+        assert(std::memcmp(hdr.magic, kCowMagic, 8) == 0);
+        assert(hdr.version == kCowVersion);
+        assert(hdr.chunk_size == kCowChunkBytes);
+        assert(hdr.entry_capacity == kCowTableCapacity);
+        assert(hdr.entry_count <= kCowTableCapacity);
+        table.resize(hdr.entry_count);
+        if (hdr.entry_count != 0) {
+            ifs.seekg(static_cast<std::streamoff>(kCowTableOffset));
+            ifs.read(reinterpret_cast<char*>(table.data()),
+                     static_cast<std::streamsize>(hdr.entry_count * sizeof(CowTableEntry)));
+            assert(ifs.gcount() ==
+                   static_cast<std::streamsize>(hdr.entry_count * sizeof(CowTableEntry)));
+        }
+        return std::make_pair(hdr, table);
+    };
+
+    auto payload_at = [&](const std::filesystem::path& p, uint32_t file_cluster, uint8_t fill) {
+        std::ifstream ifs(p, std::ios::binary);
+        assert(ifs.is_open());
+        ifs.seekg(static_cast<std::streamoff>(
+            kCowDataOffset + static_cast<uint64_t>(file_cluster) * kCowChunkBytes));
+        std::vector<uint8_t> payload(chunk);
+        ifs.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(chunk));
+        assert(ifs.gcount() == static_cast<std::streamsize>(chunk));
+        assert(payload[0] == fill);
+        assert(payload[chunk - 1] == fill);
+    };
 
     // ---- 1. read-after-write is exact with no flush in between ------------
     {
-        WritebackContext ctx(overlay_of("ring_a.cow"), chunk);
-        assert(ctx.open(base).is_ok());
-        assert(ctx.pending_chunks() == 0);
-        assert(ctx.writeback_ring_chunks() >= 1);
+        auto ctx_res = UnifiedCowDevice::create(base, test_dir / "ring_a.cow", chunk);
+        assert(ctx_res.is_ok());
+        auto ctx = ctx_res.value();
+        assert(ctx->pending_chunks() == 0);
+        assert(ctx->flush_threshold_chunks() >= 1);
 
         for (uint64_t c = 0; c < 16; ++c) {
             const auto fill = std::byte{static_cast<uint8_t>(0xA0 + c)};
             std::fill(chunk_buf.begin(), chunk_buf.end(), fill);
-            auto w = ctx.write(c * chunk, chunk_buf);
+            auto w = ctx->write(c * chunk, chunk_buf);
             assert(w.is_ok() && w.value() == chunk);
 
             // The worker may or may not have caught up; either way the read
             // has to come back with exactly what was just written.
             std::fill(read_buf.begin(), read_buf.end(), std::byte{0});
-            auto r = ctx.read(c * chunk, read_buf);
+            auto r = ctx->read(c * chunk, read_buf);
             assert(r.is_ok() && r.value() == chunk);
             for (size_t j = 0; j < chunk; ++j) {
                 assert(read_buf[j] == fill);
             }
         }
 
-        // Bounded: the ring may never exceed its configured ceiling, however
-        // fast the initiator writes relative to the disk.
-        assert(ctx.pending_chunks() <= ctx.writeback_ring_chunks());
-
         // ---- 2. flush() is a hard drain point ----
-        assert(ctx.flush().is_ok());
-        assert(ctx.pending_chunks() == 0);
-        ctx.close();
+        assert(ctx->flush().is_ok());
+        assert(ctx->pending_chunks() == 0);
+        assert(ctx->allocated_chunks() == 16);
+        ctx->close();
     }
 
-    // The flush above has to have produced real bytes in a real file, with a
-    // header that advertises the slots those bytes occupy.
+    // The flush above has to have produced real bytes in a real file, under a
+    // header that advertises the clusters those bytes occupy.
     {
-        std::ifstream ifs(overlay_of("ring_a.cow"), std::ios::binary);
-        assert(ifs.is_open());
-
-        CowHeader hdr{};
-        ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-        assert(ifs.gcount() == static_cast<std::streamsize>(sizeof(hdr)));
-        assert(std::memcmp(hdr.magic, "COWB", 4) == 0);
-        assert(hdr.chunk_size == chunk);
-        assert(hdr.allocated_chunks == 16);
-
-        const uint64_t slot_size = sizeof(uint64_t) + chunk;
+        auto meta = read_meta(test_dir / "ring_a.cow");
+        const CowFileHeader& hdr = meta.first;
+        const auto& table = meta.second;
+        assert(hdr.entry_count == 16);
+        assert(hdr.capacity_bytes == base_size);
         for (uint64_t slot = 0; slot < 16; ++slot) {
-            ifs.clear();
-            ifs.seekg(static_cast<std::streamoff>(sizeof(CowHeader) + slot * slot_size));
-
-            uint64_t v_chunk = 0;
-            ifs.read(reinterpret_cast<char*>(&v_chunk), sizeof(v_chunk));
-            assert(ifs.gcount() == static_cast<std::streamsize>(sizeof(v_chunk)));
-            assert(v_chunk == slot);
-
-            std::vector<uint8_t> payload(chunk);
-            ifs.read(reinterpret_cast<char*>(payload.data()),
-                     static_cast<std::streamsize>(chunk));
-            assert(ifs.gcount() == static_cast<std::streamsize>(chunk));
-            const auto expected = static_cast<uint8_t>(0xA0 + slot);
-            assert(payload[0] == expected);
-            assert(payload[chunk - 1] == expected);
+            const CowTableEntry* found = nullptr;
+            for (const auto& e : table) {
+                if (e.virtual_chunk == slot) {
+                    found = &e;
+                    break;
+                }
+            }
+            assert(found != nullptr);
+            payload_at(test_dir / "ring_a.cow", found->file_cluster,
+                       static_cast<uint8_t>(0xA0 + slot));
         }
+
+        // The whole point of the rewrite: the header lives in block 0 and data
+        // cluster 0 begins at 65536, so no flush can ever be expressed as an
+        // offset that overlaps the metadata.
+        assert(sizeof(CowFileHeader) == kCowHeaderBytes);
+        assert(kCowTableOffset == kCowHeaderBytes);
+        assert(kCowDataOffset == kCowChunkBytes);
     }
 
     // ---- 3. close() alone drains; no flush() is ever called ---------------
     {
-        WritebackContext ctx(overlay_of("ring_b.cow"), chunk);
-        assert(ctx.open(base).is_ok());
+        auto ctx = UnifiedCowDevice::create(base, test_dir / "ring_b.cow", chunk).value();
         const std::byte marker{0x5C};
         std::fill(chunk_buf.begin(), chunk_buf.end(), marker);
-        assert(ctx.write(40 * chunk, chunk_buf).value() == chunk);
-        assert(ctx.read(40 * chunk, read_buf).is_ok());
+        assert(ctx->write(4 * chunk, chunk_buf).value() == chunk);
+        assert(ctx->read(4 * chunk, read_buf).is_ok());
         assert(read_buf[0] == marker);
-        ctx.close(); // <- the only drain point this block relies on
+        assert(ctx->read(0, read_buf).is_ok()); // base untouched below chunk 4
+        assert(read_buf[0] == std::byte{static_cast<uint8_t>(0 % 251)});
+        ctx->close(); // <- the only drain point this block relies on
     }
     {
-        std::ifstream ifs(overlay_of("ring_b.cow"), std::ios::binary);
-        assert(ifs.is_open());
-        CowHeader hdr{};
-        ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-        assert(ifs.gcount() == static_cast<std::streamsize>(sizeof(hdr)));
-        assert(hdr.allocated_chunks == 1);
-
-        const uint64_t slot_size = sizeof(uint64_t) + chunk;
-        ifs.clear();
-        ifs.seekg(static_cast<std::streamoff>(sizeof(CowHeader) + 0 * slot_size + sizeof(uint64_t)));
-        std::vector<uint8_t> payload(chunk);
-        ifs.read(reinterpret_cast<char*>(payload.data()),
-                 static_cast<std::streamsize>(chunk));
-        assert(ifs.gcount() == static_cast<std::streamsize>(chunk));
-        assert(payload[0] == 0x5C);
-        assert(payload[chunk - 1] == 0x5C);
+        auto meta = read_meta(test_dir / "ring_b.cow");
+        assert(meta.first.entry_count == 1);
+        assert(meta.second.size() == 1);
+        assert(meta.second[0].virtual_chunk == 4);
+        payload_at(test_dir / "ring_b.cow", meta.second[0].file_cluster, 0x5C);
     }
 
     // ---- 4. merge_into() drains; it reads the file directly, so it must ---
@@ -1960,38 +2026,38 @@ static void test_async_writeback_ring() {
         }
         auto target = RawImageBackend::open(target_path.string(), false).value();
 
-        WritebackContext ctx(overlay_of("ring_c.cow"), chunk);
-        assert(ctx.open(base).is_ok());
+        auto ctx = UnifiedCowDevice::create(base, test_dir / "ring_c.cow", chunk).value();
         const std::byte marker{0x77};
         std::fill(chunk_buf.begin(), chunk_buf.end(), marker);
-        assert(ctx.write(3 * chunk, chunk_buf).value() == chunk);
-        assert(ctx.merge_into(target).is_ok());
-        assert(ctx.pending_chunks() == 0);
-        ctx.close();
+        assert(ctx->write(3 * chunk, chunk_buf).value() == chunk);
+        assert(ctx->merge_into(target).is_ok());
+        assert(ctx->pending_chunks() == 0);
+        assert(ctx->allocated_chunks() == 0 || ctx->allocated_chunks() == 1);
+        ctx->close();
 
-        std::ifstream ifs(target_path, std::ios::binary);
-        ifs.seekg(static_cast<std::streamoff>(3 * chunk));
-        uint8_t first = 0;
-        ifs.read(reinterpret_cast<char*>(&first), 1);
-        assert(first == 0x77);
-        ifs.read(reinterpret_cast<char*>(&first), 1);
-        assert(first == 0x77);
+        std::vector<std::byte> tbuf(1024);
+        assert(target->read(3 * chunk, tbuf).is_ok());
+        assert(tbuf[0] == marker);
+        assert(tbuf[tbuf.size() - 1] == marker);
+        assert(target->read(3 * chunk + 1024, tbuf).is_ok());
+        assert(tbuf[0] == marker);
     }
 
-    // ---- 5. read coherence while the ring is under pressure ---------------
-    // A reader that never sees a torn or half-applied image, even with the
-    // ring capped at four chunks so the writer is forced onto the
-    // backpressure path for most of the run.
+    // ---- 5. read coherence while the flusher is under pressure ------------
+    // A reader must never observe a torn or half-applied image, even with the
+    // worker woken on every two dirty chunks so cluster writes overlap the
+    // write path for most of the run.
     {
-        WritebackContext ctx(overlay_of("ring_d.cow"), chunk);
-        ctx.set_writeback_ring_chunks(4);
-        assert(ctx.writeback_ring_chunks() == 4);
-        assert(ctx.open(base).is_ok());
+        auto ctx_res = UnifiedCowDevice::create(base, test_dir / "ring_d.cow", chunk);
+        assert(ctx_res.is_ok());
+        auto ctx = ctx_res.value();
+        ctx->set_flush_threshold_chunks(1);
+        assert(ctx->flush_threshold_chunks() == 1);
 
         // Prime chunk 0 so the reader never observes base-image contents,
         // which are deliberately non-uniform.
         std::fill(chunk_buf.begin(), chunk_buf.end(), std::byte{0});
-        assert(ctx.write(0, chunk_buf).value() == chunk);
+        assert(ctx->write(0, chunk_buf).value() == chunk);
 
         std::atomic<bool> stop{false};
         std::atomic<int> bad_reads{0};
@@ -1999,7 +2065,7 @@ static void test_async_writeback_ring() {
         std::thread reader([&] {
             std::vector<std::byte> local(chunk);
             while (!stop.load(std::memory_order_relaxed)) {
-                if (!ctx.read(0, local).is_ok()) {
+                if (!ctx->read(0, local).is_ok()) {
                     bad_reads.fetch_add(1);
                     return;
                 }
@@ -2017,66 +2083,62 @@ static void test_async_writeback_ring() {
         for (int v = 0; v < kVersions; ++v) {
             std::fill(chunk_buf.begin(), chunk_buf.end(),
                       std::byte{static_cast<uint8_t>(v & 0xFF)});
-            auto w = ctx.write(0, chunk_buf);
+            auto w = ctx->write(0, chunk_buf);
             assert(w.is_ok() && w.value() == chunk);
-            // Invariant re-checked on every iteration, not just at the end.
-            assert(ctx.pending_chunks() <= ctx.writeback_ring_chunks());
         }
 
         stop.store(true, std::memory_order_relaxed);
         reader.join();
         assert(bad_reads.load() == 0);
 
-        assert(ctx.flush().is_ok());
-        assert(ctx.pending_chunks() == 0);
-        assert(ctx.read(0, read_buf).is_ok());
+        assert(ctx->flush().is_ok());
+        assert(ctx->pending_chunks() == 0);
+        assert(ctx->read(0, read_buf).is_ok());
         assert(read_buf[0] == std::byte{static_cast<uint8_t>((kVersions - 1) & 0xFF)});
         assert(read_buf[chunk - 1] == std::byte{static_cast<uint8_t>((kVersions - 1) & 0xFF)});
-        ctx.close();
+        ctx->close();
     }
 
-    // ---- 6. reset() discards in-flight writes rather than draining them ---
+    // ---- 6. reset() discards staged writes rather than draining them ------
     {
-        WritebackContext ctx(overlay_of("ring_e.cow"), chunk);
-        ctx.set_writeback_ring_chunks(1);
-        assert(ctx.open(base).is_ok());
-
+        auto ctx = UnifiedCowDevice::create(base, test_dir / "ring_e.cow", chunk).value();
         std::fill(chunk_buf.begin(), chunk_buf.end(), std::byte{0x33});
-        assert(ctx.write(0, chunk_buf).value() == chunk);
-        assert(ctx.read(0, read_buf).is_ok());
+        assert(ctx->write(0, chunk_buf).value() == chunk);
+        assert(ctx->read(0, read_buf).is_ok());
         assert(read_buf[0] == std::byte{0x33});
 
-        assert(ctx.reset().is_ok());
-        assert(ctx.pending_chunks() == 0);
-        assert(ctx.allocated_chunks() == 0);
+        assert(ctx->reset().is_ok());
+        assert(ctx->pending_chunks() == 0);
+        assert(ctx->allocated_chunks() == 0);
 
         // Back to pristine base contents (offset 0 of the base file is 0).
-        assert(ctx.read(0, read_buf).is_ok());
+        assert(ctx->read(0, read_buf).is_ok());
         assert(read_buf[0] == std::byte{0});
-        ctx.close();
+        ctx->close();
     }
 
-    // ---- 7. the ring knobs are reachable through CowBlockDevice ---------
+    // ---- 7. the flusher knobs are reachable through the device ------------
     {
-        auto cow_res = CowBlockDevice::create(base, overlay_of("ring_f.cow"), chunk);
+        auto cow_res = UnifiedCowDevice::create(base, test_dir / "ring_f.cow", chunk);
         assert(cow_res.is_ok());
         auto cow = cow_res.value();
 
-        assert(cow->writeback_ring_chunks() >= 1);
+        assert(cow->flush_threshold_chunks() >= 1);
         assert(cow->pending_chunks() == 0);
-        cow->set_writeback_ring_chunks(2);
-        assert(cow->writeback_ring_chunks() == 2);
+        cow->set_flush_threshold_chunks(2);
+        assert(cow->flush_threshold_chunks() == 2);
 
         std::fill(chunk_buf.begin(), chunk_buf.end(), std::byte{0x21});
         assert(cow->write(0, chunk_buf).value() == chunk);
-        assert(cow->pending_chunks() <= cow->writeback_ring_chunks());
+        assert(cow->pending_chunks() == 1);
+        assert(cow->dirty_bytes() == chunk);
         assert(cow->read(0, read_buf).is_ok());
         assert(read_buf[0] == std::byte{0x21});
         assert(cow->flush().is_ok());
         assert(cow->pending_chunks() == 0);
+        assert(cow->dirty_bytes() == 0);
         cow->close();
-        // close() drains, so nothing survives teardown (the knob itself lives
-        // on the context object, which close() does not destroy).
+        // close() drains, so nothing survives teardown.
         assert(cow->pending_chunks() == 0);
     }
 
@@ -2084,6 +2146,287 @@ static void test_async_writeback_ring() {
     std::filesystem::remove_all(test_dir, ec);
 
     std::cout << "  PASS: test_async_writeback_ring\n";
+}
+
+// The three invariants the single-class writeback engine is contracted to:
+//
+//  1. a burst of random 512-byte SCSI WRITEs never touches a file handle and,
+//     when it is finally drained, reaches the disk in ONE ascending pass;
+//  2. a partly dirty chunk reads back byte-identically from L1 both before
+//     and after the flusher has carried it to disk;
+//  3. writing data cluster 0 can never alter bytes 0-4095 of the .cow file,
+//     because data cluster 0 lives at 65536 and metadata stops there.
+static void test_unified_cow_ram_first_engine() {
+    std::cout << "Running test_unified_cow_ram_first_engine...\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_cow_ramfirst";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    const uint64_t base_size = 16ull * kCowChunkBytes; // 1 MiB
+    auto base_path = test_dir / "ramfirst_base.raw";
+    {
+        std::ofstream ofs(base_path, std::ios::binary);
+        std::vector<uint8_t> data(base_size);
+        for (size_t i = 0; i < base_size; ++i) {
+            data[i] = static_cast<uint8_t>(i % 251);
+        }
+        ofs.write(reinterpret_cast<const char*>(data.data()),
+                  static_cast<std::streamsize>(data.size()));
+    }
+    auto base = RawImageBackend::open(base_path.string(), false).value();
+
+    auto read_header = [&](const std::filesystem::path& p) {
+        std::array<uint8_t, kCowHeaderBytes> block{};
+        std::ifstream ifs(p, std::ios::binary);
+        assert(ifs.is_open());
+        ifs.read(reinterpret_cast<char*>(block.data()),
+                 static_cast<std::streamsize>(kCowHeaderBytes));
+        assert(ifs.gcount() == static_cast<std::streamsize>(kCowHeaderBytes));
+        return block;
+    };
+
+    // ---- 1. 10,000 random 512-byte writes, one ascending flush batch -------
+    {
+        auto cow_path = test_dir / "burst.cow";
+        auto dev = UnifiedCowDevice::create(base, cow_path, kCowChunkBytes);
+        assert(dev.is_ok());
+        auto cow = dev.value();
+
+        // Pin the flusher: no periodic tick, no early wake. Only flush() and
+        // close() may drain anything from here on.
+        cow->set_flush_interval_ms(0);
+        cow->set_flush_threshold_chunks(1u << 30);
+        assert(cow->flush_interval_ms() == 0);
+        assert(cow->pending_chunks() == 0);
+
+        const uint64_t span = 4ull * kCowChunkBytes; // four 64 KiB chunks
+        const uint64_t sectors = span / 512;         // 512 sectors
+        std::vector<uint8_t> expected(sectors, 0);
+        for (uint64_t l = 0; l < sectors; ++l) {
+            expected[l] = static_cast<uint8_t>((l * 512) % 251); // base contents
+        }
+        std::vector<std::byte> sector(512);
+        std::vector<std::byte> got(512);
+
+        // Prime one sector in each chunk so all four clusters are guaranteed
+        // to be allocated by the single batch below.
+        for (uint64_t lba = 0; lba < sectors; lba += kCowSectorsPerChunk) {
+            const auto fill = static_cast<uint8_t>(0x10 + 0x10 * (lba / kCowSectorsPerChunk));
+            std::fill(sector.begin(), sector.end(), std::byte{fill});
+            assert(cow->write(lba * 512, sector).value() == 512);
+            expected[lba] = fill;
+        }
+
+        std::mt19937_64 rng(0xC0BE1057ull);
+        constexpr size_t kWrites = 10000;
+        for (size_t i = 0; i < kWrites; ++i) {
+            const uint64_t lba = rng() % sectors;
+            const auto fill = static_cast<uint8_t>(rng() & 0xFF);
+            std::fill(sector.begin(), sector.end(), std::byte{fill});
+            auto w = cow->write(lba * 512, sector);
+            assert(w.is_ok() && w.value() == 512);
+            expected[lba] = fill;
+        }
+
+        // Not one of those 10,000 writes reached the file: it is still exactly
+        // the metadata cluster that create() made.
+        assert(std::filesystem::file_size(cow_path) == kCowMetaBytes);
+        assert(cow->dirty_chunks() == 4);
+        assert(cow->allocated_chunks() == 4);
+
+        // Every accepted byte is already readable out of RAM.
+        for (uint64_t lba = 0; lba < sectors; lba += 17) {
+            assert(cow->read(lba * 512, got).is_ok());
+            assert(static_cast<uint8_t>(std::to_integer<int>(got[0])) == expected[lba]);
+        }
+
+        // One drain point, one batch, ascending.
+        assert(cow->flush().is_ok());
+        assert(cow->dirty_chunks() == 0);
+        assert(cow->dirty_bytes() == 0);
+        assert(std::filesystem::file_size(cow_path) > kCowMetaBytes);
+
+        // Elevator ordering: file clusters ascend with the virtual chunks,
+        // which is only true when the batch was written after an ascending
+        // sort of the dirty set. All four clusters were allocated by this one
+        // batch, so there is no earlier allocation to interleave with.
+        auto table = cow->allocation_table();
+        assert(table.size() == 4);
+        for (size_t i = 1; i < table.size(); ++i) {
+            assert(table[i].virtual_chunk > table[i - 1].virtual_chunk);
+            assert(table[i].file_cluster > table[i - 1].file_cluster);
+        }
+
+        // Read every sector back: now sourced from the .cow clusters.
+        for (uint64_t lba = 0; lba < sectors; ++lba) {
+            assert(cow->read(lba * 512, got).is_ok());
+            assert(static_cast<uint8_t>(std::to_integer<int>(got[0])) == expected[lba]);
+        }
+        cow->close();
+
+        // ...and straight out of the file, bypassing the device entirely.
+        {
+            std::ifstream ifs(cow_path, std::ios::binary);
+            assert(ifs.is_open());
+            for (const auto& e : table) {
+                ifs.seekg(static_cast<std::streamoff>(
+                    kCowDataOffset + static_cast<uint64_t>(e.file_cluster) * kCowChunkBytes));
+                std::vector<uint8_t> block(kCowChunkBytes);
+                ifs.read(reinterpret_cast<char*>(block.data()),
+                         static_cast<std::streamsize>(kCowChunkBytes));
+                assert(ifs.gcount() == static_cast<std::streamsize>(kCowChunkBytes));
+                for (uint32_t s = 0; s < kCowSectorsPerChunk; ++s) {
+                    const uint64_t lba =
+                        static_cast<uint64_t>(e.virtual_chunk) * kCowSectorsPerChunk + s;
+                    assert(block[static_cast<size_t>(s) * 512] == expected[lba]);
+                }
+            }
+        }
+    }
+
+    // ---- 2. a partly dirty chunk reads identically before AND after flush --
+    {
+        auto cow_path = test_dir / "seam.cow";
+        auto dev = UnifiedCowDevice::create(base, cow_path, kCowChunkBytes);
+        assert(dev.is_ok());
+        auto cow = dev.value();
+        cow->set_flush_interval_ms(0);
+        cow->set_flush_threshold_chunks(1u << 30);
+
+        // Reference image: base contents, with every even sector replaced.
+        std::vector<std::byte> reference(kCowChunkBytes);
+        assert(base->read(0, reference).is_ok());
+        for (uint32_t s = 0; s < kCowSectorsPerChunk; s += 2) {
+            const std::byte fill{static_cast<uint8_t>(0x80 + (s & 0x7F))};
+            std::vector<std::byte> blk(512, fill);
+            assert(cow->write(static_cast<uint64_t>(s) * 512, blk).value() == 512);
+            std::fill(reference.begin() + static_cast<std::ptrdiff_t>(s) * 512,
+                      reference.begin() + static_cast<std::ptrdiff_t>(s + 1) * 512, fill);
+        }
+        const uint64_t dirty_expected = static_cast<uint64_t>(kCowSectorsPerChunk / 2) * 512;
+        assert(cow->dirty_bytes() == dirty_expected);
+        assert(std::filesystem::file_size(cow_path) == kCowMetaBytes); // RAM only
+
+        // Before the flush: stitched from L1 (even) + base (odd).
+        std::vector<std::byte> out(kCowChunkBytes);
+        assert(cow->read(0, out).is_ok());
+        assert(std::equal(out.begin(), out.end(), reference.begin()));
+
+        // After the flush: byte-identical, now sourced from the file.
+        assert(cow->flush().is_ok());
+        assert(cow->dirty_bytes() == 0);
+        assert(cow->read(0, out).is_ok());
+        assert(std::equal(out.begin(), out.end(), reference.begin()));
+
+        // Cross the chunk seam with one dirty sector in chunk 1: the read has
+        // to serve chunk 0 from the file and chunk 1 from RAM in one call.
+        std::vector<std::byte> seam(512, std::byte{0x42});
+        assert(cow->write(kCowChunkBytes, seam).value() == 512);
+        std::vector<std::byte> cross(1024);
+        assert(cow->read(kCowChunkBytes - 512, cross).is_ok());
+        assert(cross[512] == std::byte{0x42});
+        assert(cross[1023] == std::byte{0x42});
+        assert(std::equal(cross.begin(), cross.begin() + 512,
+                          reference.begin() + static_cast<std::ptrdiff_t>(kCowChunkBytes - 512)));
+        cow->close();
+    }
+
+    // ---- 3. data cluster 0 can never alter bytes 0-4095 of the header -----
+    {
+        auto cow_path = test_dir / "hdr.cow";
+        auto dev = UnifiedCowDevice::create(base, cow_path, kCowChunkBytes);
+        assert(dev.is_ok());
+        auto cow = dev.value();
+        cow->set_flush_interval_ms(0);
+        cow->set_flush_threshold_chunks(1u << 30);
+
+        auto created = read_header(cow_path);
+        CowFileHeader hc{};
+        std::memcpy(&hc, created.data(), sizeof(hc));
+        assert(std::memcmp(hc.magic, kCowMagic, 8) == 0);
+        assert(hc.version == kCowVersion);
+        assert(hc.chunk_size == kCowChunkBytes);
+        // Every byte past the 48-byte header field set is reserved padding.
+        for (size_t i = 48; i < kCowHeaderBytes; ++i) {
+            assert(created[i] == 0);
+        }
+
+        // Materialise data cluster 0 for the first time.
+        std::vector<std::byte> blk(kCowChunkBytes, std::byte{0xEE});
+        assert(cow->write(0, blk).value() == kCowChunkBytes);
+        assert(cow->flush().is_ok());
+        uint32_t fc0 = 0;
+        assert(cow->file_cluster(0, fc0));
+        assert(fc0 == 0);
+
+        auto after = read_header(cow_path);
+        CowFileHeader ha{};
+        std::memcpy(&ha, after.data(), sizeof(ha));
+        assert(std::memcmp(ha.magic, kCowMagic, 8) == 0);
+        assert(ha.version == kCowVersion);
+        assert(ha.chunk_size == kCowChunkBytes);
+        assert(ha.capacity_bytes == hc.capacity_bytes);
+        assert(ha.entry_capacity == hc.entry_capacity);
+        assert(ha.entry_count == 1);
+        // The reserved tail is still pristine: cluster 0's 0xEE payload never
+        // made it into block 0.
+        for (size_t i = 48; i < kCowHeaderBytes; ++i) {
+            assert(after[i] == 0);
+        }
+
+        // Rewrite the same cluster: nothing above 65536 may move at all.
+        std::fill(blk.begin(), blk.end(), std::byte{0xDD});
+        assert(cow->write(0, blk).value() == kCowChunkBytes);
+        assert(cow->flush().is_ok());
+        assert(cow->file_cluster(0, fc0));
+        assert(fc0 == 0);
+        auto again = read_header(cow_path);
+        assert(std::memcmp(after.data(), again.data(), kCowHeaderBytes) == 0);
+
+        cow->close();
+
+        // The payload is exactly where the geometry says it is: cluster 0 at
+        // 65536, 64 KiB long, and nothing between the table and it.
+        {
+            std::ifstream ifs(cow_path, std::ios::binary);
+            assert(ifs.is_open());
+            ifs.seekg(static_cast<std::streamoff>(kCowHeaderBytes - 1));
+            char last_hdr = 0;
+            ifs.read(&last_hdr, 1);
+            assert(last_hdr == 0);
+
+            // The whole allocation table region is metadata, never payload.
+            ifs.seekg(static_cast<std::streamoff>(kCowTableOffset));
+            std::vector<uint8_t> table_bytes(kCowTableBytes);
+            ifs.read(reinterpret_cast<char*>(table_bytes.data()),
+                     static_cast<std::streamsize>(kCowTableBytes));
+            assert(ifs.gcount() == static_cast<std::streamsize>(kCowTableBytes));
+            assert(std::find(table_bytes.begin(), table_bytes.end(), uint8_t{0xDD}) ==
+                   table_bytes.end());
+            assert(std::find(table_bytes.begin(), table_bytes.end(), uint8_t{0xEE}) ==
+                   table_bytes.end());
+
+            // Data cluster 0 begins strictly at 65536.
+            ifs.seekg(static_cast<std::streamoff>(kCowDataOffset));
+            std::vector<uint8_t> payload(kCowChunkBytes);
+            ifs.read(reinterpret_cast<char*>(payload.data()),
+                     static_cast<std::streamsize>(kCowChunkBytes));
+            assert(ifs.gcount() == static_cast<std::streamsize>(kCowChunkBytes));
+            assert(payload[0] == 0xDD);
+            assert(payload[kCowChunkBytes - 1] == 0xDD);
+
+            // ...and the file is exactly header + table + one cluster.
+            ifs.seekg(0, std::ios::end);
+            assert(static_cast<uint64_t>(static_cast<std::streamoff>(ifs.tellg())) ==
+                   kCowDataOffset + kCowChunkBytes);
+        }
+    }
+
+    base.reset();
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_unified_cow_ram_first_engine\n";
 }
 
 static void test_machine_store_unification() {
@@ -2370,80 +2713,88 @@ static void test_production_hardening_and_recovery() {
     }
     auto base_dev = RawImageBackend::open(base_path.string(), false).value();
 
-    // 2. Corrupt COW file test (bad magic)
+    // 2. Corrupt COW file test (bad magic). A full metadata cluster of garbage
+    //    so the failure is the magic check itself, not a short read.
     auto corrupt_cow_path = test_dir / "bad_magic.cow";
     {
         std::ofstream ofs(corrupt_cow_path, std::ios::binary);
-        ofs.write("BAD!CORRUPT_DATA", 16);
+        const std::string junk(kCowMetaBytes, 'X');
+        ofs.write(junk.data(), static_cast<std::streamsize>(junk.size()));
     }
     // Attempting to open bad_magic.cow directly fails
-    auto dev_fail = CowBlockDevice::create(base_dev, corrupt_cow_path);
+    auto dev_fail = UnifiedCowDevice::create(base_dev, corrupt_cow_path);
     assert(!dev_fail.is_ok());
 
     // 3. Quarantine corrupted overlay test
-    assert(CowBlockDevice::quarantine_corrupted_overlay(corrupt_cow_path).is_ok());
+    assert(UnifiedCowDevice::quarantine_corrupted_overlay(corrupt_cow_path).is_ok());
     assert(!std::filesystem::exists(corrupt_cow_path));
     auto quarantined_path = std::filesystem::path(corrupt_cow_path.string() + ".corrupted");
     assert(std::filesystem::exists(quarantined_path));
 
-    // 4. Truncated COW file auto-recovery test (power failure simulation)
-    // Create header specifying 5 allocated chunks, but only write 2 chunk slots to disk
+    // 4. Torn / truncated COW file detection (power failure simulation)
+    //    The metadata cluster is the only thing a power cut can leave short,
+    //    so it is the only thing that has to be refused rather than repaired:
+    //    a half-read allocation table would map clusters that are not there.
     auto trunc_cow_path = test_dir / "truncated.cow";
-    const uint32_t chunk_size = 4096;
     {
-        std::ofstream ofs(trunc_cow_path, std::ios::binary);
-        // Direct write of CowHeader layout
-        struct RawHdr {
-            char magic[4];
-            uint32_t version;
-            uint32_t chunk_size;
-            uint32_t reserved;
-            uint64_t virtual_capacity;
-            uint64_t allocated_chunks;
-            uint64_t checksum;
-            uint8_t pad[472];
-        } hdr{};
-        std::memcpy(hdr.magic, "COWB", 4);
-        hdr.version = 1;
-        hdr.chunk_size = chunk_size;
-        hdr.virtual_capacity = base_dev->size();
-        hdr.allocated_chunks = 5; // Claims 5 slots exist
-        ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-
-        // Write only 2 valid slots:
-        // Slot 0: virtual chunk 1
-        uint64_t v0 = 1;
-        ofs.write(reinterpret_cast<const char*>(&v0), sizeof(v0));
-        std::vector<uint8_t> payload0(chunk_size, 0x11);
-        ofs.write(reinterpret_cast<const char*>(payload0.data()), payload0.size());
-
-        // Slot 1: virtual chunk 3
-        uint64_t v1 = 3;
-        ofs.write(reinterpret_cast<const char*>(&v1), sizeof(v1));
-        std::vector<uint8_t> payload1(chunk_size, 0x33);
-        ofs.write(reinterpret_cast<const char*>(payload1.data()), payload1.size());
-        // Abrupt termination here! File truncated before slots 2, 3, 4!
+        auto dev = UnifiedCowDevice::create(base_dev, trunc_cow_path, 4096);
+        assert(dev.is_ok());
+        auto d = dev.value();
+        std::vector<std::byte> seg(kCowChunkBytes, std::byte{0x11});
+        assert(d->write(0, seg).value() == kCowChunkBytes);
+        assert(d->flush().is_ok());
+        assert(d->allocated_chunks() == 1);
+        d->close();
+        d.reset();
+    }
+    {
+        // A complete file reopens and keeps the cluster it was given.
+        auto dev = UnifiedCowDevice::create(base_dev, trunc_cow_path, 4096);
+        assert(dev.is_ok());
+        auto d = dev.value();
+        assert(d->allocated_chunks() == 1);
+        std::vector<std::byte> rb(kCowChunkBytes);
+        assert(d->read(0, rb).is_ok());
+        assert(rb[0] == std::byte{0x11});
+        assert(rb[kCowChunkBytes - 1] == std::byte{0x11});
+        d->close();
+        d.reset();
     }
 
-    // Opening truncated.cow should auto-repair and clamp allocated chunks to 2
-    auto recovered_cow = CowBlockDevice::create(base_dev, trunc_cow_path, chunk_size);
-    assert(recovered_cow.is_ok());
-    auto r_dev = recovered_cow.value();
-    assert(r_dev->allocated_chunks() == 2);
+    // Chop the file short of a whole metadata cluster: the shape a power cut
+    // leaves behind. The next open must refuse it instead of clamping.
+    std::filesystem::resize_file(trunc_cow_path, kCowHeaderBytes - 16, ec);
+    auto truncated_open = UnifiedCowDevice::create(base_dev, trunc_cow_path, 4096);
+    assert(!truncated_open.is_ok());
+    assert(UnifiedCowDevice::quarantine_corrupted_overlay(trunc_cow_path).is_ok());
+    assert(!std::filesystem::exists(trunc_cow_path));
+    assert(std::filesystem::exists(test_dir / "truncated.cow.corrupted"));
 
-    // Verify chunk 1 data was preserved
-    std::vector<std::byte> read_buf(chunk_size);
-    auto read_res = r_dev->read(1 * chunk_size, read_buf);
-    assert(read_res.is_ok());
-    assert(read_buf[0] == std::byte{0x11});
+    // A torn allocation table is refused just as hard: flip one byte past the
+    // header and the FNV-1a checksum no longer matches what is on disk.
+    {
+        auto dev = UnifiedCowDevice::create(base_dev, trunc_cow_path, 4096);
+        assert(dev.is_ok());
+        std::vector<std::byte> seg(kCowChunkBytes, std::byte{0x33});
+        assert(dev.value()->write(0, seg).value() == kCowChunkBytes);
+        assert(dev.value()->flush().is_ok());
+        dev.value()->close();
+        dev.value().reset();
 
-    // Verify unwritten chunk reads from base device (0xAA)
-    read_res = r_dev->read(0, read_buf);
-    assert(read_res.is_ok());
-    assert(read_buf[0] == std::byte{0xAA});
-
-    r_dev->close();
-    r_dev.reset();
+        {
+            std::fstream f(trunc_cow_path, std::ios::in | std::ios::out | std::ios::binary);
+            assert(f.is_open());
+            const char flipped = static_cast<char>(0x7E);
+            f.seekp(static_cast<std::streamoff>(kCowTableOffset + 3));
+            f.write(&flipped, 1);
+            assert(f.good());
+            f.close();
+        }
+        auto torn = UnifiedCowDevice::create(base_dev, trunc_cow_path, 4096);
+        assert(!torn.is_ok());
+        assert(UnifiedCowDevice::quarantine_corrupted_overlay(trunc_cow_path).is_ok());
+        assert(!std::filesystem::exists(trunc_cow_path));
+    }
 
     // 5. ClientSessionManager auto-quarantine test
     Configuration cfg;
@@ -2612,11 +2963,11 @@ static void test_end_to_end_diskless_boot_pipeline() {
     assert(uefi_opts.value().client_arch == ClientArch::Efi_x64);
     assert(!uefi_opts.value().is_ipxe_client);
 
-    // DHCP Offer responds with ipxe.efi stage-1 loader
+    // DHCP Offer responds with cobpxe.efi stage-1 loader
     auto uefi_offer = dhcp->build_reply(uefi_hdr, uefi_opts.value(), 2, NetworkAddress(192, 168, 1, 150));
     assert(uefi_offer.is_ok());
     const auto* uefi_reply = reinterpret_cast<const DhcpHeader*>(uefi_offer.value().data());
-    assert(std::string(reinterpret_cast<const char*>(uefi_reply->file)) == "ipxe.efi");
+    assert(std::string(reinterpret_cast<const char*>(uefi_reply->file)) == "cobpxe.efi");
 
     // =========================================================================
     // PIPELINE STEP 2: iPXE Client Identification
@@ -2689,8 +3040,10 @@ static void test_end_to_end_diskless_boot_pipeline() {
     auto script_res = tftp->get_file_content("boot.ipxe");
     assert(script_res.is_ok());
     std::string script_str(script_res.value().begin(), script_res.value().end());
-    assert(script_str.find("sanboot iscsi:") != std::string::npos);
-    assert(script_str.find("set keep-san 1") != std::string::npos);
+    assert(script_str.find("set busloc ${net0/busloc}") != std::string::npos);
+    assert(script_str.find("chain http://") != std::string::npos);
+
+
 
     // =========================================================================
     // PIPELINE STEP 4: iSCSI Multi-client Session & Cache Verification
@@ -2958,7 +3311,7 @@ void test_real_socket_networking() {
         const auto* reply_hdr = reinterpret_cast<const DhcpHeader*>(offer_buf.data());
         assert(reply_hdr->op == 2); // BOOTREPLY
         assert(reply_hdr->xid == htonl(0x11223344));
-        assert(std::string(reinterpret_cast<const char*>(reply_hdr->file)) == "ipxe.efi");
+        assert(std::string(reinterpret_cast<const char*>(reply_hdr->file)) == "cobpxe.efi");
 
         // Test truncated/malformed DHCP packet (must not crash server)
         std::vector<uint8_t> short_pkt = {0x01, 0x01, 0x06, 0x00};
@@ -2976,25 +3329,105 @@ void test_real_socket_networking() {
         uint16_t iscsi_port = 13260;
         auto reg = std::make_shared<GoldenImageRegistry>();
         auto img_mgr = std::make_shared<ImageManager>(reg);
+
+        // Fixture OS image: the fail-closed login gate only lets a connection
+        // through once it resolved to a session WITH a mounted sandbox, and
+        // session creation needs a real image. Without a default assigned
+        // (see the negative controls below) the target must refuse everything.
+        {
+            std::ofstream ofs(test_dir / "socket_os.raw", std::ios::binary);
+            std::vector<char> data(1024 * 1024, 0x5A);
+            ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+        }
+        Configuration img_cfg;
+        img_cfg.set_os_images_dir(test_dir);
+        img_mgr->configure(img_cfg);
+        assert(img_mgr->import_image(test_dir / "socket_os.raw", ImageRole::OsImage,
+                                     ImageId("os_image")).is_ok());
+
         auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir);
 
         IscsiTargetConfig cfg;
         cfg.listen_address = NetworkAddress(127, 0, 0, 1, iscsi_port);
         cfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
         IscsiTarget target(cfg, sess_mgr);
+        target.set_image_manager(img_mgr); // resolve_session falls back to its default OS image
         assert(target.initialize().is_ok());
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-        SOCKET s_iscsi = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        assert(s_iscsi != INVALID_SOCKET);
-
-        DWORD tv_ms = 3000;
-        setsockopt(s_iscsi, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 
         sockaddr_in iscsi_srv_addr{};
         iscsi_srv_addr.sin_family = AF_INET;
         iscsi_srv_addr.sin_port = htons(iscsi_port);
         iscsi_srv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        DWORD tv_ms = 3000;
+
+        // --- (a) FAIL-CLOSED negative control: nothing authorizes this peer
+        //         (no default image), so the login is answered with a Login
+        //         Response carrying Status-Class 0x02 / Detail 0x01 and the
+        //         TCP socket is closed. It must never reach the SCSI path.
+        {
+            SOCKET s_neg = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            assert(s_neg != INVALID_SOCKET);
+            setsockopt(s_neg, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+            assert(connect(s_neg, reinterpret_cast<const sockaddr*>(&iscsi_srv_addr),
+                           sizeof(iscsi_srv_addr)) == 0);
+
+            IscsiBhs neg_login{};
+            neg_login.opcode = 0x03;
+            neg_login.flags = 0x80;
+            neg_login.initiator_task_tag = 0x11223344;
+            int neg_sent = send(s_neg, reinterpret_cast<const char*>(&neg_login), sizeof(neg_login), 0);
+            assert(neg_sent == sizeof(neg_login));
+
+            IscsiBhs neg_resp{};
+            int neg_recv = recv(s_neg, reinterpret_cast<char*>(&neg_resp), sizeof(neg_resp), 0);
+            assert(neg_recv == sizeof(neg_resp));
+            assert((neg_resp.opcode & 0x3F) == 0x23);            // Login Response
+            assert(neg_resp.initiator_task_tag == 0x11223344);   // ITT echoed
+            assert(neg_resp.cdb[4] == 0x02); // Status-Class: Initiator Error
+            assert(neg_resp.cdb[5] == 0x01); // auth/authorization failure
+
+            // The socket must be closed immediately after the refusal.
+            neg_recv = recv(s_neg, reinterpret_cast<char*>(&neg_resp), sizeof(neg_resp), 0);
+            assert(neg_recv == 0);
+            closesocket(s_neg);
+        }
+
+        // --- (b) A non-login PDU on a connection that cannot be resolved to
+        //         an authorized session is dropped: NO answer of any kind
+        //         (not even Inquiry/ReportLUNs/ReadCapacity discovery bytes).
+        {
+            SOCKET s_raw = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            assert(s_raw != INVALID_SOCKET);
+            setsockopt(s_raw, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+            assert(connect(s_raw, reinterpret_cast<const sockaddr*>(&iscsi_srv_addr),
+                           sizeof(iscsi_srv_addr)) == 0);
+
+            IscsiBhs inq_only{};
+            inq_only.opcode = 0x01; // SCSI Command without a login
+            inq_only.flags = 0x40;
+            inq_only.initiator_task_tag = 0x55667788;
+            inq_only.cdb[0] = 0x12; // INQUIRY
+            inq_only.cdb[4] = 36;
+            int raw_sent = send(s_raw, reinterpret_cast<const char*>(&inq_only), sizeof(inq_only), 0);
+            assert(raw_sent == sizeof(inq_only));
+
+            IscsiBhs unexpected{};
+            int raw_recv = recv(s_raw, reinterpret_cast<char*>(&unexpected), sizeof(unexpected), 0);
+            assert(raw_recv <= 0); // connection closed, nothing served
+            closesocket(s_raw);
+        }
+
+        // --- (c) With a default image authorized, the same login shape now
+        //         resolves a session (mounted UnifiedCowDevice) and the SCSI
+        //         command path is reachable.
+        img_mgr->set_default_os_image_id("os_image");
+
+        SOCKET s_iscsi = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        assert(s_iscsi != INVALID_SOCKET);
+
+        setsockopt(s_iscsi, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 
         int conn = connect(s_iscsi, reinterpret_cast<const sockaddr*>(&iscsi_srv_addr), sizeof(iscsi_srv_addr));
         assert(conn == 0);
@@ -3012,6 +3445,27 @@ void test_real_socket_networking() {
         assert(recvd == sizeof(login_resp));
         assert((login_resp.opcode & 0x3F) == 0x23); // Login Response
         assert(login_resp.initiator_task_tag == 0x44332211);
+        assert(login_resp.cdb[4] == 0x00); // Status-Class: success (0x00)
+
+        // RFC 3720 5.3.1: even a bare stage transition -- this login carries no
+        // parameters of its own and never named a target -- comes back with the
+        // TargetPortalGroupTag confirmation. Drain it so the Data-In below is
+        // read at the right offset in the stream.
+        uint32_t login_dlen = (static_cast<uint32_t>(login_resp.data_seg_len[0]) << 16) |
+                              (static_cast<uint32_t>(login_resp.data_seg_len[1]) << 8) |
+                              static_cast<uint32_t>(login_resp.data_seg_len[2]);
+        assert(login_dlen > 0);
+        {
+            const uint32_t login_padded = (login_dlen + 3) & ~3u;
+            std::vector<char> login_text(login_padded, 0);
+            recvd = recv(s_iscsi, login_text.data(), static_cast<int>(login_padded), 0);
+            assert(recvd == static_cast<int>(login_padded));
+            const std::string login_keys(login_text.data(), login_dlen);
+            assert(login_keys.find("TargetPortalGroupTag=1") != std::string::npos);
+            // The initiator never offered a TargetName, so no IQN may be invented.
+            assert(login_keys.find("TargetName=") == std::string::npos);
+            assert(login_keys.find("InitiatorName=") == std::string::npos);
+        }
 
         // Send SCSI INQUIRY
         IscsiBhs inq_req{};
@@ -3033,7 +3487,8 @@ void test_real_socket_networking() {
         recvd = recv(s_iscsi, reinterpret_cast<char*>(inq_payload.data()), static_cast<int>(inq_payload.size()), 0);
         assert(recvd == 36);
         std::string vendor(reinterpret_cast<char*>(inq_payload.data() + 8), 8);
-        assert(vendor == "COB     ");
+        assert(vendor == "COBDISK ");
+        assert(inq_payload[1] == 0x00); // RMB = 0: Windows must see a fixed disk
 
         // Send iSCSI Logout Request
         IscsiBhs logout_req{};
@@ -3074,7 +3529,7 @@ void test_concurrency_and_stress() {
 
     auto base_ro = std::make_shared<ReadOnlyBlockDevice>(base_mem);
     auto cow_file = test_dir / "cow_stress.bin";
-    auto cow_dev = CowBlockDevice::create(base_ro, cow_file, 4096).value();
+    auto cow_dev = UnifiedCowDevice::create(base_ro, cow_file, 4096).value();
 
     auto cached_dev = CachedBlockDevice::create(cow_dev, 65536, 4096, 2).value();
 
@@ -3475,7 +3930,7 @@ void test_dhcp_client_auto_registration_pipeline() {
     assert(yiaddr_bytes[1] == assigned_ip.octet(1));
     assert(yiaddr_bytes[2] == assigned_ip.octet(2));
     assert(yiaddr_bytes[3] == assigned_ip.octet(3));
-    assert(std::string(reinterpret_cast<const char*>(offer_hdr->file)) == "ipxe.efi");
+    assert(std::string(reinterpret_cast<const char*>(offer_hdr->file)) == "cobpxe.efi");
 
     // Verify lease table records
     auto leases = server.list_leases();
@@ -3565,6 +4020,49 @@ static void perform_test_login(SOCKET s, const std::string& initiator_name, uint
     bhs.opcode = 0x03;
     bhs.flags = 0x87;
     bhs.initiator_task_tag = task_tag;
+    uint32_t d_len = static_cast<uint32_t>(text.size());
+    bhs.data_seg_len[0] = static_cast<uint8_t>((d_len >> 16) & 0xFF);
+    bhs.data_seg_len[1] = static_cast<uint8_t>((d_len >> 8) & 0xFF);
+    bhs.data_seg_len[2] = static_cast<uint8_t>(d_len & 0xFF);
+
+    assert(send_all_bytes(s, &bhs, sizeof(bhs)));
+    assert(send_all_bytes(s, text.data(), text.size()));
+    uint32_t pad = (4 - (text.size() % 4)) % 4;
+    if (pad > 0) {
+        char pad_buf[4] = {0};
+        assert(send_all_bytes(s, pad_buf, pad));
+    }
+
+    IscsiBhs resp{};
+    assert(recv_all_bytes(s, &resp, sizeof(resp)));
+    assert((resp.opcode & 0x3F) == 0x23);
+
+    uint32_t resp_dlen = (static_cast<uint32_t>(resp.data_seg_len[0]) << 16) |
+                         (static_cast<uint32_t>(resp.data_seg_len[1]) << 8) |
+                         static_cast<uint32_t>(resp.data_seg_len[2]);
+    uint32_t resp_padded = (resp_dlen + 3) & ~3;
+    if (resp_padded > 0) {
+        std::vector<char> discard(resp_padded);
+        assert(recv_all_bytes(s, discard.data(), resp_padded));
+    }
+}
+
+static void perform_test_login_with_isid(SOCKET s, const std::string& initiator_name, const uint8_t isid[6], uint32_t task_tag = 0x1000) {
+    std::string text;
+    text += "InitiatorName=" + initiator_name;
+    text.push_back('\0');
+    text += "SessionType=Normal";
+    text.push_back('\0');
+    text += "AuthMethod=None";
+    text.push_back('\0');
+
+    IscsiBhs bhs{};
+    bhs.opcode = 0x03;
+    bhs.flags = 0x87;
+    bhs.initiator_task_tag = task_tag;
+    if (isid) {
+        std::memcpy(&bhs.lun, isid, 6);
+    }
     uint32_t d_len = static_cast<uint32_t>(text.size());
     bhs.data_seg_len[0] = static_cast<uint8_t>((d_len >> 16) & 0xFF);
     bhs.data_seg_len[1] = static_cast<uint8_t>((d_len >> 8) & 0xFF);
@@ -3707,7 +4205,8 @@ void test_iscsi_rfc3720_login_and_data_segment_drainage() {
 
     IscsiBhs login_bhs{};
     login_bhs.opcode = 0x03; // Login Request
-    login_bhs.flags = 0x87;  // Transit=1, CSG=0, NSG=3
+    login_bhs.flags = 0x87;  // Transit=1, CSG=1 (operational), NSG=3: a single
+                             // PDU that skips straight to Full Feature Phase
     login_bhs.initiator_task_tag = 0x778899AA;
     uint32_t d_len = static_cast<uint32_t>(text_params.size());
     login_bhs.data_seg_len[0] = static_cast<uint8_t>((d_len >> 16) & 0xFF);
@@ -3726,7 +4225,22 @@ void test_iscsi_rfc3720_login_and_data_segment_drainage() {
     assert(recv_all_bytes(s, &resp_bhs, sizeof(resp_bhs)));
     assert((resp_bhs.opcode & 0x3F) == 0x23); // Login Response
     assert(resp_bhs.initiator_task_tag == 0x778899AA);
-    assert(resp_bhs.cdb[0] == 0); // Status-Class: Success
+    // RFC 3720 10.13 byte layout: 24=StatSN, 28=ExpCmdSN, 32=MaxCmdSN,
+    // 36=Status-Class, 37=Status-Detail (all big-endian). Note cdb[0] is byte 32,
+    // i.e. the MSB of MaxCmdSN -- not the status, which lives at cdb[4].
+    {
+        const uint8_t* h = reinterpret_cast<const uint8_t*>(&resp_bhs);
+        assert(h[36] == 0); // Status-Class: Success
+        assert(h[37] == 0); // Status-Detail: Success
+        auto be32 = [](const uint8_t* p) -> uint32_t {
+            return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+                   (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+        };
+        assert(be32(h + 24) == 0);  // StatSN = the ExpStatSN this request carried
+        assert(be32(h + 28) == 0);  // ExpCmdSN = the request's CmdSN (3720 10.12.8), not CmdSN + 1
+        assert(be32(h + 32) == 32); // MaxCmdSN counted from that same CmdSN
+    }
+    assert(resp_bhs.cdb[0] == 0); // MaxCmdSN MSB: window stays well below 2^24
 
     uint32_t resp_dlen = (static_cast<uint32_t>(resp_bhs.data_seg_len[0]) << 16) |
                          (static_cast<uint32_t>(resp_bhs.data_seg_len[1]) << 8) |
@@ -3737,9 +4251,17 @@ void test_iscsi_rfc3720_login_and_data_segment_drainage() {
     assert(recv_all_bytes(s, resp_payload.data(), resp_padded));
 
     std::string resp_text(resp_payload.data(), resp_dlen);
-    assert(resp_text.find("TargetName=") != std::string::npos);
+    // RFC 3720 12.4: "TargetName MUST not be redeclared within the login
+    // phase." The initiator owns that key; the target's confirmation is the
+    // portal group tag, and Appendix C's login examples never carry a
+    // TargetName back the other way.
+    assert(resp_text.find("TargetName=") == std::string::npos);
+    assert(resp_text.find("TargetPortalGroupTag=1") != std::string::npos); // 5.3.1 MUST
+    // The initiator's own InitiatorName belongs to the initiator; a target that
+    // echoes it back is answering a key it was never asked.
+    assert(resp_text.find("InitiatorName=") == std::string::npos);
     assert(resp_text.find("AuthMethod=None") != std::string::npos);
-    assert(resp_text.find("InitialR2T=Yes") != std::string::npos);
+    assert(resp_text.find("InitialR2T=No") != std::string::npos);
 
     IscsiBhs logout_req{};
     logout_req.opcode = 0x06;
@@ -3755,6 +4277,393 @@ void test_iscsi_rfc3720_login_and_data_segment_drainage() {
     target.shutdown();
     std::filesystem::remove_all(test_dir, ec);
     std::cout << "  PASS: test_iscsi_rfc3720_login_and_data_segment_drainage\n";
+}
+
+// Regression test for the two defects that kept Windows' own initiator (msiscsi)
+// off the target while iPXE booted happily:
+//
+//  1. The Login Response forced T=1/NSG=3 on *every* request. RFC 3720 5.3.1
+//     defines a final accept as T=1 with NSG=FullFeaturePhase in BOTH PDUs, so
+//     answering an initiator that offered NSG=LoginOperationalNegotiation was a
+//     protocol violation, and msiscsi recovers from those by resetting the TCP
+//     connection -- which is exactly the login -> RST 211ms later seen on the
+//     wire. iPXE offers NSG=3 on its first PDU, so it never hit the branch.
+//  2. StatSN/ExpCmdSN were written little-endian and MaxCmdSN was never written
+//     at all, i.e. every response advertised a zero-length command window.
+//     RFC 3720 3.2.2.1 then forbids the initiator from issuing a single further
+//     command: a permanent stall with no error anywhere.
+void test_iscsi_login_mirrors_offered_stage() {
+    std::cout << "[RUN] test_iscsi_login_mirrors_offered_stage\n";
+#if defined(_WIN32)
+    WSADATA wsa;
+    assert(WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+#endif
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_iscsi_stage";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    std::filesystem::path os_path = test_dir / "golden.raw";
+    {
+        std::ofstream ofs(os_path, std::ios::binary);
+        std::vector<uint8_t> dummy(64 * 1024, 0x11);
+        ofs.write(reinterpret_cast<const char*>(dummy.data()), dummy.size());
+    }
+
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    Configuration cfg;
+    cfg.set_os_images_dir(test_dir);
+    cfg.set_writeback_dir(test_dir);
+    img_mgr->configure(cfg);
+    assert(img_mgr->import_image(os_path, ImageRole::OsImage, ImageId("os_image")).is_ok());
+
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir);
+
+    uint16_t port = 13265;
+    IscsiTargetConfig tcfg;
+    tcfg.listen_address = NetworkAddress(127, 0, 0, 1, port);
+    tcfg.default_os_image_id = ImageId("os_image");
+    tcfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
+    IscsiTarget target(tcfg, sess_mgr);
+    assert(target.initialize().is_ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(s != INVALID_SOCKET);
+    DWORD tv = 3000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+
+    sockaddr_in srv{};
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(port);
+    srv.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(s, reinterpret_cast<const sockaddr*>(&srv), sizeof(srv)) == 0);
+
+    // RFC 3720 numeric fields are big-endian on the wire; IscsiBhs holds them as
+    // native uint32_t, so decode from the raw bytes.
+    auto be32 = [](const uint8_t* p) -> uint32_t {
+        return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+               (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+    };
+
+    auto do_login = [&](uint8_t flags, uint32_t tag, const std::string& keys,
+                        IscsiBhs& out_bhs, std::string& out_text) {
+        IscsiBhs req{};
+        req.opcode = 0x03; // Login Request
+        req.flags = flags;
+        req.initiator_task_tag = tag;
+        uint32_t d_len = static_cast<uint32_t>(keys.size());
+        req.data_seg_len[0] = static_cast<uint8_t>((d_len >> 16) & 0xFF);
+        req.data_seg_len[1] = static_cast<uint8_t>((d_len >> 8) & 0xFF);
+        req.data_seg_len[2] = static_cast<uint8_t>(d_len & 0xFF);
+        assert(send_all_bytes(s, &req, sizeof(req)));
+        assert(send_all_bytes(s, keys.data(), keys.size()));
+        uint32_t pad = (4 - (d_len % 4)) % 4;
+        if (pad > 0) {
+            char pad_buf[4] = {0};
+            assert(send_all_bytes(s, pad_buf, pad));
+        }
+
+        assert(recv_all_bytes(s, &out_bhs, sizeof(out_bhs)));
+        uint32_t resp_dlen = (static_cast<uint32_t>(out_bhs.data_seg_len[0]) << 16) |
+                             (static_cast<uint32_t>(out_bhs.data_seg_len[1]) << 8) |
+                             static_cast<uint32_t>(out_bhs.data_seg_len[2]);
+        uint32_t resp_padded = (resp_dlen + 3) & ~3;
+        std::vector<char> payload(resp_padded, 0);
+        assert(recv_all_bytes(s, payload.data(), resp_padded));
+        out_text.assign(payload.data(), resp_dlen);
+    };
+
+    // --- Exchange 1: the msiscsi shape. Security stage first, offering the
+    // --- operational stage as the next one (T=1, CSG=0, NSG=1).
+    std::string sec_keys;
+    sec_keys += "InitiatorName=iqn.1991-05.com.microsoft:pc01stage"; sec_keys.push_back('\0');
+    sec_keys += "SessionType=Normal";                                sec_keys.push_back('\0');
+    sec_keys += "TargetName=iqn.2026-09.com.cobdiskless:storage";    sec_keys.push_back('\0');
+    sec_keys += "AuthMethod=CHAP,None";                              sec_keys.push_back('\0');
+    sec_keys += "HeaderDigest=None";                                 sec_keys.push_back('\0');
+    sec_keys += "MaxRecvDataSegmentLength=65536";                    sec_keys.push_back('\0');
+
+    IscsiBhs resp1{};
+    std::string text1;
+    do_login(0x81, 0x5E11AAAA, sec_keys, resp1, text1);
+
+    assert((resp1.opcode & 0x3F) == 0x23); // Login Response
+    assert(resp1.initiator_task_tag == 0x5E11AAAA);
+    // The response must mirror the offered stage. Forcing T=1/NSG=3 here is the
+    // protocol violation msiscsi answers with a TCP reset.
+    assert(resp1.flags == 0x81); // T=1, CSG=0, NSG=1
+    const uint8_t* h1 = reinterpret_cast<const uint8_t*>(&resp1);
+    assert(h1[36] == 0);        // Status-Class: Success
+    assert(h1[37] == 0);        // Status-Detail: Success
+    assert(be32(h1 + 24) == 0);  // StatSN seeded from this request's ExpStatSN
+    assert(be32(h1 + 28) == 0);  // ExpCmdSN = the initiator's CmdSN, not CmdSN + 1
+    assert(be32(h1 + 32) == 32); // MaxCmdSN = CmdSN + window depth (3720 3.2.2.1)
+    // RFC 3720 10.13.3 & 10.13.5: TSIH (offsets 14..15) MUST be 0 in intermediate Login Response PDUs
+    assert(h1[14] == 0);
+    assert(h1[15] == 0);
+    // Stage 0 is a security-negotiation response: RFC 3720 5.3.1 allows it
+    // nothing but the portal group tag and the one Chapter 11 key it exists to
+    // settle. TargetName is never echoed (12.4: it MUST not be redeclared
+    // within the login phase) and operational keys are Chapter 12 keys that a
+    // strict initiator rejects the login over.
+    assert(text1.find("TargetPortalGroupTag=1") != std::string::npos); // 5.3.1 MUST
+    assert(text1.find("AuthMethod=None") != std::string::npos);
+    assert(text1.find("TargetName=") == std::string::npos);
+    // The initiator's own InitiatorName is never echoed back (RFC 3720 5.3.2).
+    assert(text1.find("InitiatorName=") == std::string::npos);
+    assert(text1.find("InitialR2T=") == std::string::npos);
+    assert(text1.find("HeaderDigest=") == std::string::npos);
+    // Exactly two keys: nothing else may ride along in SecurityNegotiation.
+    {
+        size_t key_count = 0;
+        for (size_t i = 0; i < text1.size();) {
+            size_t j = i;
+            while (j < text1.size() && text1[j] != '\0') ++j;
+            if (j > i) ++key_count;
+            i = j + 1;
+        }
+        assert(key_count == 2);
+    }
+
+    // --- Exchange 2: the initiator reaches the operational stage and transits
+    // --- to Full Feature Phase (T=1, CSG=1, NSG=3).
+    std::string op_keys;
+    op_keys += "InitiatorName=iqn.1991-05.com.microsoft:pc01stage"; op_keys.push_back('\0');
+    op_keys += "HeaderDigest=None";                                 op_keys.push_back('\0');
+    op_keys += "MaxRecvDataSegmentLength=65536";                    op_keys.push_back('\0');
+
+    IscsiBhs resp2{};
+    std::string text2;
+    do_login(0x87, 0x5E11AAAA, op_keys, resp2, text2);
+
+    assert((resp2.opcode & 0x3F) == 0x23);
+    assert(resp2.flags == 0x87); // T=1, CSG=1, NSG=3: final accept
+    const uint8_t* h2 = reinterpret_cast<const uint8_t*>(&resp2);
+    assert(h2[36] == 0);
+    assert(be32(h2 + 24) == 1); // StatSN advanced exactly once (3720 10.13.4)
+    assert(be32(h2 + 28) == 0); // CmdSN never advances during the Login Phase
+    assert(be32(h2 + 32) == 32);
+    // RFC 3720 10.13.3 & 10.13.5: TSIH (offsets 14..15) MUST be non-zero in Login Final-Response
+    assert(h2[14] == 0);
+    assert(h2[15] == 1);
+    assert(text2.find("InitialR2T=No") != std::string::npos);
+    assert(text2.find("ImmediateData=Yes") != std::string::npos);
+    assert(text2.find("MaxBurstLength=262144") != std::string::npos);
+    assert(text2.find("FirstBurstLength=") != std::string::npos);
+    assert(text2.find("MaxRecvDataSegmentLength=") != std::string::npos);
+    assert(text2.find("MaxOutstandingR2T=1") != std::string::npos);
+    assert(text2.find("DefaultTime2Wait=0") != std::string::npos);
+    assert(text2.find("DefaultTime2Retain=0") != std::string::npos);
+    // AuthMethod is a Chapter 11 key: once the exchange is in the operational
+    // stage it must not appear, whatever the initiator offered.
+    assert(text2.find("AuthMethod=") == std::string::npos);
+    // ... and InitiatorName still comes back only from the initiator's own PDU.
+    assert(text2.find("InitiatorName=") == std::string::npos);
+    // TargetPortalGroupTag is the confirmation owed for a target the
+    // initiator named; TargetName itself is still never redeclared (12.4).
+    assert(text2.find("TargetPortalGroupTag=1") != std::string::npos);
+    assert(text2.find("TargetName=") == std::string::npos);
+
+    closesocket(s);
+    target.shutdown();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_iscsi_login_mirrors_offered_stage\n";
+}
+
+// RFC 3720 3.2.2.2 / 10.12.8 / 10.13: the Login Phase's sequence numbers are
+// per connection and have to come from the request that opens it.
+//
+// Three defects used to be indistinguishable on the wire:
+//   * ExpCmdSN answered login_req.CmdSN + 1, claiming to have consumed a
+//     command the initiator never issued. CmdSN does not advance during the
+//     Login Phase (RFC 3720 3.2.2.1), so the response has to confirm the very
+//     number it was handed.
+//   * MaxCmdSN was counted from that inflated base, publishing a window one
+//     slot ahead of the ExpCmdSN it was published with.
+//   * StatSN always restarted at 1 regardless of the ExpStatSN the initiator
+//     carried, so a connection reattaching past a counter of 1 was answered
+//     with a status sequence *below* the one it had already acknowledged.
+//
+// The test drives two independent connections: the first with a high, non-zero
+// CmdSN/ExpStatSN pair, the second back at zero. The second must answer zero
+// as well -- nothing from the first connection may survive into it.
+void test_iscsi_login_sequence_window_reset() {
+    std::cout << "[RUN] test_iscsi_login_sequence_window_reset\n";
+#if defined(_WIN32)
+    WSADATA wsa;
+    assert(WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+#endif
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_iscsi_seqwin";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    std::filesystem::path os_path = test_dir / "golden.raw";
+    {
+        std::ofstream ofs(os_path, std::ios::binary);
+        std::vector<uint8_t> dummy(64 * 1024, 0x11);
+        ofs.write(reinterpret_cast<const char*>(dummy.data()), dummy.size());
+    }
+
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    Configuration cfg;
+    cfg.set_os_images_dir(test_dir);
+    cfg.set_writeback_dir(test_dir);
+    img_mgr->configure(cfg);
+    assert(img_mgr->import_image(os_path, ImageRole::OsImage, ImageId("os_image")).is_ok());
+
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir);
+
+    uint16_t port = 13267;
+    IscsiTargetConfig tcfg;
+    tcfg.listen_address = NetworkAddress(127, 0, 0, 1, port);
+    tcfg.default_os_image_id = ImageId("os_image");
+    tcfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
+    IscsiTarget target(tcfg, sess_mgr);
+    assert(target.initialize().is_ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    sockaddr_in srv{};
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(port);
+    srv.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    auto be32 = [](const uint8_t* p) -> uint32_t {
+        return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+               (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+    };
+    // Every numeric iSCSI field is big-endian on the wire and IscsiBhs stores
+    // them as native uint32_t, so a *set* value has to be byte-swapped.
+    auto put_be32 = [](uint32_t& field, uint32_t v) {
+        auto* p = reinterpret_cast<uint8_t*>(&field);
+        p[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
+        p[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
+        p[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
+        p[3] = static_cast<uint8_t>(v & 0xFF);
+    };
+
+    // One Login Request with an explicit CmdSN/ExpStatSN pair, plus the text
+    // parameters that carry it. Returns the response BHS and its text payload.
+    auto login = [&](SOCKET s, uint8_t flags, uint32_t tag, const std::string& keys,
+                     uint32_t cmd_sn, uint32_t exp_stat_sn)
+        -> std::pair<IscsiBhs, std::string> {
+        IscsiBhs req{};
+        req.opcode = 0x03; // Login Request
+        req.flags = flags;
+        req.initiator_task_tag = tag;
+        put_be32(req.cmd_sn, cmd_sn);
+        put_be32(req.exp_stat_sn, exp_stat_sn);
+        const uint32_t d_len = static_cast<uint32_t>(keys.size());
+        req.data_seg_len[0] = static_cast<uint8_t>((d_len >> 16) & 0xFF);
+        req.data_seg_len[1] = static_cast<uint8_t>((d_len >> 8) & 0xFF);
+        req.data_seg_len[2] = static_cast<uint8_t>(d_len & 0xFF);
+
+        assert(send_all_bytes(s, &req, sizeof(req)));
+        if (d_len > 0) {
+            assert(send_all_bytes(s, keys.data(), keys.size()));
+            const uint32_t pad = (4 - (d_len % 4)) % 4;
+            if (pad > 0) {
+                const char pad_buf[4] = {0};
+                assert(send_all_bytes(s, pad_buf, pad));
+            }
+        }
+
+        IscsiBhs resp{};
+        assert(recv_all_bytes(s, &resp, sizeof(resp)));
+        assert((resp.opcode & 0x3F) == 0x23);
+        const uint32_t r_len = (static_cast<uint32_t>(resp.data_seg_len[0]) << 16) |
+                               (static_cast<uint32_t>(resp.data_seg_len[1]) << 8) |
+                               static_cast<uint32_t>(resp.data_seg_len[2]);
+        std::string text;
+        if (r_len > 0) {
+            const uint32_t r_pad = (r_len + 3) & ~3u;
+            std::vector<char> buf(r_pad, 0);
+            assert(recv_all_bytes(s, buf.data(), r_pad));
+            text.assign(buf.data(), r_len);
+        }
+        return {resp, text};
+    };
+
+    auto connect_to = [&](SOCKET& out) {
+        out = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        assert(out != INVALID_SOCKET);
+        DWORD tv = 3000;
+        setsockopt(out, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        assert(connect(out, reinterpret_cast<const sockaddr*>(&srv), sizeof(srv)) == 0);
+    };
+
+    // --- Connection A: a login that arrives with a long history behind it.
+    std::string sec_keys;
+    sec_keys += "InitiatorName=iqn.1991-05.com.microsoft:seq-a"; sec_keys.push_back('\0');
+    sec_keys += "SessionType=Normal";                            sec_keys.push_back('\0');
+    sec_keys += "AuthMethod=CHAP,None";                          sec_keys.push_back('\0');
+    sec_keys += "TargetName=iqn.2026-09.com.cobdiskless:storage";sec_keys.push_back('\0');
+
+    SOCKET a = INVALID_SOCKET;
+    connect_to(a);
+
+    const auto r1 = login(a, 0x81 /* T=1, CSG=0, NSG=1 */, 0xA0010001u, sec_keys, 1000, 77);
+    {
+        const uint8_t* h = reinterpret_cast<const uint8_t*>(&r1.first);
+        assert(be32(h + 24) == 77);   // StatSN = the ExpStatSN this request carried
+        assert(be32(h + 28) == 1000); // ExpCmdSN = this request's CmdSN, not +1
+        assert(be32(h + 32) == 1032); // MaxCmdSN counted from the same base
+        assert(h[36] == 0);           // Status-Class: Success
+    }
+    assert(r1.second.find("TargetPortalGroupTag=1") != std::string::npos); // 5.3.1 MUST
+    assert(r1.second.find("AuthMethod=None") != std::string::npos);
+    assert(r1.second.find("InitiatorName=") == std::string::npos); // never echoed
+    assert(r1.second.find("InitialR2T=") == std::string::npos);     // not in stage 0
+
+    // Second PDU of the same connection: CSG=1 -> NSG=3, and CmdSN still 1000
+    // because it never advances during the Login Phase.
+    std::string op_keys;
+    op_keys += "HeaderDigest=None";          op_keys.push_back('\0');
+    op_keys += "DataDigest=None";            op_keys.push_back('\0');
+    op_keys += "MaxRecvDataSegmentLength=65536"; op_keys.push_back('\0');
+
+    const auto r2 = login(a, 0x87 /* T=1, CSG=1, NSG=3 */, 0xA0010002u, op_keys, 1000, 78);
+    {
+        const uint8_t* h = reinterpret_cast<const uint8_t*>(&r2.first);
+        assert(be32(h + 24) == 78);   // StatSN advanced exactly once (3720 10.13.4)
+        assert(be32(h + 28) == 1000); // ExpCmdSN still the request's CmdSN
+        assert(be32(h + 32) == 1032);
+    }
+    assert(r2.second.find("HeaderDigest=None") != std::string::npos);
+    assert(r2.second.find("AuthMethod=") == std::string::npos); // Chapter 11 key, stage 1
+    assert(r2.second.find("InitiatorName=") == std::string::npos);
+
+    closesocket(a);
+
+    // --- Connection B: a brand-new connection back at the bottom of the
+    // --- counters. It must be answered from its own request, never from the
+    // --- 1000/78 connection A left behind.
+    std::string sec_keys_b;
+    sec_keys_b += "InitiatorName=iqn.1991-05.com.microsoft:seq-b"; sec_keys_b.push_back('\0');
+    sec_keys_b += "SessionType=Normal";                             sec_keys_b.push_back('\0');
+    sec_keys_b += "AuthMethod=None";                                sec_keys_b.push_back('\0');
+    sec_keys_b += "TargetName=iqn.2026-09.com.cobdiskless:storage"; sec_keys_b.push_back('\0');
+
+    SOCKET b = INVALID_SOCKET;
+    connect_to(b);
+
+    const auto r3 = login(b, 0x81, 0xB0010001u, sec_keys_b, 0, 0);
+    {
+        const uint8_t* h = reinterpret_cast<const uint8_t*>(&r3.first);
+        assert(be32(h + 24) == 0);  // StatSN reset with the connection
+        assert(be32(h + 28) == 0);  // ExpCmdSN = 0, not A's 1000
+        assert(be32(h + 32) == 32); // a full 32-deep window from CmdSN 0
+        assert(h[36] == 0);
+    }
+    assert(r3.second.find("TargetPortalGroupTag=1") != std::string::npos);
+    closesocket(b);
+
+    target.shutdown();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_iscsi_login_sequence_window_reset\n";
 }
 
 void test_iscsi_windows_boot_scsi_command_suite() {
@@ -3820,8 +4729,10 @@ void test_iscsi_windows_boot_scsi_command_suite() {
         auto data = recv_scsi_data_in(s, in_bhs);
         assert(data.size() == 36);
         assert(data[0] == 0x00); // Direct-access block device
-        assert(std::string(reinterpret_cast<const char*>(data.data() + 8), 8) == "COB     ");
-        assert(std::string(reinterpret_cast<const char*>(data.data() + 16), 16) == "CobDiskless SAN ");
+        assert(data[1] == 0x00); // RMB = 0: fixed disk (removable = no paging, no C:\)
+        assert(std::string(reinterpret_cast<const char*>(data.data() + 8), 8) == "COBDISK ");
+        assert(std::string(reinterpret_cast<const char*>(data.data() + 16), 16) == "VIRTUAL SAN DISK");
+        assert(std::string(reinterpret_cast<const char*>(data.data() + 32), 4) == "0001");
     }
 
     // 2. INQUIRY VPD Page 0x00 (Supported VPD Pages)
@@ -3834,18 +4745,30 @@ void test_iscsi_windows_boot_scsi_command_suite() {
         cmd.cdb[1] = 0x01; // EVPD
         cmd.cdb[2] = 0x00; // Supported Pages
         cmd.cdb[4] = 64;
+        test_write_be32(reinterpret_cast<uint8_t*>(&cmd.data_transfer_tag), 64); // EDTL = 64
         assert(send_all_bytes(s, &cmd, sizeof(cmd)));
 
         IscsiBhs in_bhs{};
         auto data = recv_scsi_data_in(s, in_bhs);
-        assert(data.size() >= 4);
+        assert(data.size() == 8);
+        assert(data[0] == 0x00);
         assert(data[1] == 0x00);
-        bool has_80 = false, has_83 = false;
+        assert(data[2] == 0x00);
+        assert(data[3] == 0x04); // 4 supported pages: 0x00, 0x80, 0x83, 0xB1
+        bool has_80 = false, has_83 = false, has_b1 = false;
         for (size_t i = 4; i < data.size(); ++i) {
             if (data[i] == 0x80) has_80 = true;
             if (data[i] == 0x83) has_83 = true;
+            if (data[i] == 0xB1) has_b1 = true;
         }
-        assert(has_80 && has_83);
+        assert(has_80 && has_83 && has_b1);
+        assert(in_bhs.flags == 0x83); // F (0x80) | U (0x02) | S (0x01)
+        assert(in_bhs.data_transfer_tag == 0xFFFFFFFF);
+        uint32_t residual = (static_cast<uint32_t>(in_bhs.cdb[12]) << 24) |
+                            (static_cast<uint32_t>(in_bhs.cdb[13]) << 16) |
+                            (static_cast<uint32_t>(in_bhs.cdb[14]) << 8)  |
+                             static_cast<uint32_t>(in_bhs.cdb[15]);
+        assert(residual == 64 - 8);
     }
 
     // 3. INQUIRY VPD Page 0x80 (Unit Serial Number)
@@ -3885,6 +4808,42 @@ void test_iscsi_windows_boot_scsi_command_suite() {
         assert(data.size() >= 4);
         assert(data[1] == 0x83);
         assert(data.size() >= 44);
+        // Descriptor 1 (offset 4): T10 Vendor ID, ASCII code set, type 0.
+        assert(data[4] == 0x02);
+        assert(data[5] == 0x00);
+        assert(data[7] == 24);
+        assert(std::string(reinterpret_cast<const char*>(data.data() + 8), 8) == "COBDISK ");
+        // Descriptor 2 (offset 32): a real 64-bit NAA -- binary code set,
+        // designator type 3, 8-byte identifier, top nibble 0x6 (NAA 6).
+        // This identity is what Windows records as the disk's device
+        // identification; it is derived from the client MAC, so it must be
+        // byte-for-byte identical on every reboot or the disk is flagged as
+        // a signature collision and taken offline.
+        assert(data[32] == 0x01);
+        assert(data[33] == 0x30); // designator type = NAA, PIV = 0
+        assert(data[34] == 0x00);
+        assert(data[35] == 8);
+        assert((data[36] & 0xF0) == 0x60); // NAA type 6
+    }
+
+    // 4b. INQUIRY VPD Page 0xB1 (Block Device Characteristics: Non-rotating / SSD)
+    {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.flags = 0x40;
+        cmd.initiator_task_tag = 0x3015;
+        cmd.cdb[0] = 0x12;
+        cmd.cdb[1] = 0x01; // EVPD
+        cmd.cdb[2] = 0xB1; // Block Device Characteristics
+        cmd.cdb[4] = 64;
+        assert(send_all_bytes(s, &cmd, sizeof(cmd)));
+
+        IscsiBhs in_bhs{};
+        auto data = recv_scsi_data_in(s, in_bhs);
+        assert(data.size() >= 6);
+        assert(data[1] == 0xB1);
+        uint16_t rot_rate = (static_cast<uint16_t>(data[4]) << 8) | data[5];
+        assert(rot_rate == 0x0001); // 0x0001 = Non-rotating medium (SSD)
     }
 
     // 5. REPORT LUNS (Opcode 0xA0)
@@ -3961,6 +4920,16 @@ void test_iscsi_windows_boot_scsi_command_suite() {
         IscsiBhs in_bhs{};
         auto data = recv_scsi_data_in(s, in_bhs);
         assert(data.size() >= 12);
+        // Byte 2 Bit 7 is WP (Write Protect). Must be 0 (Writable).
+        // A stray 1 here makes Windows mount C:\ read-only and stop dead.
+        assert((data[2] & 0x80) == 0);
+        // Caching Mode Page (0x08) must report WCE=1 so the initiator knows
+        // the device owns a write cache (the COW L1 RAM) and can push writes
+        // without waiting for the medium.
+        assert(data.size() >= 32);
+        assert(data[12] == 0x08); // Page Code: Caching
+        assert(data[13] == 0x12); // Page Length: 18
+        assert((data[14] & 0x04) != 0); // WCE (bit 2 of byte 2) = 1
 
         // MODE SENSE (10)
         IscsiBhs cmd10{};
@@ -3975,6 +4944,11 @@ void test_iscsi_windows_boot_scsi_command_suite() {
         IscsiBhs in_bhs10{};
         auto data10 = recv_scsi_data_in(s, in_bhs10);
         assert(data10.size() >= 16);
+        // Byte 3 Bit 7 is WP. Must be 0 (Writable).
+        assert((data10[3] & 0x80) == 0);
+        assert(data10.size() >= 36);
+        assert(data10[16] == 0x08);
+        assert((data10[18] & 0x04) != 0); // WCE = 1
     }
 
     // 9. TEST UNIT READY
@@ -3988,6 +4962,48 @@ void test_iscsi_windows_boot_scsi_command_suite() {
         auto resp = recv_scsi_response(s);
         assert(resp.initiator_task_tag == 0x300A);
         assert(resp.cdb[0] == 0x00); // SCSI Status: Good
+    }
+
+    // 9b. SYNCHRONIZE CACHE (10) and (16): a real durability barrier, not the
+    //     old "cache=unsafe" bypass. The target wakes its elevator flusher and
+    //     only answers SAM_STAT_GOOD once the dirty L1 clusters are on disk.
+    {
+        // Opcode 0x35: SYNCHRONIZE CACHE (10)
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.initiator_task_tag = 0x3016;
+        cmd.cdb[0] = 0x35;
+        assert(send_all_bytes(s, &cmd, sizeof(cmd)));
+        auto resp = recv_scsi_response(s);
+        assert(resp.initiator_task_tag == 0x3016);
+        assert(resp.cdb[0] == 0x00); // SCSI Status: Good
+
+        // Opcode 0x91: SYNCHRONIZE CACHE (16)
+        IscsiBhs cmd16{};
+        cmd16.opcode = 0x01;
+        cmd16.initiator_task_tag = 0x3017;
+        cmd16.cdb[0] = 0x91;
+        assert(send_all_bytes(s, &cmd16, sizeof(cmd16)));
+        auto resp16 = recv_scsi_response(s);
+        assert(resp16.initiator_task_tag == 0x3017);
+        assert(resp16.cdb[0] == 0x00); // SCSI Status: Good
+    }
+
+    // 10. TASK MANAGEMENT FUNCTION (Opcode 0x02: Logical Unit Reset)
+    {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x02; // Task Management Function Request
+        cmd.flags = 0x80 | 0x02; // Function = 0x02 (Logical Unit Reset)
+        cmd.initiator_task_tag = 0x300B;
+        assert(send_all_bytes(s, &cmd, sizeof(cmd)));
+
+        IscsiBhs resp{};
+        int n = recv(s, reinterpret_cast<char*>(&resp), sizeof(resp), 0);
+        assert(n == sizeof(resp));
+        assert(resp.opcode == 0x22); // Task Management Function Response
+        assert((resp.flags & 0x80) == 0x80);
+        assert(resp.rsvd1[0] == 0x00); // Function Complete
+        assert(resp.initiator_task_tag == 0x300B);
     }
 
     closesocket(s);
@@ -4083,6 +5099,42 @@ void test_iscsi_write10_and_sync_cache_persistence() {
         auto resp = recv_scsi_response(s);
         assert(resp.initiator_task_tag == 0x4003);
         assert(resp.cdb[0] == 0x00);
+
+        // The GOOD above is only honest if the two sectors are already on the
+        // target's disk, not still sitting in the L1 RAM cache. The base image
+        // is 0x33 throughout, so a 0x77 run inside the .cow overlay can only
+        // have come from this write -- and it has to be at the byte offset
+        // LBA 20 occupies inside whatever 64 KiB cluster the overlay put it in.
+        const uint64_t write_len_proof = 1024;
+        bool persisted = false;
+        std::error_code fs_ec;
+        for (std::filesystem::recursive_directory_iterator it(test_dir, fs_ec), end;
+             !fs_ec && it != end; it.increment(fs_ec)) {
+            if (!it->is_regular_file() || it->path().extension() != ".cow") {
+                continue;
+            }
+            std::ifstream ifs(it->path(), std::ios::binary);
+            if (!ifs) {
+                continue;
+            }
+            std::vector<uint8_t> file((std::istreambuf_iterator<char>(ifs)),
+                                       std::istreambuf_iterator<char>());
+            const uint64_t within_chunk = 20ull * 512; // LBA 20 inside its cluster
+            for (uint64_t off = kCowDataOffset + within_chunk;
+                 off + write_len_proof <= file.size();
+                 off += kCowChunkBytes) {
+                if (std::all_of(file.begin() + static_cast<std::ptrdiff_t>(off),
+                                file.begin() + static_cast<std::ptrdiff_t>(off + write_len_proof),
+                                [](uint8_t b) { return b == 0x77; })) {
+                    persisted = true;
+                    break;
+                }
+            }
+            if (persisted) {
+                break;
+            }
+        }
+        assert(persisted);
     }
 
     // 3. Send READ 10 for the written sectors (LBA 20, 2 sectors) -> must return 0x77
@@ -4149,12 +5201,27 @@ void test_iscsi_write10_and_sync_cache_persistence() {
         assert((r2t.opcode & 0x3F) == 0x31); // R2T
         assert(r2t.initiator_task_tag == 0x4006);
 
+        // RFC 3720 10.8 field positions (cdb starts at byte 32). A regression
+        // here put Desired Data Transfer Length = 0 on the wire, which makes
+        // the initiator answer with zero-length Data-Out PDUs forever: the
+        // R2T storm that stalls the Windows boot write.
+        auto r2t_be32 = [](const uint8_t* p) {
+            return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+                   (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+        };
+        assert(r2t_be32(r2t.cdb + 4) == 0);            // R2TSN = 0 (first R2T)
+        assert(r2t_be32(r2t.cdb + 8) == 0);            // Buffer Offset = 0
+        assert(r2t_be32(r2t.cdb + 12) == write_len);   // Desired Data Transfer Length = 512
+        assert(r2t.data_transfer_tag == 0x00000001);   // Target Transfer Tag
+
         // Send SCSI Data-Out PDU (Opcode 0x05) in response to R2T
         IscsiBhs dout{};
         dout.opcode = 0x05; // SCSI Data-Out
         dout.flags = 0x80;  // Final
         dout.initiator_task_tag = 0x4006;
         dout.data_transfer_tag = r2t.data_transfer_tag;
+        test_write_be32(dout.cdb + 0, 0);       // DataSN = 0 (byte 36)
+        test_write_be32(dout.cdb + 8, 0);       // Buffer Offset = 0 (byte 40)
         dout.data_seg_len[0] = static_cast<uint8_t>((write_len >> 16) & 0xFF);
         dout.data_seg_len[1] = static_cast<uint8_t>((write_len >> 8) & 0xFF);
         dout.data_seg_len[2] = static_cast<uint8_t>(write_len & 0xFF);
@@ -4580,7 +5647,7 @@ void test_real_hardware_recovery_dhcp_tftp_cache() {
         for (size_t i = 0; i < sizeof(reply_hdr->sname); ++i) {
             assert(reply_hdr->sname[i] == 0);
         }
-        assert(std::string(reinterpret_cast<const char*>(reply_hdr->file)) == "undionly.kpxe");
+        assert(std::string(reinterpret_cast<const char*>(reply_hdr->file)) == "cobpxe.kpxe");
 
         // The DHCPACK goes through the same option builder, so it must be equally
         // clean: a client that has reached SELECTING and receives a ProxyDHCP hint
@@ -4648,7 +5715,7 @@ void test_real_hardware_recovery_dhcp_tftp_cache() {
 
         // DHCPACK still carries the boot file both ways: legacy BOOTP `file` and Option 67.
         const auto* ack_hdr = reinterpret_cast<const DhcpHeader*>(ack.data());
-        assert(std::string(reinterpret_cast<const char*>(ack_hdr->file)) == "undionly.kpxe");
+        assert(std::string(reinterpret_cast<const char*>(ack_hdr->file)) == "cobpxe.kpxe");
         // ...but sname stays zero on the ACK too, for the same DNS reason.
         assert(ack_hdr->sname[0] == '\0');
         bool ack_opt67 = false;
@@ -4661,7 +5728,7 @@ void test_real_hardware_recovery_dhcp_tftp_cache() {
             const uint8_t len = ack[a_idx++];
             if (a_idx + len > ack.size()) break;
             if (code == 67 && len > 0 &&
-                std::string(reinterpret_cast<const char*>(ack.data() + a_idx), len) == "undionly.kpxe") {
+                std::string(reinterpret_cast<const char*>(ack.data() + a_idx), len) == "cobpxe.kpxe") {
                 ack_opt67 = true;
             }
             a_idx += len;
@@ -4673,8 +5740,16 @@ void test_real_hardware_recovery_dhcp_tftp_cache() {
     }
 
     // 2. Real TFTP Bootloader Payloads and Multi-Block Delivery
+    //    Hermetic like the suite's other file-content checks: virtual payloads
+    //    sized past the real-binary thresholds, so this test never depends on
+    //    boot assets on disk -- the DHCP filename test a few suites up
+    //    requires undionly.kpxe to be absent, so on-disk presence can never
+    //    satisfy both.
     {
         TftpServer tftp_srv(NetworkAddress(192, 168, 1, 100), "tftp_boot");
+        tftp_srv.register_virtual_file("ipxe.efi", std::vector<uint8_t>(600000, 0x4D));
+        tftp_srv.register_virtual_file("undionly.kpxe", std::vector<uint8_t>(60000, 0x55));
+        tftp_srv.register_virtual_file("snponly.efi", std::vector<uint8_t>(120000, 0x53));
 
         auto ipxe_efi = tftp_srv.get_file_content("ipxe.efi");
         assert(ipxe_efi.is_ok());
@@ -4693,8 +5768,9 @@ void test_real_hardware_recovery_dhcp_tftp_cache() {
         assert(boot_ipxe.is_ok());
         std::string ipxe_script(reinterpret_cast<const char*>(boot_ipxe.value().data()), boot_ipxe.value().size());
         assert(ipxe_script.find("#!ipxe") != std::string::npos);
-        assert(ipxe_script.find("sanboot iscsi:") != std::string::npos);
-        assert(ipxe_script.find("set keep-san 1") != std::string::npos);
+        assert(ipxe_script.find("set busloc ${net0/busloc}") != std::string::npos);
+        assert(ipxe_script.find("chain http://") != std::string::npos);
+
     }
 
     // 3. StorageManager Attached Cache Configuration & Persistence
@@ -5130,12 +6206,16 @@ void test_super_client_image_update_pipeline() {
     assert(res_fallback.error().code() == ErrorCode::StorageFailure);
 
     // 3. Client Manager: Super Client toggle and persistence
+    std::filesystem::path wb_dir = test_dir / "writeback";
+    std::filesystem::create_directories(wb_dir, ec);
+
     auto cli_mgr = std::make_shared<ClientManager>();
     ClientRecord cl1;
     cl1.pc_name = "SuperPC";
     cl1.mac_address = "AA:BB:CC:11:22:33";
     cl1.ip_address = NetworkAddress(192, 168, 1, 50);
     cl1.os_image_id = "master_os";
+    cl1.writeback_dir = wb_dir;
     cl1.is_super_client = true;
     assert(cli_mgr->add_or_update_client(cl1).is_ok());
 
@@ -5150,8 +6230,6 @@ void test_super_client_image_update_pipeline() {
     assert(cl_loaded->is_super_client == true);
 
     // 4. Session Manager and Super Client COW Merge Pipeline
-    std::filesystem::path wb_dir = test_dir / "writeback";
-    std::filesystem::create_directories(wb_dir, ec);
     auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, wb_dir);
     sess_mgr->set_client_manager(cli_mgr);
 
@@ -5471,8 +6549,8 @@ void test_multi_client_writeback_isolation_and_lifecycle() {
     assert(sess_mgr->active_clients_count() == 2);
 
     // --- 5. Session teardown purges the overlay for a clean baseline ---
-    const std::filesystem::path a_overlay = wb_dir / "wb_00_11_22_33_44_AA.cow";
-    const std::filesystem::path b_overlay = wb_dir / "wb_00_11_22_33_44_BB.cow";
+    const std::filesystem::path a_overlay = wb_dir / "wb_0011223344aa.cow";
+    const std::filesystem::path b_overlay = wb_dir / "wb_0011223344bb.cow";
     assert(std::filesystem::exists(a_overlay));
     assert(std::filesystem::exists(b_overlay));
 
@@ -5522,7 +6600,7 @@ void test_multi_client_writeback_isolation_and_lifecycle() {
 
     assert(sess_mgr->terminate_session(sup->id()).is_ok());
     assert(sess_mgr->active_clients_count() == 0);
-    assert(!std::filesystem::exists(wb_dir / "wb_00_11_22_33_44_99.cow"));
+    assert(!std::filesystem::exists(wb_dir / "wb_001122334499.cow"));
 
     // --- 7. The base only ever received the Super Client's maintenance write ---
     assert(base_byte(8192) == 0xC3);   // committed directly into the base
@@ -5792,14 +6870,28 @@ void test_http_enrollment_and_ipxe_scripts() {
     daemon.set_initiator_prefix("iqn.2026-09.cobdiskless:");
     daemon.set_http_port(8080);
 
-    // --- 2. Bare /boot.ipxe returns clean SANBoot script --------------------
+    // --- 2. Bare /boot.ipxe re-chains itself with the caller's MAC ----------
+    // DHCP's Option 67 URL is a fixed string and cannot expand ${net0/mac},
+    // so the first hop has no way to say who it is. Attaching anyway is what
+    // stranded a brand-new machine behind a shared target it was never
+    // enrolled for -- and never asked it for a name.
     const HttpResponse bootstrap = daemon.handle_request("GET", "/boot.ipxe");
     assert(bootstrap.status == 200);
     assert(bootstrap.body.rfind("#!ipxe", 0) == 0);
-    assert(bootstrap.body.find("set keep-san 1") != std::string::npos);
-    assert(bootstrap.body.find("sanboot iscsi:192.168.10.7::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
-    assert(bootstrap.body.find("${server_ip}") == std::string::npos);
+    assert(bootstrap.body.find(
+               "/boot.ipxe?mac=${net0/mac}&platform=${platform}") != std::string::npos);
+    assert(bootstrap.body.find("sanboot") == std::string::npos);
     assert(bootstrap.body.find("sanhook") == std::string::npos);
+    assert(bootstrap.body.find("${server_ip}") == std::string::npos);
+
+    // A present-but-empty `mac` key is still an answer (same rule as
+    // `platform`): re-chaining on it would loop forever, so the second hop
+    // has to settle -- here, by falling through to the naming prompt.
+    const HttpResponse bare_mac = daemon.handle_request("GET", "/boot.ipxe?mac=");
+    assert(bare_mac.status == 200);
+    assert(bare_mac.body.find("/boot.ipxe?mac=${net0/mac}") == std::string::npos);
+    assert(bare_mac.body.find("sanboot") == std::string::npos);
+    assert(bare_mac.body.find("Unregistered PC Detected") != std::string::npos);
 
     // --- 3. Unregistered MAC -> interactive enrollment prompt ----------------
     HttpResponse unknown = daemon.handle_request("GET", "/boot.ipxe?mac=aa:bb:cc:00:00:01");
@@ -5820,22 +6912,33 @@ void test_http_enrollment_and_ipxe_scripts() {
     assert(enrolled.status == 200);
     assert(enrolled.body.rfind("#!ipxe", 0) == 0);
     assert(enrolled.body.find("set keep-san 1") != std::string::npos);
-    assert(enrolled.body.find("sanboot iscsi:192.168.10.7::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+    assert(enrolled.body.find("set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}") != std::string::npos);
+    assert(enrolled.body.find("sanhook --drive 0x80 iscsi:192.168.10.7::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+    assert(enrolled.body.find("sanboot --drive 0x80") != std::string::npos);
     assert(enrolled.body.find("${server_ip}") == std::string::npos);
-    assert(enrolled.body.find("sanhook") == std::string::npos);
     assert(db->client_count() == 1);
     assert(db->find_client_by_mac("aa:bb:cc:00:00:01")->hostname == "PC-01");
     assert(db->find_client_by_mac("aa:bb:cc:00:00:01")->ip_address ==
            NetworkAddress(192, 168, 10, 100));
     assert(db->find_client_by_mac("aa:bb:cc:00:00:01")->base_image == "win10_base.vhd");
 
-    // --- 5. Registered MAC now boots straight to the SAN ---------------------
+    // --- 5. Registered MAC no longer boots straight to the SAN ------------
+    // A DB-known MAC is no proof its NIC was ever enrolled (ven/dev-only
+    // manifest rows predate per-board bindings), so the legacy hop detours
+    // through PCI sniffing + the enrollment route: an enrolled board answers
+    // SAN on the very next hop, an unenrolled one enrolls and reboots.
+    // Serving sanboot here is what sent stock-iPXE bare-metal stations
+    // straight into 0x7B with no enrollment attempt in the log.
     HttpResponse known = daemon.handle_request("GET", "/boot.ipxe?mac=aa:bb:cc:00:00:01");
     assert(known.status == 200);
-    assert(known.body.find("sanboot iscsi:192.168.10.7::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
-    assert(known.body.find("${server_ip}") == std::string::npos);
-    assert(known.body.find("set keep-san 1") != std::string::npos);
+    assert(known.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(known.body.find("set subdev ${pci/${busloc}.2e.2:hex}") != std::string::npos);
+    assert(known.body.find(
+               "chain http://192.168.10.7:8080/boot?mac=AA:BB:CC:00:00:01"
+               "&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&sniffed=1")
+           != std::string::npos);
     assert(known.body.find("sanhook") == std::string::npos);
+    assert(known.body.find("sanboot") == std::string::npos);
     assert(known.body.find("read pc_name") == std::string::npos);
     assert(known.body.find("Unregistered PC Detected") == std::string::npos);
 
@@ -5843,10 +6946,11 @@ void test_http_enrollment_and_ipxe_scripts() {
     const HttpResponse replay = daemon.handle_request(
         "GET", "/api/enroll?mac=AA:BB:CC:00:00:01&name=PC-01");
     assert(replay.status == 200);
-    assert(replay.body.find("sanboot iscsi:192.168.10.7::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+    assert(replay.body.find("set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}") != std::string::npos);
+    assert(replay.body.find("sanhook --drive 0x80 iscsi:192.168.10.7::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+    assert(replay.body.find("sanboot --drive 0x80") != std::string::npos);
     assert(replay.body.find("${server_ip}") == std::string::npos);
     assert(replay.body.find("set keep-san 1") != std::string::npos);
-    assert(replay.body.find("sanhook") == std::string::npos);
     assert(db->client_count() == 1);
 
     // Same MAC under a different name -> conflict, not a silent rename.
@@ -6044,10 +7148,12 @@ void test_http_daemon_live_socket() {
 
         assert(boot_reply.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
         assert(boot_reply.find("#!ipxe") != std::string::npos);
-        assert(boot_reply.find("sanboot iscsi:192.168.10.7::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+        // DB-known MAC without telemetry detours into sniffing (strict gate),
+        // it no longer takes silent SAN here.
+        assert(boot_reply.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+        assert(boot_reply.find("&sniffed=1") != std::string::npos);
+        assert(boot_reply.find("sanboot --drive 0x80") == std::string::npos);
         assert(boot_reply.find("${server_ip}") == std::string::npos);
-        assert(boot_reply.find("set keep-san 1") != std::string::npos);
-        assert(boot_reply.find("sanhook") == std::string::npos);
     }
 
     // --- 404 over the wire -----------------------------------------------------
@@ -6192,6 +7298,69 @@ void test_config_file_resolution_and_default_port() {
     std::cout << "  PASS: test_config_file_resolution_and_default_port\n";
 }
 
+void test_tftp_boot_directory_dynamic_resolution() {
+    std::cout << "[RUN] test_tftp_boot_directory_dynamic_resolution\n";
+
+    // 1. Candidate paths ordering check
+    const std::filesystem::path mock_work = "C:/mock/project";
+    const std::filesystem::path mock_exe = "C:/mock/project/build/bin";
+    auto candidates = Configuration::candidate_tftp_boot_paths("", mock_work, mock_exe);
+    assert(!candidates.empty());
+    // Executable-relative candidates should be tested first
+    assert(candidates[0] == mock_exe / "tftp_boot");
+    assert(candidates[2] == mock_exe / ".." / "tftp_boot");
+    assert(candidates[4] == mock_exe / ".." / ".." / "tftp_boot");
+
+    // 2. Multi-level hierarchy resolution
+    const std::filesystem::path base_test_dir = "test_scratch_tftp_dynamic_res";
+    std::error_code ec;
+    std::filesystem::remove_all(base_test_dir, ec);
+
+    const std::filesystem::path repo_root = base_test_dir / "repo";
+    const std::filesystem::path repo_tftp = repo_root / "tftp_boot";
+    const std::filesystem::path repo_build_bin = repo_root / "build" / "bin";
+    const std::filesystem::path other_work = base_test_dir / "other_work";
+
+    std::filesystem::create_directories(repo_tftp, ec);
+    std::filesystem::create_directories(repo_build_bin, ec);
+    std::filesystem::create_directories(other_work, ec);
+
+    // Place undionly.kpxe only at repo root tftp_boot
+    {
+        std::ofstream ofs(repo_tftp / "undionly.kpxe", std::ios::binary);
+        ofs << "MOCK_UNDIONLY_PAYLOAD";
+    }
+
+    // Probing from build/bin directory with working directory elsewhere must traverse upwards and find repo_tftp!
+    auto resolved_repo = Configuration::resolve_tftp_boot_directory("", other_work, repo_build_bin);
+    assert(resolved_repo == repo_build_bin / ".." / ".." / "tftp_boot");
+    assert(std::filesystem::exists(resolved_repo / "undionly.kpxe"));
+
+    // Case B: Now simulate build output directory having its own tftp_boot (via CMake POST_BUILD copy)
+    const std::filesystem::path bin_tftp = repo_build_bin / "tftp_boot";
+    std::filesystem::create_directories(bin_tftp, ec);
+    {
+        std::ofstream ofs(bin_tftp / "undionly.kpxe", std::ios::binary);
+        ofs << "MOCK_BIN_UNDIONLY_PAYLOAD";
+    }
+    auto resolved_bin = Configuration::resolve_tftp_boot_directory("", other_work, repo_build_bin);
+    assert(resolved_bin == repo_build_bin / "tftp_boot");
+
+    // Case C: Explicitly configured directory takes precedence
+    const std::filesystem::path custom_tftp = base_test_dir / "custom_boot";
+    std::filesystem::create_directories(custom_tftp, ec);
+    {
+        std::ofstream ofs(custom_tftp / "undionly.kpxe", std::ios::binary);
+        ofs << "MOCK_CUSTOM_PAYLOAD";
+    }
+    auto resolved_custom = Configuration::resolve_tftp_boot_directory(custom_tftp, other_work, repo_build_bin);
+    assert(resolved_custom == custom_tftp);
+
+    // Clean up
+    std::filesystem::remove_all(base_test_dir, ec);
+    std::cout << "  PASS: test_tftp_boot_directory_dynamic_resolution\n";
+}
+
 // =============================================================================
 // Dynamic Port Propagation on Collision Tests
 // =============================================================================
@@ -6295,12 +7464,16 @@ void test_dynamic_port_propagation_on_collision() {
     assert(found_opt67);
 
     // 4. Verify all iPXE script templates contain correct configuration
-    // 4a. Clean SANBoot script (bare /boot.ipxe)
+    // 4a. Bare /boot.ipxe re-identifies over HTTP (bare -> ?mac= chain)
     auto boot_script = daemon.handle_request("GET", "/boot.ipxe");
     assert(boot_script.status == 200);
     assert(boot_script.body.rfind("#!ipxe", 0) == 0);
-    assert(boot_script.body.find("set keep-san 1") != std::string::npos);
-    assert(boot_script.body.find("sanboot iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+    assert(boot_script.body.find(
+               "http://192.168.1.100:") != std::string::npos);
+    assert(boot_script.body.find(
+               "/boot.ipxe?mac=${net0/mac}&platform=${platform}") != std::string::npos);
+    assert(boot_script.body.find("sanboot") == std::string::npos);
+    assert(boot_script.body.find("sanhook") == std::string::npos);
     assert(boot_script.body.find("${server_ip}") == std::string::npos);
 
     // 4b. Interactive enrollment script (unregistered client contains bound port 28081)
@@ -6338,8 +7511,12 @@ void test_dynamic_port_propagation_on_collision() {
 
         assert(resp.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
         assert(resp.find("#!ipxe") != std::string::npos);
-        assert(resp.find("set keep-san 1") != std::string::npos);
-        assert(resp.find("sanboot iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:storage") != std::string::npos);
+        // The chain target must carry the port the daemon actually bound after
+        // the collision, not the configured one.
+        assert(resp.find("http://192.168.1.100:" + std::to_string(bound) +
+                         "/boot.ipxe?mac=${net0/mac}&platform=${platform}") !=
+               std::string::npos);
+        assert(resp.find("sanboot") == std::string::npos);
         assert(resp.find("${server_ip}") == std::string::npos);
     }
 
@@ -6418,7 +7595,7 @@ void test_dynamic_port_propagation_on_collision() {
 }
 
 // =============================================================================
-// Minimal read-only regf hive walker (used to verify offline hive injections)
+// Minimal read-only regf hive walker (used to verify offline hive arming)
 // =============================================================================
 namespace {
 
@@ -6533,66 +7710,6 @@ uint32_t hive_open_path(const std::vector<uint8_t>& hive, const std::string& pat
     return current;
 }
 
-// Read a REG_SZ / REG_EXPAND_SZ value from an nk cell as ASCII ("" when absent)
-std::string hive_get_string(const std::vector<uint8_t>& hive, uint32_t nk_off, const std::string& value_name) {
-    HiveCell nk = hive_cell(hive, nk_off);
-    if (!nk.valid() || nk.len < 0x2C || hive_rd16(nk.data) != 0x6B6E) return "";
-
-    uint32_t val_count = hive_rd32(nk.data + 0x24);
-    uint32_t vl_off = hive_rd32(nk.data + 0x28);
-    if (val_count == 0 || vl_off == 0 || vl_off == 0xFFFFFFFF) return "";
-
-    HiveCell vl = hive_cell(hive, vl_off);
-    if (!vl.valid()) return "";
-
-    for (uint32_t i = 0; i < val_count; ++i) {
-        if (static_cast<size_t>(i + 1) * 4 > vl.len) break; // value list cell is a bare offset array
-        uint32_t vk_off = hive_rd32(vl.data + i * 4);
-        HiveCell vk = hive_cell(hive, vk_off);
-        if (!vk.valid() || vk.len < 0x14 || hive_rd16(vk.data) != 0x6B76) continue;
-
-        uint16_t nlen = hive_rd16(vk.data + 0x02);
-        if (0x14 + static_cast<size_t>(nlen) > vk.len) continue;
-        std::string vname(reinterpret_cast<const char*>(vk.data + 0x14), nlen);
-        if (!hive_name_iequal(vname, value_name)) continue;
-
-        uint32_t dlen = hive_rd32(vk.data + 0x04);
-        uint32_t raw_len = dlen & 0x7FFFFFFF;
-        const uint8_t* dptr = nullptr;
-        size_t dcap = 0;
-        if (dlen & 0x80000000u) {
-            if (vk.len < 0x0C) return "";
-            dptr = vk.data + 0x08;
-            dcap = vk.len - 0x08;
-        } else {
-            uint32_t doff = hive_rd32(vk.data + 0x08);
-            HiveCell dc = hive_cell(hive, doff);
-            if (!dc.valid()) return "";
-            dptr = dc.data;
-            dcap = dc.len;
-        }
-        if (!dptr || raw_len == 0) return "";
-        if (raw_len > dcap) raw_len = static_cast<uint32_t>(dcap);
-
-        std::string out;
-        if (raw_len >= 2 && dptr[1] == 0) { // UTF-16LE
-            for (uint32_t c = 0; c + 1 < raw_len; c += 2) {
-                char ch = static_cast<char>(dptr[c]);
-                if (ch == 0) break;
-                out.push_back(ch);
-            }
-        } else {
-            for (uint32_t c = 0; c < raw_len; ++c) {
-                char ch = static_cast<char>(dptr[c]);
-                if (ch == 0) break;
-                out.push_back(ch);
-            }
-        }
-        return out;
-    }
-    return "";
-}
-
 // Read a REG_DWORD value from an nk cell (false when absent or not a DWORD)
 bool hive_get_dword(const std::vector<uint8_t>& hive, uint32_t nk_off, const std::string& value_name, uint32_t* out) {
     HiveCell nk = hive_cell(hive, nk_off);
@@ -6636,533 +7753,530 @@ bool hive_get_dword(const std::vector<uint8_t>& hive, uint32_t nk_off, const std
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Small write helpers. The Stage 15 test deliberately re-corrupts already-armed
-// values (dump stack on, paging file present, task offload on) and re-arms,
-// which proves the armer *corrects* existing values
-// instead of only creating the ones that are missing.
-// ---------------------------------------------------------------------------
-
-void hive_wr32(uint8_t* p, uint32_t v) noexcept {
-    p[0] = static_cast<uint8_t>(v & 0xFF);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
-    p[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
-    p[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
-}
-
-// REG_* type of a value (0xFFFFFFFF when the value does not exist)
-uint32_t hive_value_type(const std::vector<uint8_t>& hive, uint32_t nk_off, const std::string& value_name) {
-    HiveCell nk = hive_cell(hive, nk_off);
-    if (!nk.valid() || nk.len < 0x2C || hive_rd16(nk.data) != 0x6B6E) return 0xFFFFFFFF;
-
-    uint32_t val_count = hive_rd32(nk.data + 0x24);
-    uint32_t vl_off = hive_rd32(nk.data + 0x28);
-    if (val_count == 0 || vl_off == 0 || vl_off == 0xFFFFFFFF) return 0xFFFFFFFF;
-
-    HiveCell vl = hive_cell(hive, vl_off);
-    if (!vl.valid()) return 0xFFFFFFFF;
-
+// Read a REG_SZ value from an nk cell ("" when absent or not a string).
+// Group is the only string the arming contract writes, and it is the one
+// value whose *content* decides whether an image boots: "NDIS Wrapper" and
+// "NDIS" are the same four characters to a length-blind byte search.
+std::string hive_get_sz(const std::vector<uint8_t>& hive, uint32_t nk_off,
+                        const std::string& value_name) {
+    const HiveCell nk = hive_cell(hive, nk_off);
+    if (!nk.valid() || nk.len < 0x2C || hive_rd16(nk.data) != 0x6B6E) return "";
+    const uint32_t val_count = hive_rd32(nk.data + 0x24);
+    const HiveCell vl = hive_cell(hive, hive_rd32(nk.data + 0x28));
+    if (!vl.valid() || static_cast<size_t>(val_count) * 4u > vl.len) return "";
     for (uint32_t i = 0; i < val_count; ++i) {
-        if (static_cast<size_t>(i + 1) * 4 > vl.len) break;
-        uint32_t vk_off = hive_rd32(vl.data + i * 4);
-        HiveCell vk = hive_cell(hive, vk_off);
+        const HiveCell vk = hive_cell(hive, hive_rd32(vl.data + i * 4));
         if (!vk.valid() || vk.len < 0x14 || hive_rd16(vk.data) != 0x6B76) continue;
-        uint16_t nlen = hive_rd16(vk.data + 0x02);
-        if (0x14 + static_cast<size_t>(nlen) > vk.len) continue;
-        std::string vname(reinterpret_cast<const char*>(vk.data + 0x14), nlen);
+        const uint16_t nlen = hive_rd16(vk.data + 0x02);
+        if (0x14u + nlen > vk.len) continue;
+        const std::string vname(reinterpret_cast<const char*>(vk.data + 0x14), nlen);
         if (!hive_name_iequal(vname, value_name)) continue;
-        return hive_rd32(vk.data + 0x0C);
+        if (hive_rd32(vk.data + 0x0C) != 1) return ""; // not REG_SZ
+        uint32_t dlen = hive_rd32(vk.data + 0x04);
+        const bool inlined = (dlen & 0x80000000u) != 0;
+        dlen &= 0x7FFFFFFFu;
+        const uint8_t* dp = nullptr;
+        if (inlined) {
+            if (vk.len < 0x0C || dlen > 4) return "";
+            dp = vk.data + 0x08;
+        } else {
+            const HiveCell dc = hive_cell(hive, hive_rd32(vk.data + 0x08));
+            if (!dc.valid() || dc.len < 2) return "";
+            if (dc.len < dlen) dlen = static_cast<uint32_t>(dc.len);
+            dp = dc.data;
+        }
+        std::string out;
+        for (uint32_t b = 0; b + 1 < dlen; b += 2) {
+            const uint16_t ch = static_cast<uint16_t>(dp[b]) |
+                                static_cast<uint16_t>(static_cast<uint16_t>(dp[b + 1]) << 8);
+            if (ch == 0) break;
+            out.push_back(static_cast<char>(ch & 0xFF));
+        }
+        return out;
     }
-    return 0xFFFFFFFF;
-}
-
-// Mutable pointer to a value's vk payload inside an nk cell (nullptr when absent)
-uint8_t* hive_vk_ptr(std::vector<uint8_t>& hive, uint32_t nk_off, const std::string& value_name) {
-    HiveCell nk = hive_cell(hive, nk_off);
-    if (!nk.valid() || nk.len < 0x2C || hive_rd16(nk.data) != 0x6B6E) return nullptr;
-
-    uint32_t val_count = hive_rd32(nk.data + 0x24);
-    uint32_t vl_off = hive_rd32(nk.data + 0x28);
-    if (val_count == 0 || vl_off == 0 || vl_off == 0xFFFFFFFF) return nullptr;
-
-    HiveCell vl = hive_cell(hive, vl_off);
-    if (!vl.valid()) return nullptr;
-
-    for (uint32_t i = 0; i < val_count; ++i) {
-        if (static_cast<size_t>(i + 1) * 4 > vl.len) break;
-        uint32_t vk_off = hive_rd32(vl.data + i * 4);
-        HiveCell vk = hive_cell(hive, vk_off);
-        if (!vk.valid() || vk.len < 0x14 || hive_rd16(vk.data) != 0x6B76) continue;
-        uint16_t nlen = hive_rd16(vk.data + 0x02);
-        if (0x14 + static_cast<size_t>(nlen) > vk.len) continue;
-        std::string vname(reinterpret_cast<const char*>(vk.data + 0x14), nlen);
-        if (!hive_name_iequal(vname, value_name)) continue;
-        return const_cast<uint8_t*>(vk.data);
-    }
-    return nullptr;
-}
-
-// Overwrite a REG_DWORD in place (inline data or heap cell)
-bool hive_poke_dword(std::vector<uint8_t>& hive, uint32_t nk_off, const std::string& value_name, uint32_t value) {
-    uint8_t* vk = hive_vk_ptr(hive, nk_off, value_name);
-    if (!vk) return false;
-    if (hive_rd32(vk + 0x04) & 0x80000000u) {
-        hive_wr32(vk + 0x08, value);
-        return true;
-    }
-    HiveCell dc = hive_cell(hive, hive_rd32(vk + 0x08));
-    if (!dc.valid() || dc.len < 4) return false;
-    hive_wr32(const_cast<uint8_t*>(dc.data), value);
-    return true;
-}
-
-// Overwrite the raw UTF-16 payload of a REG_SZ / REG_MULTI_SZ value in place
-// (only when the replacement fits the existing data cell -- no hive allocation).
-bool hive_poke_string_data(std::vector<uint8_t>& hive, uint32_t nk_off, const std::string& value_name,
-                           const std::vector<uint8_t>& bytes) {
-    uint8_t* vk = hive_vk_ptr(hive, nk_off, value_name);
-    if (!vk) return false;
-    uint32_t dlen = hive_rd32(vk + 0x04);
-    if (dlen & 0x80000000u) {
-        if (bytes.size() > (dlen & 0x7FFFFFFFu)) return false;
-        std::memcpy(vk + 0x08, bytes.data(), bytes.size());
-        hive_wr32(vk + 0x04, 0x80000000u | static_cast<uint32_t>(bytes.size()));
-        return true;
-    }
-    HiveCell dc = hive_cell(hive, hive_rd32(vk + 0x08));
-    if (!dc.valid() || dc.len < bytes.size()) return false;
-    std::memcpy(const_cast<uint8_t*>(dc.data), bytes.data(), bytes.size());
-    hive_wr32(vk + 0x04, static_cast<uint32_t>(bytes.size()));
-    return true;
+    return "";
 }
 
 } // namespace
 
-namespace {
-// Advanced properties a "capable" NDIS miniport declares under
-// <Index>\Ndi\params\<ParamName>. The native armer writes NONE of them -- there is no
-// anti-flap / offload REG_SZ pass any more -- and this list exists so the tests can prove
-// it: an adapter seeded with the complete schema must come out of an arming pass with not
-// a single one of those values on its instance key.
-const std::vector<std::string>& full_anti_flap_ndi_schema() {
-    static const std::vector<std::string> params = {
-        "EEE", "EnableGreenEthernet", "*PowerSavingMode", "LinkDownPowerSaving",
-        "FlowControl", "*FlowControl", "*InterruptModeration",
-        "*LsoV2IPv4", "*LsoV2IPv6", "*IPChecksumOffloadIPv4", "*TCPChecksumOffloadIPv4",
-        "*UDPChecksumOffloadIPv4", "*TCPChecksumOffloadIPv6", "*UDPChecksumOffloadIPv6",
-        "*EEE", "AdvancedEEE", "PowerSavingMode", "ReduceSpeedOnPowerDown",
-        "AutoDisableGigabit", "GigaLite", "*WaitAutoNegComplete", "*GreenEthernet",
-        "*GigaLite", "*WakeOnMagicPacket", "AutoDisablePhy",
+// =============================================================================
+// Start = 0 round-trip: the whole registry contract the diskless boot chain
+// still depends on, plus the two supporting behaviours without which Start = 0
+// would not *take* -- subkey-list repair and a CLEAN header flush.
+//
+// Hardware-ID matching, Control\Class walking, CriticalDeviceDatabase writes,
+// dynamic-INF staging, Stage-15 hardening and driver injection were archived to
+// archive/pnp_dccb/ and are no longer reachable from the active tree.
+// =============================================================================
+void test_bootstart_arm_and_structural_repair() {
+    std::cout << "[RUN] test_bootstart_arm_and_structural_repair\n";
+
+    // REG_SZ reading lives at file scope next to hive_get_dword(), because
+    // more than one test has to tell "NDIS Wrapper" from "NDIS".
+
+    auto wr32 = [](uint8_t* p, uint32_t v) {
+        p[0] = static_cast<uint8_t>(v & 0xFF);
+        p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+        p[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+        p[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
     };
-    return params;
+
+    auto nk_name = [](const std::vector<uint8_t>& hive, uint32_t nk_off) -> std::string {
+        const HiveCell nk = hive_cell(hive, nk_off);
+        if (!nk.valid() || nk.len < 0x4C || hive_rd16(nk.data) != 0x6B6E) return "";
+        const uint16_t nlen = hive_rd16(nk.data + 0x48);
+        if (static_cast<size_t>(0x4C) + nlen > nk.len) return "";
+        return std::string(reinterpret_cast<const char*>(nk.data + 0x4C), nlen);
+    };
+
+    // The flat subkey list in *file* order -- exactly the sequence a binary
+    // search over that list walks, and therefore the order Cm needs it in.
+    auto subkey_names = [&](const std::vector<uint8_t>& hive, const std::string& path) {
+        std::vector<std::string> names;
+        const uint32_t nk_off = hive_open_path(hive, path);
+        assert(nk_off != 0xFFFFFFFF);
+        const HiveCell nk = hive_cell(hive, nk_off);
+        assert(nk.valid());
+        const uint32_t count = hive_rd32(nk.data + 0x14);
+        const HiveCell list = hive_cell(hive, hive_rd32(nk.data + 0x1C));
+        assert(list.valid());
+        assert(hive_rd16(list.data) == 0x666C); // 'lf'
+        assert(list.len >= 4u + static_cast<size_t>(count) * 8u);
+        for (uint32_t i = 0; i < count; ++i) {
+            names.push_back(nk_name(hive, hive_rd32(list.data + 0x04 + i * 8)));
+        }
+        return names;
+    };
+
+    // 'lf' carries the first four bytes of each name, little-endian, space
+    // padded -- the hash Cm reproduces when it loads the list.
+    auto lf_prefix_hash = [](const std::string& name) -> uint32_t {
+        uint32_t h = 0;
+        for (size_t i = 0; i < 4; ++i) {
+            const unsigned char c = i < name.size()
+                                        ? static_cast<unsigned char>(name[i])
+                                        : static_cast<unsigned char>(' ');
+            h |= static_cast<uint32_t>(c) << (8 * i);
+        }
+        return h;
+    };
+
+    // Reverse a flat subkey list in place and blank every hash: the exact shape
+    // an earlier arming pass used to leave behind.
+    auto corrupt_subkey_list = [](std::vector<uint8_t>& hive, const std::string& path) {
+        const uint32_t nk_off = hive_open_path(hive, path);
+        assert(nk_off != 0xFFFFFFFF);
+        const HiveCell nk = hive_cell(hive, nk_off);
+        const uint32_t count = hive_rd32(nk.data + 0x14);
+        assert(count > 1);
+        const size_t entry = 0x1000u + static_cast<size_t>(hive_rd32(nk.data + 0x1C)) + 4u + 4u;
+        for (uint32_t i = 0; i < count / 2; ++i) {
+            const size_t a = entry + static_cast<size_t>(i) * 8u;
+            const size_t b = entry + static_cast<size_t>(count - 1 - i) * 8u;
+            for (size_t k = 0; k < 8; ++k) {
+                const uint8_t t = hive[a + k];
+                hive[a + k] = hive[b + k];
+                hive[b + k] = t;
+            }
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            for (size_t k = 0; k < 4; ++k) {
+                hive[entry + static_cast<size_t>(i) * 8u + 4u + k] = 0;
+            }
+        }
+    };
+
+    // --- 1. a pristine fixture is a hive Cm can open --------------------------
+    std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+        1, {{"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}, {"e1d68x64", 3}});
+    assert(hive.size() > 8192);
+    assert(hive[0] == 'r' && hive[1] == 'e' && hive[2] == 'g' && hive[3] == 'f');
+    assert(hive_open_path(hive, "Select") != 0xFFFFFFFF);
+    assert(hive_open_path(hive, "ControlSet001\\Services\\msiscsi") != 0xFFFFFFFF);
+
+    const std::vector<std::string> native_order = subkey_names(hive, "ControlSet001\\Services");
+    assert(native_order.size() == 5);
+
+    // --- 2. break that list, so there is something for the repair pass to do --
+    corrupt_subkey_list(hive, "ControlSet001\\Services");
+    assert(subkey_names(hive, "ControlSet001\\Services") != native_order);
+
+    // --- 3. arm it -------------------------------------------------------------
+    const auto armed = RegBootStart::arm_hive_buffer(hive);
+    assert(armed.is_ok());
+    const BootStartArmReport& report = armed.value();
+    assert(report.success);
+    assert(report.control_set == "ControlSet001");
+    assert(report.armed_services.size() == RegBootStart::boot_start_services().size());
+    assert(report.modified_services.size() == RegBootStart::boot_start_services().size());
+    assert(report.missing_services.empty());
+    assert(report.iscsi_stack_armed);
+    assert(report.boot_flags_armed);
+    assert(!report.hive_dirty_on_entry);
+
+    // The list is back in name order with hashes Cm can reproduce, so the
+    // service keys are reachable again. Exactly the table rows: the armer
+    // never invents a service key (a Start = 0 row whose binary is not
+    // staged is driver injection), so nothing beyond the table may appear.
+    assert(subkey_names(hive, "ControlSet001\\Services").size() == RegBootStart::boot_start_services().size());
+    {
+        const uint32_t services = hive_open_path(hive, "ControlSet001\\Services");
+        const HiveCell nk = hive_cell(hive, services);
+        const uint32_t count = hive_rd32(nk.data + 0x14);
+        const HiveCell list = hive_cell(hive, hive_rd32(nk.data + 0x1C));
+        assert(list.valid());
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t child = hive_rd32(list.data + 0x04 + i * 8);
+            assert(hive_rd32(list.data + 0x08 + i * 8) == lf_prefix_hash(nk_name(hive, child)));
+        }
+    }
+
+    // --- 4. Start = 0 / BootFlags / Group -------------------------------------
+    struct Expected {
+        const char* service;
+        const char* group;
+        bool boot_flags;
+    };
+    const Expected expected[] = {
+        {"msiscsi", "iSCSI", true},
+        {"Tcpip", "PNP_TDI", true},
+        {"NDIS", "NDIS Wrapper", true},
+        {"rt640x64", "NDIS", true},
+        {"e1d68x64", "NDIS", true},
+    };
+    for (const Expected& e : expected) {
+        const uint32_t svc =
+            hive_open_path(hive, std::string("ControlSet001\\Services\\") + e.service);
+        assert(svc != 0xFFFFFFFF);
+        uint32_t start = 0xFFFFFFFF;
+        assert(hive_get_dword(hive, svc, "Start", &start) && start == 0);
+        assert(hive_get_sz(hive, svc, "Group") == e.group);
+        uint32_t flags = 0xFFFFFFFF;
+        const bool has_flags = hive_get_dword(hive, svc, "BootFlags", &flags);
+        if (e.boot_flags) {
+            assert(has_flags && flags == 0x1);
+        } else {
+            // Every network row in the table carries the promotion now; a
+            // row without the flag still has to read back without one.
+            assert(!has_flags);
+        }
+    }
+
+    // --- 5. idempotent: a second pass rewrites nothing -------------------------
+    const auto armed_again = RegBootStart::arm_hive_buffer(hive);
+    assert(armed_again.is_ok());
+    const BootStartArmReport& again = armed_again.value();
+    assert(again.success);
+    assert(again.armed_services.size() == RegBootStart::boot_start_services().size());
+    // Start is already 0 and every Group already reads the canonical text, so
+    // nothing has to be written. Group is gated on "differs from the table" --
+    // not on "the key has none", which cannot repair an image that already
+    // carries a wrong Group -- and a second pass must still come back clean.
+    assert(again.modified_services.empty());
+
+    // --- 6. the base block is flushed CLEAN so Phase 0 cannot replay it --------
+    assert(hive_rd32(&hive[0x04]) == hive_rd32(&hive[0x08]));
+    assert(hive_rd32(&hive[0x1FC]) == RegBootStart::calculate_regf_header_checksum(hive.data()));
+
+    // --- 7. a hive that arrived dirty is detected and forced clean ------------
+    std::vector<uint8_t> dirty = RegBootStart::create_minimal_system_hive(1, {{"Tcpip", 3}});
+    assert(hive_rd32(&dirty[0x04]) == hive_rd32(&dirty[0x08]));
+    wr32(&dirty[0x08], hive_rd32(&dirty[0x04]) + 1);
+    assert(hive_rd32(&dirty[0x04]) != hive_rd32(&dirty[0x08]));
+    const auto dirty_armed = RegBootStart::arm_hive_buffer(dirty);
+    assert(dirty_armed.is_ok());
+    assert(dirty_armed.value().hive_dirty_on_entry);
+    assert(!dirty_armed.value().warnings.empty()); // it says so instead of losing the writes
+    assert(hive_rd32(&dirty[0x04]) == hive_rd32(&dirty[0x08]));
+
+    // --- 8. missing required services are created and armed with Start = 0 ---
+    std::vector<uint8_t> no_net = RegBootStart::create_minimal_system_hive(1, {{"msiscsi", 3}});
+    const auto partial = RegBootStart::arm_hive_buffer(no_net);
+    assert(partial.is_ok());
+    assert(partial.value().iscsi_stack_armed);
+    assert(hive_open_path(no_net, "ControlSet001\\Services\\Tcpip") != 0xFFFFFFFF);
+    assert(hive_open_path(no_net, "ControlSet001\\Services\\ndis") != 0xFFFFFFFF);
+    uint32_t msi_start = 0xFFFFFFFF;
+    const uint32_t msi_off = hive_open_path(no_net, "ControlSet001\\Services\\msiscsi");
+    assert(msi_off != 0xFFFFFFFF);
+    assert(hive_get_dword(no_net, msi_off, "Start", &msi_start) && msi_start == 0);
+
+    // --- 9. a Group that already reads wrong is repaired, not trusted -------
+    //
+    // This is the state the master image was found in: `ndis` reading Group =
+    // "NDIS" and `iScsiPrt` reading Group = "NDIS", both with the old text
+    // still sitting behind the new one as a stale tail. A writer that only
+    // fills an empty Group would leave both alone, and the boot would order
+    // the NDIS wrapper in with the miniports that depend on it.
+    auto utf16 = [](const std::string& text) {
+        std::vector<uint8_t> out;
+        out.reserve((text.size() + 1) * 2);
+        for (char c : text) {
+            out.push_back(static_cast<uint8_t>(c));
+            out.push_back(0);
+        }
+        out.push_back(0);
+        out.push_back(0);
+        return out;
+    };
+    // Byte-for-byte replacement, same length in and out: the data length lives
+    // in the vk cell and this test is not reaching into one, so the value
+    // keeps reading the same size while its content stops matching.
+    auto overwrite_utf16 = [](std::vector<uint8_t>& target,
+                              const std::vector<uint8_t>& from,
+                              const std::vector<uint8_t>& to) {
+        assert(from.size() == to.size());
+        const auto it = std::search(target.begin(), target.end(), from.begin(), from.end());
+        assert(it != target.end());
+        std::copy(to.begin(), to.end(), it);
+    };
+
+    std::vector<uint8_t> repair_hive =
+        RegBootStart::create_minimal_system_hive(1, {{"ndis", 3}, {"iScsiPrt", 3}, {"msiscsi", 3}});
+    const auto repair_first = RegBootStart::arm_hive_buffer(repair_hive);
+    assert(repair_first.is_ok() && repair_first.value().success);
+    const uint32_t ndis_off = hive_open_path(repair_hive, "ControlSet001\\Services\\ndis");
+    const uint32_t iscsi_off = hive_open_path(repair_hive, "ControlSet001\\Services\\iScsiPrt");
+    assert(ndis_off != 0xFFFFFFFF && iscsi_off != 0xFFFFFFFF);
+    assert(hive_get_sz(repair_hive, ndis_off, "Group") == "NDIS Wrapper");
+    assert(hive_get_sz(repair_hive, iscsi_off, "Group") == "CCiSCSI");
+
+    // "NDIS\0" + the original "Wrapper\0" left in place, and "NDIS\0" +
+    // "XX\0" the same way -- the truncated value with a stale tail that
+    // a partial write leaves behind. Both replacements are the same number of
+    // bytes as the text they replace, so the data length in the vk cell stays
+    // honest and only the content stops matching.
+    auto cat = [](std::vector<uint8_t> head, const std::vector<uint8_t>& tail) {
+        head.insert(head.end(), tail.begin(), tail.end());
+        return head;
+    };
+    overwrite_utf16(repair_hive, utf16("NDIS Wrapper"), cat(utf16("NDIS"), utf16("Wrapper")));
+    overwrite_utf16(repair_hive, utf16("CCiSCSI"), cat(utf16("NDIS"), utf16("XX")));
+    assert(hive_get_sz(repair_hive, ndis_off, "Group") == "NDIS");
+    assert(hive_get_sz(repair_hive, iscsi_off, "Group") == "NDIS");
+
+    const auto repair_second = RegBootStart::arm_hive_buffer(repair_hive);
+    assert(repair_second.is_ok() && repair_second.value().success);
+    // Both bad keys were rewritten; the one that already read right was not.
+    assert(repair_second.value().modified_services.size() == 2);
+    {
+        bool saw_ndis = false;
+        bool saw_iscsi = false;
+        for (const std::string& name : repair_second.value().modified_services) {
+            if (name == "ndis") saw_ndis = true;
+            if (name == "iScsiPrt") saw_iscsi = true;
+            assert(name != "msiscsi");
+        }
+        assert(saw_ndis && saw_iscsi);
+    }
+    assert(hive_get_sz(repair_hive, ndis_off, "Group") == "NDIS Wrapper");
+    assert(hive_get_sz(repair_hive, iscsi_off, "Group") == "CCiSCSI");
+
+    // ... and the repair settles: a third pass has nothing left to write.
+    const auto repair_third = RegBootStart::arm_hive_buffer(repair_hive);
+    assert(repair_third.is_ok() && repair_third.value().success);
+    assert(repair_third.value().modified_services.empty());
+
+    std::cout << "  PASS: test_bootstart_arm_and_structural_repair\n";
 }
-} // namespace
 
-void test_pnp_driver_arming_and_offline_registry_injection() {
-    std::cout << "[RUN] test_pnp_driver_arming_and_offline_registry_injection\n";
+// ---------------------------------------------------------------------------
+// The staged-driver gate.
+//
+// An image stages the NIC variant its hardware actually uses and nothing
+// else, so the boot-start table cannot assume every row's .sys is on disk. A
+// row whose binary is missing has to come back demand-start: a Start = 0
+// driver the SCM cannot resolve is a boot-time failure, and the rows the
+// image does carry are armed as usual. The same gate refuses an enrollment
+// that would bind hardware to a driver the image does not carry, before
+// anything at all is written.
+// ---------------------------------------------------------------------------
+static void test_staged_driver_gate_demotes_and_refuses() {
+    std::cout << "[RUN] test_staged_driver_gate_demotes_and_refuses\n";
 
-    const std::filesystem::path scratch_dir = "test_scratch_pnp_arming";
     std::error_code ec;
-    std::filesystem::remove_all(scratch_dir, ec);
-    std::filesystem::create_directories(scratch_dir, ec);
+    const std::filesystem::path root = "test_scratch_staged_gate";
+    std::filesystem::remove_all(root, ec);
 
-    const std::string net_class =
-        "ControlSet001\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}";
+    // The hive sits in the Windows\System32\config layout, so the gate can
+    // see the image it belongs to rather than guessing.
+    const std::filesystem::path hive_path = root / "Windows" / "System32" / "config" / "SYSTEM";
+    std::filesystem::create_directories(hive_path.parent_path(), ec);
+    {
+        const std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+            1, {{"msiscsi", 3},
+                {"Tcpip", 3},
+                {"ndis", 3},
+                {"rt640x64", 3},
+                {"rt640x64_25g", 3},
+                {"rt68cx64", 3},
+                {"e1d68x64", 3},
+                {"e2f68", 3}});
+        std::ofstream ofs(hive_path, std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(hive.data()),
+                  static_cast<std::streamsize>(hive.size()));
+    }
 
-    // Case-insensitive on purpose: the report canonically carries the armer's own service
-    // names (the stack entry is "ndis") while the image may key it "NDIS".
-    auto ascii_lower = [](std::string s) {
+    // The core boot stack plus one Realtek 8168 variant. The other four rows
+    // of the table name .sys files this image deliberately does not carry.
+    const std::filesystem::path drivers = root / "Windows" / "System32" / "drivers";
+    std::filesystem::create_directories(drivers, ec);
+    for (const char* name : {"msiscsi.sys", "tcpip.sys", "ndis.sys", "rt640x64.sys"}) {
+        const std::string stub = std::string("MZ") + name;
+        std::ofstream ofs(drivers / name, std::ios::binary | std::ios::trunc);
+        ofs.write(stub.data(), static_cast<std::streamsize>(stub.size()));
+    }
+
+    assert(RegBootStart::staged_drivers_dir(hive_path) == drivers);
+
+    // --- 1. armed = staged, demoted = not -----------------------------------
+    const auto armed = RegBootStart::arm_offline_system_hive(hive_path);
+    assert(armed.is_ok());
+    const BootStartArmReport& report = armed.value();
+    assert(report.success);
+    assert(report.iscsi_stack_armed);
+    assert(report.boot_flags_armed);
+
+    std::ifstream ifs(hive_path, std::ios::binary);
+    const std::vector<uint8_t> armed_hive((std::istreambuf_iterator<char>(ifs)),
+                                          std::istreambuf_iterator<char>());
+    assert(!armed_hive.empty());
+    // The handle must go before the second pass renames over the same file:
+    // an MSVC read handle shares read/write but not delete, so a still-open
+    // `ifs` turns that replace into ERROR_ACCESS_DENIED.
+    ifs.close();
+
+    auto start_of = [&armed_hive](const char* service) -> uint32_t {
+        const uint32_t off =
+            hive_open_path(armed_hive, std::string("ControlSet001\\Services\\") + service);
+        assert(off != 0xFFFFFFFF);
+        uint32_t start = 0xFFFFFFFF;
+        assert(hive_get_dword(armed_hive, off, "Start", &start));
+        return start;
+    };
+
+    // Carried: armed boot-start, including iScsiPrt, which is created here
+    // because its ImagePath resolves to msiscsi.sys -- a file the image has.
+    assert(start_of("msiscsi") == 0);
+    assert(start_of("Tcpip") == 0);
+    assert(start_of("ndis") == 0);
+    assert(start_of("rt640x64") == 0);
+    assert(start_of("iScsiPrt") == 0);
+
+    // Not carried: the key survives, at demand-start rather than at Start = 0
+    // behind an ImagePath that resolves to nothing.
+    for (const char* service : {"rt640x64_25g", "rt68cx64", "e1d68x64", "e2f68"}) {
+        assert(start_of(service) == 3);
+    }
+    assert(report.demoted_services.size() == 4);
+    // Exactly the four unstaged rows: nothing carried was demoted.
+    for (const std::string& name : report.demoted_services) {
+        assert(name == "rt640x64_25g" || name == "rt68cx64" || name == "e1d68x64" ||
+               name == "e2f68");
+    }
+
+    // A second pass is still clean: demotion is idempotent, and nothing
+    // staged comes back up to Start = 0.
+    const auto again = RegBootStart::arm_offline_system_hive(hive_path);
+    if (!again.is_ok()) {
+        std::cout << "  second arm pass error: " << again.error().message() << std::endl;
+    }
+    assert(again.is_ok());
+    assert(again.value().success);
+    assert(again.value().demoted_services.size() == 4);
+    assert(start_of("rt640x64") == 0);
+    assert(start_of("e2f68") == 3);
+
+    // --- 2. enrollment is refused when the binding would not resolve --------
+    std::vector<uint8_t> enroll = RegBootStart::create_minimal_system_hive(1, {});
+    const std::vector<uint8_t> untouched = enroll;
+    // 8086:15F3 resolves to e2f68, whose .sys this image does not stage (the
+    // 8125 case used to play this role until oem0.inf put the RTL812x parts
+    // on the staged rt640x64 driver).
+    const auto refused = RegBootStart::arm_pci_hardware_buffer(enroll, 0x8086, 0x15F3, drivers);
+    assert(refused.is_err());
+    assert(enroll == untouched); // refused before a single cell was written
+
+    // The variant it does stage still enrolls.
+    const auto enrolled = RegBootStart::arm_pci_hardware_buffer(enroll, 0x10EC, 0x8168, drivers);
+    assert(enrolled.is_ok() && enrolled.value());
+
+    std::cout << "  PASS: test_staged_driver_gate_demotes_and_refuses\n";
+}
+
+// ---------------------------------------------------------------------------
+// The staged gate has to work on the path spelling it is actually handed.
+//
+// std::filesystem::path on this toolchain (MSYS2/Cygwin libstdc++) parses POSIX
+// separators only, so parent_path() on "S:\Windows\System32\config\SYSTEM" is
+// empty, the walk to the drivers directory never finishes, and
+// staged_drivers_dir() returns "{}". Every caller reads an empty drivers
+// directory as "nothing to gate against", so nothing gets gated: the arming bar
+// reports "already met" over rows whose Start = 0 points at .sys files this
+// image has never carried.
+//
+// The POSIX spelling never exercised any of that. The command line always
+// spells a Windows path with backslashes, so the branch that mattered was the
+// one no test reached.
+// ---------------------------------------------------------------------------
+static void test_staged_gate_reads_a_windows_spelled_path() {
+    std::cout << "[RUN] test_staged_gate_reads_a_windows_spelled_path\n";
+
+    std::error_code ec;
+    const std::filesystem::path root = "test_scratch_staged_gate_win";
+    std::filesystem::remove_all(root, ec);
+
+    // The same layout the POSIX-spelled test builds, so both spellings can be
+    // held to one known answer.
+    const std::filesystem::path drivers = root / "Windows" / "System32" / "drivers";
+    std::filesystem::create_directories(drivers, ec);
+    for (const char* name : {"msiscsi.sys", "tcpip.sys", "ndis.sys", "rt640x64.sys"}) {
+        std::ofstream ofs(drivers / name, std::ios::binary | std::ios::trunc);
+        ofs << "MZ" << name;
+    }
+    std::filesystem::create_directories(root / "Windows" / "System32" / "config", ec);
+
+    auto backslash = [](std::string s) {
         for (char& c : s) {
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if (c == '/') c = '\\';
         }
         return s;
     };
-    auto mentions = [&](const std::vector<std::string>& haystack, const std::string& needle) {
-        const std::string n = ascii_lower(needle);
-        return std::any_of(haystack.begin(), haystack.end(), [&](const std::string& s) {
-            return ascii_lower(s).find(n) != std::string::npos;
-        });
-    };
-    auto find_u16 = [](const std::string& haystack, const std::string& needle) -> bool {
-        std::string utf16;
-        utf16.reserve(needle.size() * 2);
-        for (char c : needle) {
-            utf16.push_back(c);
-            utf16.push_back('\0');
-        }
-        return haystack.find(utf16) != std::string::npos;
-    };
-    auto dword_at = [](std::vector<uint8_t>& hive, const std::string& path,
-                       const char* value_name, uint32_t* out) {
-        const uint32_t nk = hive_open_path(hive, path);
-        assert(nk != 0xFFFFFFFF);
-        assert(hive_get_dword(hive, nk, value_name, out));
-    };
 
-    // The image's own Net class bindings: one Realtek instance, one Intel instance, both
-    // advertising the complete NDI advanced-property schema. Whatever the miniport
-    // declares, the native armer must not write a single one of those properties.
-    const std::vector<PnpDriverArmer::SyntheticNetAdapter> both = {
-        {"0000", "Realtek PCIe GbE Family Controller", "PCI\\VEN_10EC&DEV_8168",
-         "pci\\ven_10ec&dev_8168", full_anti_flap_ndi_schema(), "rt640x64"},
-        {"0001", "Intel(R) Ethernet Connection I219-LM", "PCI\\VEN_8086&DEV_15B8",
-         "pci\\ven_8086&dev_15b8", full_anti_flap_ndi_schema(), "e1d68x64"},
-    };
+    const std::filesystem::path posix_hive = root / "Windows" / "System32" / "config" / "SYSTEM";
+    const std::filesystem::path win_hive(backslash(posix_hive.string()));
 
-    // b57nd64a is deliberately NOT bound by any adapter: its Start must survive the pass
-    // byte for byte -- never demoted, never promoted, never armed.
-    const std::vector<std::pair<std::string, uint32_t>> initial_services = {
-        {"msiscsi", 3}, {"Tcpip", 1}, {"NDIS", 1},
-        {"rt640x64", 3}, {"e1d68x64", 2}, {"b57nd64a", 3}
-    };
+    // The layout guard the raw writers are held behind. Answering false here
+    // is what let `is_raw_regf && !hive_sits_on_an_image(...)` offer an
+    // image-owned hive to the in-process regf writer.
+    assert(RegBootStart::hive_sits_on_an_image(win_hive));
+    assert(!RegBootStart::hive_sits_on_an_image(
+        std::filesystem::path(backslash((root / "loose" / "SYSTEM").string()))));
 
-    auto hive_buf = PnpDriverArmer::create_synthetic_system_hive(1, initial_services, both);
-    assert(hive_buf.size() >= 8192);
-    assert(std::memcmp(hive_buf.data(), "regf", 4) == 0);
-    assert(PnpDriverArmer::calculate_regf_header_checksum(hive_buf.data()) ==
-           hive_rd32(&hive_buf[0x1FC]));
+    // Shape 1: the Windows spelling finds the directory, spelled back.
+    const std::filesystem::path found = RegBootStart::staged_drivers_dir(win_hive);
+    assert(!found.empty());
+    assert(found.string() == backslash(drivers.string()));
 
-    // ------------------------------------------------------------------
-    // 1. Arm it, capturing every log line: a native pass emits no demotion
-    //    line and no "boot driver missing" warning.
-    // ------------------------------------------------------------------
-    std::vector<std::string> captured;
-    Logger::default_logger().set_sink(
-        [&](LogLevel /*level*/, std::string_view /*category*/, std::string_view message,
-            std::string_view /*formatted*/) { captured.emplace_back(message); });
+    // What the gate is for. An empty directory from the walk above makes every
+    // one of these false and demotes the whole table; a walk that ignores the
+    // separator makes them all true and demotes nothing.
+    assert(RegBootStart::staged_binary_present(found, "msiscsi.sys"));
+    assert(RegBootStart::staged_binary_present(found, "tcpip.sys"));
+    assert(!RegBootStart::staged_binary_present(found, "rt640x64_25g.sys"));
+    assert(!RegBootStart::staged_binary_present(found, "e2f68.sys"));
 
-    auto arm_buf_res = PnpDriverArmer::arm_hive_buffer(hive_buf);
-    assert(arm_buf_res.is_ok());
-    Logger::default_logger().reset_to_default_sink();
+    // Shape 2: the volume-root spelling, which is what the inspection passes
+    // when it knows the volume rather than the hive sitting on it.
+    std::string vol = backslash(posix_hive.string());
+    const std::size_t win = vol.rfind("\\Windows\\");
+    assert(win != std::string::npos);
+    vol.resize(win + 1);
+    assert(RegBootStart::staged_drivers_dir(std::filesystem::path(vol)).string() ==
+           backslash(drivers.string()));
 
-    const auto& report1 = arm_buf_res.value();
-    assert(report1.success);
-    assert(report1.control_set == "ControlSet001");
-    assert(report1.guest_os_family == "unknown");
-    assert(report1.hive_dirty_on_entry == report1.hive_cleaned_on_exit);
-    assert(report1.armed_services.size() == 5);
-
-    // ---- 2. The bound NIC services and the iSCSI core stack are armed ---------------
-    for (const char* svc : {"msiscsi", "Tcpip", "NDIS", "rt640x64", "e1d68x64"}) {
-        assert(mentions(report1.armed_services, svc));
-        assert(mentions(report1.modified_services, svc));
-    }
-    assert(report1.boot_flags_armed);
-    assert(report1.iscsi_stack_armed);
-    assert(report1.message.find("Stage 15 crash dump/paging file/offload neutralised") !=
-           std::string::npos);
-
-    // ---- 3. Start = 0 / BootFlags = 0x1 exactly where they belong -------------------
-    uint32_t v = 0;
-    for (const char* svc : {"msiscsi", "rt640x64", "e1d68x64"}) {
-        const std::string base = std::string("ControlSet001\\Services\\") + svc;
-        dword_at(hive_buf, base, "Start", &v);
-        assert(v == 0); // SERVICE_BOOT_START
-        dword_at(hive_buf, base, "BootFlags", &v);
-        assert(v == 0x1); // CM_SERVICE_NETWORK_BOOT_LOAD
-    }
-    for (const char* svc : {"Tcpip", "NDIS"}) {
-        const std::string base = std::string("ControlSet001\\Services\\") + svc;
-        dword_at(hive_buf, base, "Start", &v);
-        assert(v == 0);
-        // Only the network miniports and the iSCSI initiator carry the network load flag.
-        const uint32_t nk = hive_open_path(hive_buf, base);
-        assert(nk != 0xFFFFFFFF);
-        assert(hive_value_type(hive_buf, nk, "BootFlags") == 0xFFFFFFFF);
-    }
-
-    // ---- 4. An unbound service is left completely alone ----------------------------
-    {
-        const uint32_t unbound = hive_open_path(hive_buf, "ControlSet001\\Services\\b57nd64a");
-        assert(unbound != 0xFFFFFFFF);
-        assert(hive_get_dword(hive_buf, unbound, "Start", &v) && v == 3);
-        assert(hive_value_type(hive_buf, unbound, "BootFlags") == 0xFFFFFFFF);
-        assert(!mentions(report1.armed_services, "b57nd64a"));
-        assert(!mentions(report1.modified_services, "b57nd64a"));
-    }
-
-    // iscsiprt is optional: reported missing, never fabricated.
-    assert(mentions(report1.missing_services, "iscsiprt"));
-    assert(hive_open_path(hive_buf, "ControlSet001\\Services\\iscsiprt") == 0xFFFFFFFF);
-
-    // ---- 5. Stage 15 neutralisation + disk timeout live in the same pass ------------
-    assert(report1.crash_dump_disabled);
-    assert(report1.paging_files_cleared);
-    assert(report1.tcpip_offload_disabled);
-    assert(report1.disk_timeout_armed);
-    {
-        uint32_t w = 0;
-        const uint32_t crash = hive_open_path(hive_buf, "ControlSet001\\Control\\CrashControl");
-        assert(crash != 0xFFFFFFFF);
-        assert(hive_get_dword(hive_buf, crash, "CrashDumpEnabled", &w) && w == 0);
-        assert(hive_get_dword(hive_buf, crash, "AutoReboot", &w) && w == 0);
-        const uint32_t mm = hive_open_path(
-            hive_buf, "ControlSet001\\Control\\Session Manager\\Memory Management");
-        assert(mm != 0xFFFFFFFF);
-        assert(hive_get_string(hive_buf, mm, "PagingFiles").empty());
-        const uint32_t tcp = hive_open_path(hive_buf, "ControlSet001\\Services\\Tcpip\\Parameters");
-        assert(tcp != 0xFFFFFFFF);
-        assert(hive_get_dword(hive_buf, tcp, "DisableTaskOffload", &w) && w == 1);
-        const uint32_t disk = hive_open_path(hive_buf, "ControlSet001\\Services\\disk");
-        assert(disk != 0xFFFFFFFF);
-        assert(hive_value_type(hive_buf, disk, "TimeOutValue") == 4 /* REG_DWORD */);
-        assert(hive_get_dword(hive_buf, disk, "TimeOutValue", &w) && w == 60);
-    }
-
-    // ---- 6. Nothing beyond those keys was written ----------------------------------
-    // (a) No CriticalDeviceDatabase: deprecated since Windows 8 and a ghost-devnode
-    //     source on any modern image.
-    assert(hive_open_path(hive_buf, "ControlSet001\\Control\\CriticalDeviceDatabase") ==
-           0xFFFFFFFF);
-    // (b) No per-adapter anti-flap / offload REG_SZ, however complete the schema.
-    for (const char* inst : {"0000", "0001"}) {
-        const uint32_t inst_off = hive_open_path(hive_buf, net_class + "\\" + inst);
-        assert(inst_off != 0xFFFFFFFF);
-        for (const std::string& kw : full_anti_flap_ndi_schema()) {
-            assert(hive_value_type(hive_buf, inst_off, kw) == 0xFFFFFFFF);
-        }
-    }
-    // (c) No flat driver-level Parameters mirror.
-    assert(hive_open_path(hive_buf, "ControlSet001\\Services\\rt640x64\\Parameters") ==
-           0xFFFFFFFF);
-    assert(hive_open_path(hive_buf, "ControlSet001\\Services\\e1d68x64\\Parameters") ==
-           0xFFFFFFFF);
-    // (d) No description / .sys / group strings were injected anywhere.
-    const std::string hive_str(reinterpret_cast<const char*>(hive_buf.data()), hive_buf.size());
-    assert(!find_u16(hive_str, "Boot Bus Extender"));
-    assert(!find_u16(hive_str, "Realtek RT640 Gigabit Ethernet NIC Driver"));
-    assert(!find_u16(hive_str, "rt640x64.sys"));
-    assert(!find_u16(hive_str, "e1d68x64.sys"));
-    assert(!find_u16(hive_str, "NDIS Group"));
-
-    // ---- 7. The log proves the native contract -------------------------------------
-    assert(!mentions(captured, "Demoted"));
-    assert(!mentions(captured, "missing from"));
-    assert(!mentions(captured, "harvest"));
-    assert(mentions(captured, "Armed existing native NIC service rt640x64"));
-    assert(mentions(captured, "Armed existing native NIC service e1d68x64"));
-    assert(mentions(captured, "Armed msiscsi"));
-
-    // ---- 8. Hive transaction hygiene ------------------------------------------------
-    assert(hive_rd32(&hive_buf[0x04]) == hive_rd32(&hive_buf[0x08]));
-    assert(PnpDriverArmer::calculate_regf_header_checksum(hive_buf.data()) ==
-           hive_rd32(&hive_buf[0x1FC]));
-
-    // ---- 9. Re-arming the same buffer is a no-op, not a second election -------------
-    {
-        std::vector<std::string> second;
-        Logger::default_logger().set_sink(
-            [&](LogLevel /*level*/, std::string_view /*category*/, std::string_view message,
-                std::string_view /*formatted*/) { second.emplace_back(message); });
-        auto again = PnpDriverArmer::arm_hive_buffer(hive_buf);
-        Logger::default_logger().reset_to_default_sink();
-        assert(again.is_ok());
-        assert(again.value().success);
-        assert(again.value().armed_services.size() == report1.armed_services.size());
-        assert(!mentions(second, "Demoted"));
-    }
-
-    // ---- 10. An image with no Net class binding at all: warn, invent nothing --------
-    {
-        auto blind = PnpDriverArmer::create_synthetic_system_hive(
-            1, {{"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}});
-        auto blind_res = PnpDriverArmer::arm_hive_buffer(blind);
-        assert(blind_res.is_ok());
-        const auto& br = blind_res.value();
-        assert(br.success);
-        assert(mentions(br.warnings, "No adapter Service value bound"));
-        assert(br.armed_services.size() == 3); // msiscsi + Tcpip + ndis only
-        dword_at(blind, "ControlSet001\\Services\\msiscsi", "Start", &v);
-        assert(v == 0);
-        assert(hive_open_path(blind, "ControlSet001\\Services\\rt640x64") == 0xFFFFFFFF);
-        assert(hive_open_path(blind, "ControlSet001\\Control\\CriticalDeviceDatabase") ==
-               0xFFFFFFFF);
-    }
-
-    // ---- 11. A pre-existing flat Parameters mirror is left untouched ----------------
-    {
-        auto preseeded = PnpDriverArmer::create_synthetic_system_hive(
-            1, initial_services, both, "",
-            {PnpDriverArmer::SyntheticServiceParameter{"rt640x64", "*EEE", false, 0, "1"}});
-        const uint32_t params =
-            hive_open_path(preseeded, "ControlSet001\\Services\\rt640x64\\Parameters");
-        assert(params != 0xFFFFFFFF);
-        assert(hive_get_string(preseeded, params, "*EEE") == "1");
-        auto pre_res = PnpDriverArmer::arm_hive_buffer(preseeded);
-        assert(pre_res.is_ok());
-        assert(pre_res.value().success);
-        const uint32_t params_after =
-            hive_open_path(preseeded, "ControlSet001\\Services\\rt640x64\\Parameters");
-        assert(params_after != 0xFFFFFFFF);
-        assert(hive_get_string(preseeded, params_after, "*EEE") == "1");
-    }
-
-    // ------------------------------------------------------------------
-    // 12. Offline file round trip: stale transaction logs are cleaned
-    //     and the armed values survive the write-back.
-    // ------------------------------------------------------------------
-    const std::filesystem::path hive_file = scratch_dir / "SYSTEM";
-    {
-        std::vector<uint8_t> fresh = PnpDriverArmer::create_synthetic_system_hive(
-            1, initial_services, both);
-        std::ofstream ofs(hive_file, std::ios::binary | std::ios::trunc);
-        ofs.write(reinterpret_cast<const char*>(fresh.data()),
-                  static_cast<std::streamsize>(fresh.size()));
-    }
-    {
-        std::ofstream l1(scratch_dir / "SYSTEM.LOG1", std::ios::binary | std::ios::trunc);
-        l1.write("DIRTY_LOG_1_DATA", 16);
-        std::ofstream l2(scratch_dir / "SYSTEM.LOG2", std::ios::binary | std::ios::trunc);
-        l2.write("DIRTY_LOG_2_DATA", 16);
-    }
-    auto arm_file_res = PnpDriverArmer::arm_offline_system_hive(hive_file);
-    assert(arm_file_res.is_ok());
-    const auto& file_report = arm_file_res.value();
-    assert(file_report.success);
-    assert(file_report.control_set == "ControlSet001");
-    assert(mentions(file_report.armed_services, "rt640x64"));
-    assert(mentions(file_report.armed_services, "msiscsi"));
-    {
-        std::error_code ecle;
-        for (const char* log_name : {"SYSTEM.LOG1", "SYSTEM.LOG2"}) {
-            const std::filesystem::path lp = scratch_dir / log_name;
-            const bool clean = !std::filesystem::exists(lp, ecle) ||
-                               std::filesystem::file_size(lp, ecle) == 0;
-            assert(clean);
-        }
-    }
-    {
-        std::vector<uint8_t> read_back;
-        std::ifstream ifs(hive_file, std::ios::binary);
-        read_back.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
-        assert(read_back.size() >= 8192);
-        assert(std::memcmp(read_back.data(), "regf", 4) == 0);
-        assert(hive_rd32(&read_back[0x04]) == hive_rd32(&read_back[0x08]));
-        assert(PnpDriverArmer::calculate_regf_header_checksum(read_back.data()) ==
-               hive_rd32(&read_back[0x1FC]));
-        dword_at(read_back, "ControlSet001\\Services\\rt640x64", "Start", &v);
-        assert(v == 0);
-        dword_at(read_back, "ControlSet001\\Services\\rt640x64", "BootFlags", &v);
-        assert(v == 0x1);
-        dword_at(read_back, "ControlSet001\\Services\\disk", "TimeOutValue", &v);
-        assert(v == 60);
-        assert(hive_open_path(read_back, "ControlSet001\\Control\\CriticalDeviceDatabase") ==
-               0xFFFFFFFF);
-        const uint32_t rb_0000 =
-            hive_open_path(read_back, net_class + "\\0000");
-        assert(rb_0000 != 0xFFFFFFFF);
-        for (const std::string& kw : full_anti_flap_ndi_schema()) {
-            assert(hive_value_type(read_back, rb_0000, kw) == 0xFFFFFFFF);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // 13. ControlSet002 is armed through Select\Current alone.
-    // ------------------------------------------------------------------
-    {
-        std::vector<uint8_t> cs2 = PnpDriverArmer::create_synthetic_system_hive(
-            2, {{"msiscsi", 3}, {"rt640x64", 3}}, both);
-        auto cs2_res = PnpDriverArmer::arm_hive_buffer(cs2);
-        assert(cs2_res.is_ok());
-        assert(cs2_res.value().success);
-        assert(cs2_res.value().control_set == "ControlSet002");
-        assert(mentions(cs2_res.value().armed_services, "msiscsi"));
-        dword_at(cs2, "ControlSet002\\Services\\msiscsi", "Start", &v);
-        assert(v == 0);
-        dword_at(cs2, "ControlSet002\\Services\\rt640x64", "Start", &v);
-        assert(v == 0);
-        dword_at(cs2, "ControlSet002\\Services\\rt640x64", "BootFlags", &v);
-        assert(v == 0x1);
-        assert(hive_open_path(cs2, "ControlSet002\\Control\\CriticalDeviceDatabase") ==
-               0xFFFFFFFF);
-    }
-
-    // ------------------------------------------------------------------
-    // 14. Malformed input is rejected before anything is written.
-    // ------------------------------------------------------------------
-    {
-        std::vector<uint8_t> empty_buf;
-        assert(PnpDriverArmer::arm_hive_buffer(empty_buf).is_err());
-
-        std::vector<uint8_t> small_buf(4096, 0);
-        assert(PnpDriverArmer::arm_hive_buffer(small_buf).is_err());
-
-        std::vector<uint8_t> bad_magic(65536, 0);
-        std::memcpy(bad_magic.data(), "bad!", 4);
-        assert(PnpDriverArmer::arm_hive_buffer(bad_magic).is_err());
-
-        std::vector<uint8_t> bad_hbin(65536, 0);
-        std::memcpy(bad_hbin.data(), "regf", 4);
-        assert(PnpDriverArmer::arm_hive_buffer(bad_hbin).is_err());
-
-        std::vector<uint8_t> bad_root(65536, 0);
-        std::memcpy(bad_root.data(), "regf", 4);
-        std::memcpy(&bad_root[0x1000], "hbin", 4);
-        write_le32(&bad_root[0x24], 0xFFFFFF00);
-        assert(PnpDriverArmer::arm_hive_buffer(bad_root).is_err());
-
-        std::vector<uint8_t> bad_nk(65536, 0);
-        std::memcpy(bad_nk.data(), "regf", 4);
-        std::memcpy(&bad_nk[0x1000], "hbin", 4);
-        write_le32(&bad_nk[0x24], 0x20);
-        write_le32(&bad_nk[0x1020], static_cast<uint32_t>(-64));
-        std::memcpy(&bad_nk[0x1024], "xx", 2);
-        assert(PnpDriverArmer::arm_hive_buffer(bad_nk).is_err());
-
-        // Checksum is recomputed over whatever it finds.
-        auto test_hive = PnpDriverArmer::create_synthetic_system_hive(1, {{"msiscsi", 3}});
-        const uint32_t expected_csum =
-            PnpDriverArmer::calculate_regf_header_checksum(test_hive.data());
-        assert(expected_csum == hive_rd32(&test_hive[0x1FC]));
-        test_hive[0x40] ^= 0x5A;
-        assert(PnpDriverArmer::calculate_regf_header_checksum(test_hive.data()) != expected_csum);
-        assert(PnpDriverArmer::arm_hive_buffer(test_hive).is_ok());
-        assert(PnpDriverArmer::calculate_regf_header_checksum(test_hive.data()) ==
-               hive_rd32(&test_hive[0x1FC]));
-
-        auto no_cs_hive = PnpDriverArmer::create_synthetic_system_hive(1, {});
-        for (size_t i = 0x1000; i + 17 < no_cs_hive.size(); ++i) {
-            if (std::memcmp(&no_cs_hive[i], "ControlSet001", 13) == 0) {
-                std::memcpy(&no_cs_hive[i], "CorruptedSet1", 13);
-            }
-            if (std::memcmp(&no_cs_hive[i], "CurrentControlSet", 17) == 0) {
-                std::memcpy(&no_cs_hive[i], "CorruptedSet2    ", 17);
-            }
-        }
-        assert(PnpDriverArmer::arm_hive_buffer(no_cs_hive).is_err());
-    }
-
-    const std::filesystem::path corrupt_file = scratch_dir / "CORRUPT_HIVE";
-    {
-        std::ofstream ofs(corrupt_file, std::ios::binary);
-        ofs << "NOT_A_REGF_FILE";
-    }
-    assert(PnpDriverArmer::arm_offline_system_hive(corrupt_file).is_err());
-    assert(PnpDriverArmer::arm_offline_system_hive(scratch_dir / "DOES_NOT_EXIST").is_err());
-
-    // ------------------------------------------------------------------
-    // 15. ensure_image_armed(): idempotent and tolerant of images that
-    //     are not Windows volumes at all.
-    // ------------------------------------------------------------------
-    const std::filesystem::path raw_img = scratch_dir / "test.raw";
-    {
-        std::ofstream ofs(raw_img, std::ios::binary);
-        std::vector<char> zeros(1024, 0);
-        ofs.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
-    }
-    auto raw_arm_res = PnpDriverArmer::ensure_image_armed(raw_img);
-    assert(raw_arm_res.is_ok());
-    assert(raw_arm_res.value().success);
-
-    auto sys_arm_res = PnpDriverArmer::ensure_image_armed(hive_file);
-    assert(sys_arm_res.is_ok());
-    assert(sys_arm_res.value().success);
-    auto sys_second = PnpDriverArmer::ensure_image_armed(hive_file);
-    assert(sys_second.is_ok());
-    assert(sys_second.value().armed_services.size() == sys_arm_res.value().armed_services.size());
-
-    std::filesystem::remove_all(scratch_dir, ec);
-    std::cout << "  PASS: test_pnp_driver_arming_and_offline_registry_injection\n";
+    std::filesystem::remove_all(root, ec);
+    std::cout << "  PASS: test_staged_gate_reads_a_windows_spelled_path\n";
 }
 
 void test_dhcp_init_reboot_and_kernel_handoff() {
@@ -7388,7 +8502,9 @@ void test_ipxe_boot_script_rendering_and_wire_integrity() {
         assert(def_script.find("${server_ip}") == std::string::npos);
         assert(def_script.find("${target_iqn}") == std::string::npos);
         assert(def_script.find("set keep-san 1") != std::string::npos);
-        assert(def_script.find("sanboot iscsi:${next-server}::::") != std::string::npos);
+        assert(def_script.find("set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}") != std::string::npos);
+        assert(def_script.find("sanhook --drive 0x80 iscsi:${next-server}::::") != std::string::npos);
+        assert(def_script.find("sanboot --drive 0x80") != std::string::npos);
 
         // Explicit formatting: replaces %s with actual server IP and target IQN
         ipxe::SanbootOptions custom_opts;
@@ -7398,21 +8514,49 @@ void test_ipxe_boot_script_rendering_and_wire_integrity() {
 
         const std::string expected_script =
             "#!ipxe\n"
+            "dhcp net0\n"
+            "set net0/gateway 0.0.0.0\n"
             "set keep-san 1\n"
-            "sanboot iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:os\n";
+            "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n"
+            "sanhook --drive 0x80 iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:os\n"
+            "sanboot --drive 0x80\n";
         assert(custom_script == expected_script);
         assert(static_cast<uint8_t>(custom_script[0]) == 0x23);
         assert(custom_script.find("${server_ip}") == std::string::npos);
         assert(custom_script.find("${target_iqn}") == std::string::npos);
     }
 
-    // 2. HttpDaemon handle_request("GET", "/boot.ipxe") serves clean SANBoot script
+    // 2. Bare /boot.ipxe re-identifies; the configured shared target still
+    //    renders verbatim for a machine that has named itself.
     {
         HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
         daemon.set_server_ip(NetworkAddress(192, 168, 1, 100));
         daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:os");
 
-        HttpResponse resp = daemon.handle_request("GET", "/boot.ipxe");
+        // A bare first hop carries no MAC (DHCP's Option 67 URL is fixed), so
+        // it re-chains instead of attaching to a target it may not be
+        // enrolled for.
+        HttpResponse chain = daemon.handle_request("GET", "/boot.ipxe");
+        assert(chain.status == 200);
+        assert(chain.content_type == "text/plain; charset=utf-8");
+        assert(chain.body.rfind("#!ipxe", 0) == 0);
+        assert(static_cast<uint8_t>(chain.body[0]) == 0x23);
+        assert(chain.body.find(
+                   "/boot.ipxe?mac=${net0/mac}&platform=${platform}") != std::string::npos);
+        assert(chain.body.find("sanboot") == std::string::npos);
+        assert(chain.body.find("sanhook") == std::string::npos);
+
+        // Enrollment answers with the SANBoot script, which is where the
+        // server-side set_target_iqn()/set_server_ip() wiring shows up.
+        const std::filesystem::path db_path = "test_target_iqn_db.json";
+        std::filesystem::remove(db_path);
+        auto db = std::make_shared<ClientDatabase>(db_path);
+        db->configure_pool(NetworkAddress(192, 168, 1, 50),
+                           NetworkAddress(192, 168, 1, 60));
+        daemon.set_client_database(db);
+
+        HttpResponse resp = daemon.handle_request(
+            "GET", "/api/enroll?mac=aa:bb:cc:00:00:77&name=pctest");
         assert(resp.status == 200);
         assert(resp.content_type == "text/plain; charset=utf-8");
         assert(resp.body.rfind("#!ipxe", 0) == 0);
@@ -7420,7 +8564,23 @@ void test_ipxe_boot_script_rendering_and_wire_integrity() {
         assert(resp.body.find("${server_ip}") == std::string::npos);
         assert(resp.body.find("${target_iqn}") == std::string::npos);
         assert(resp.body.find("set keep-san 1") != std::string::npos);
-        assert(resp.body.find("sanboot iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:os") != std::string::npos);
+        assert(resp.body.find(
+                   "sanhook --drive 0x80 iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:os")
+               != std::string::npos);
+        assert(resp.body.find("sanboot --drive 0x80") != std::string::npos);
+
+        // ...and the same caller now detours into sniffing: a DB-known MAC
+        // without telemetry never takes silent SAN (strict gate) -- the next
+        // hop reports ven/dev into enrollment, which answers SAN for an
+        // enrolled board.
+        HttpResponse known = daemon.handle_request("GET", "/boot.ipxe?mac=aa:bb:cc:00:00:77");
+        assert(known.status == 200);
+        assert(known.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+        assert(known.body.find("&sniffed=1") != std::string::npos);
+        assert(known.body.find("sanboot --drive 0x80") == std::string::npos);
+        assert(known.body.find("read pc_name") == std::string::npos);
+
+        std::filesystem::remove(db_path);
     }
 
     // 3. Live Socket test: curl-style GET /boot.ipxe over real TCP socket
@@ -7429,59 +8589,83 @@ void test_ipxe_boot_script_rendering_and_wire_integrity() {
         live_daemon.set_server_ip(NetworkAddress(192, 168, 1, 100));
         live_daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:os");
 
+        const std::filesystem::path db_path = "test_wire_db.json";
+        std::filesystem::remove(db_path);
+        auto wire_db = std::make_shared<ClientDatabase>(db_path);
+        wire_db->configure_pool(NetworkAddress(192, 168, 1, 50),
+                                NetworkAddress(192, 168, 1, 60));
+        live_daemon.set_client_database(wire_db);
+
         auto init_res = live_daemon.initialize();
         assert(init_res.is_ok());
         const uint16_t bound = live_daemon.bound_port();
         assert(bound != 0);
 
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        assert(sock != INVALID_SOCKET);
+        const auto fetch = [&](const std::string& target) {
+            SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            assert(sock != INVALID_SOCKET);
 
-        sockaddr_in srv{};
-        srv.sin_family = AF_INET;
-        srv.sin_port = htons(bound);
-        srv.sin_addr.s_addr = htonl(0x7F000001u); // 127.0.0.1
-        assert(connect(sock, reinterpret_cast<sockaddr*>(&srv), sizeof(srv)) == 0);
+            sockaddr_in srv{};
+            srv.sin_family = AF_INET;
+            srv.sin_port = htons(bound);
+            srv.sin_addr.s_addr = htonl(0x7F000001u); // 127.0.0.1
+            assert(connect(sock, reinterpret_cast<sockaddr*>(&srv), sizeof(srv)) == 0);
 
-        const std::string curl_req = "GET /boot.ipxe HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: curl/8.4.0\r\nAccept: */*\r\n\r\n";
-        assert(send(sock, curl_req.c_str(), static_cast<int>(curl_req.size()), 0) == static_cast<int>(curl_req.size()));
+            const std::string curl_req =
+                "GET " + target +
+                " HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: curl/8.4.0\r\n"
+                "Accept: */*\r\n\r\n";
+            assert(send(sock, curl_req.c_str(), static_cast<int>(curl_req.size()), 0) ==
+                   static_cast<int>(curl_req.size()));
 
-        std::string raw_reply;
-        char buf[2048];
-        for (;;) {
-            int n = recv(sock, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            raw_reply.append(buf, static_cast<size_t>(n));
-        }
-        closesocket(sock);
+            std::string raw_reply;
+            char buf[2048];
+            for (;;) {
+                int n = recv(sock, buf, sizeof(buf), 0);
+                if (n <= 0) break;
+                raw_reply.append(buf, static_cast<size_t>(n));
+            }
+            closesocket(sock);
 
-        // Verify status line
-        assert(raw_reply.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
+            assert(raw_reply.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
+            const size_t body_pos = raw_reply.find("\r\n\r\n");
+            assert(body_pos != std::string::npos);
+            return raw_reply.substr(body_pos + 4);
+        };
 
-        // Extract body after \r\n\r\n
-        const size_t body_pos = raw_reply.find("\r\n\r\n");
-        assert(body_pos != std::string::npos);
-        const std::string wire_body = raw_reply.substr(body_pos + 4);
-
-        // Verify byte 0 is strictly '#!ipxe'
+        // Bare first hop: re-identify over HTTP, never attach. The chain
+        // target must carry the port the daemon actually bound.
+        const std::string wire_body = fetch("/boot.ipxe");
         assert(wire_body.size() >= 6);
-        assert(wire_body[0] == '#');
-        assert(wire_body[1] == '!');
-        assert(wire_body[2] == 'i');
-        assert(wire_body[3] == 'p');
-        assert(wire_body[4] == 'x');
-        assert(wire_body[5] == 'e');
-
-        // Verify no leading whitespace, newlines, or UTF-8 BOM
-        assert(static_cast<uint8_t>(wire_body[0]) == 0x23);
-
-        // Verify content
-        assert(wire_body.find("set keep-san 1") != std::string::npos);
-        assert(wire_body.find("sanboot iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:os") != std::string::npos);
+        assert(wire_body.rfind("#!ipxe", 0) == 0);
+        assert(static_cast<uint8_t>(wire_body[0]) == 0x23); // no BOM/whitespace
+        assert(wire_body.find("http://192.168.1.100:" + std::to_string(bound) +
+                              "/boot.ipxe?mac=${net0/mac}&platform=${platform}") !=
+               std::string::npos);
+        assert(wire_body.find("sanboot") == std::string::npos);
         assert(wire_body.find("${server_ip}") == std::string::npos);
         assert(wire_body.find("${target_iqn}") == std::string::npos);
 
+        // ...and an enrolled caller, identifying itself, now detours through
+        // PCI sniffing + the enrollment route first: silent SAN here is what
+        // sent bare-metal stations into 0x7B with no enrollment attempt.
+        assert(live_daemon.handle_request(
+                   "GET", "/api/enroll?mac=aa:bb:cc:00:00:88&name=wirepc").status == 200);
+        const std::string san_body = fetch("/boot.ipxe?mac=aa:bb:cc:00:00:88");
+        assert(san_body.size() >= 6);
+        assert(san_body.rfind("#!ipxe", 0) == 0);
+        assert(static_cast<uint8_t>(san_body[0]) == 0x23);
+        assert(san_body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+        assert(san_body.find(
+                   "/boot?mac=AA:BB:CC:00:00:88"
+                   "&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&sniffed=1") !=
+               std::string::npos);
+        assert(san_body.find("sanboot --drive 0x80") == std::string::npos);
+        assert(san_body.find("${server_ip}") == std::string::npos);
+        assert(san_body.find("${target_iqn}") == std::string::npos);
+
         live_daemon.shutdown();
+        std::filesystem::remove(db_path);
     }
 
     std::cout << "  PASS: test_ipxe_boot_script_rendering_and_wire_integrity\n";
@@ -7617,16 +8801,24 @@ void test_dynamic_boot_script_router() {
     // Builder defaults must reproduce the documented scripts byte for byte.
     assert(ipxe::legacy_mbr_sanboot_script() ==
            "#!ipxe\n"
+           "dhcp net0\n"
+           "set net0/gateway 0.0.0.0\n"
+           "set keep-san 1\n"
+           "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n"
            "sanhook --drive 0x80 iscsi:${server_ip}::::${target_iqn}\n"
-           "sanboot --no-describe\n");
+           "sanboot --drive 0x80\n");
 
     ipxe::LegacySanbootOptions concrete;
     concrete.server_ip = "192.168.1.10";
     concrete.target_iqn = "iqn.2026-09.com.cobdiskless:os";
     assert(ipxe::legacy_mbr_sanboot_script(concrete) ==
            "#!ipxe\n"
+           "dhcp net0\n"
+           "set net0/gateway 0.0.0.0\n"
+           "set keep-san 1\n"
+           "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n"
            "sanhook --drive 0x80 iscsi:192.168.1.10::::iqn.2026-09.com.cobdiskless:os\n"
-           "sanboot --no-describe\n");
+           "sanboot --drive 0x80\n");
 
     const std::string expected_wimboot =
         "#!ipxe\n"
@@ -7688,8 +8880,12 @@ void test_dynamic_boot_script_router() {
     assert(ready.status == 200);
     assert(ready.body ==
            "#!ipxe\n"
+           "dhcp net0\n"
+           "set net0/gateway 0.0.0.0\n"
+           "set keep-san 1\n"
+           "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n"
            "sanhook --drive 0x80 iscsi:${server_ip}::::iqn.2026-09.com.cobdiskless:pc01\n"
-           "sanboot --no-describe\n");
+           "sanboot --drive 0x80\n");
     assert(ready.body.find("wimboot") == std::string::npos);
 
     // Another client must not inherit that READY state.
@@ -7732,14 +8928,8 @@ void test_staged_callback_lifecycle_and_static_assets() {
         const std::filesystem::path hive_path =
             target / "Windows" / "System32" / "config" / "SYSTEM";
         std::filesystem::create_directories(hive_path.parent_path());
-        const std::vector<PnpDriverArmer::SyntheticNetAdapter> adapters = {
-            {"0000", "Realtek PCIe GbE Family Controller", "PCI\\VEN_10EC&DEV_8168",
-             "pci\\ven_10ec&dev_8168", full_anti_flap_ndi_schema(), "rt640x64"},
-            {"0001", "Intel(R) Ethernet Connection I219-LM", "PCI\\VEN_8086&DEV_15B8",
-             "pci\\ven_8086&dev_15b8", full_anti_flap_ndi_schema(), "e1d68x64"},
-        };
-        const std::vector<uint8_t> hive = PnpDriverArmer::create_synthetic_system_hive(
-            1, {{"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}, {"e1d68x64", 3}}, adapters);
+        const std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+            1, {{"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}, {"e1d68x64", 3}});
         std::ofstream ofs(hive_path, std::ios::binary | std::ios::trunc);
         ofs.write(reinterpret_cast<const char*>(hive.data()),
                   static_cast<std::streamsize>(hive.size()));
@@ -7767,10 +8957,10 @@ void test_staged_callback_lifecycle_and_static_assets() {
     int arming_calls = 0;
     std::filesystem::path last_armed;
     daemon.set_hive_arming_function(
-        [&](const std::filesystem::path& hive_path) -> Result<PnpDriverArmReport> {
+        [&](const std::filesystem::path& hive_path) -> Result<BootStartArmReport> {
             ++arming_calls;
             last_armed = hive_path;
-            return PnpDriverArmer::arm_offline_system_hive(hive_path);
+            return RegBootStart::arm_offline_system_hive(hive_path);
         });
 
     // --- request validation --------------------------------------------------
@@ -7817,8 +9007,9 @@ void test_staged_callback_lifecycle_and_static_assets() {
     assert(mgr->find_boot_state(mac01).value().status == ClientBootStatus::Ready);
 
     // The handler must leave the hive provably boot-ready:
-    // Start=0, BootFlags=0x1 for bound adapters and iSCSI stack.
-    // CDDB and vendor parameters should NOT be created.
+    // Start=0, BootFlags=0x1 for bound adapters and iSCSI stack, plus the
+    // initiator contract (root#iscsiprt class binding); hardware-specific
+    // CDDB rows and vendor parameters must NOT be created.
     {
         std::ifstream ifs(last_armed, std::ios::binary);
         const std::vector<uint8_t> armed_bytes((std::istreambuf_iterator<char>(ifs)),
@@ -7849,8 +9040,24 @@ void test_staged_callback_lifecycle_and_static_assets() {
         assert(hive_get_dword(armed_bytes, e1d_off, "Start", &value) && value == 0);
         assert(hive_get_dword(armed_bytes, e1d_off, "BootFlags", &value) && value == 0x1);
 
-        // CDDB and vendor parameters should NOT exist
-        assert(hive_open_path(armed_bytes, "ControlSet001\\Control\\CriticalDeviceDatabase") == 0xFFFFFFFF);
+        // The initiator's own class-level binding is ground truth: the
+        // working-era master carries CriticalDeviceDatabase\root#iscsiprt and
+        // arm_multi_nic.ps1 wrote it, so the native contract writes it too.
+        // What must NOT come back is the archived pnp_dccb machinery --
+        // hardware-specific pci# rows and vendor offload parameters the boot
+        // stack has no business inventing.
+        const uint32_t cddb = hive_open_path(
+            armed_bytes, "ControlSet001\\Control\\CriticalDeviceDatabase");
+        assert(cddb != 0xFFFFFFFF);
+        const uint32_t initiator_entry = hive_open_path(
+            armed_bytes,
+            "ControlSet001\\Control\\CriticalDeviceDatabase\\root#iscsiprt");
+        assert(initiator_entry != 0xFFFFFFFF);
+        assert(hive_get_sz(armed_bytes, initiator_entry, "Service") == "iScsiPrt");
+        assert(hive_open_path(
+                   armed_bytes,
+                   "ControlSet001\\Control\\CriticalDeviceDatabase\\pci#ven_10ec&dev_8168") ==
+               0xFFFFFFFF);
         assert(hive_open_path(armed_bytes, "ControlSet001\\Services\\rt640x64\\Parameters") == 0xFFFFFFFF);
         assert(hive_open_path(armed_bytes, "ControlSet001\\Services\\e1d68x64\\Parameters") == 0xFFFFFFFF);
     }
@@ -7865,7 +9072,7 @@ void test_staged_callback_lifecycle_and_static_assets() {
     assert(mgr->assign_boot_target("AA:BB:CC:00:00:02", pc02, "iqn.x:pc02").is_ok());
     assert(mgr->begin_staging("AA:BB:CC:00:00:02").is_ok());
     daemon.set_hive_arming_function(
-        [](const std::filesystem::path&) -> Result<PnpDriverArmReport> {
+        [](const std::filesystem::path&) -> Result<BootStartArmReport> {
             return Error(ErrorCode::IoFailure, "simulated mount failure");
         });
 
@@ -7885,8 +9092,8 @@ void test_staged_callback_lifecycle_and_static_assets() {
     assert(mgr->assign_boot_target("AA:BB:CC:00:00:03", pc03, "iqn.x:pc03").is_ok());
     assert(mgr->begin_staging("AA:BB:CC:00:00:03").is_ok());
     daemon.set_hive_arming_function(
-        [](const std::filesystem::path&) -> Result<PnpDriverArmReport> {
-            PnpDriverArmReport report;
+        [](const std::filesystem::path&) -> Result<BootStartArmReport> {
+            BootStartArmReport report;
             report.success = true;
             report.boot_flags_armed = false;
             report.iscsi_stack_armed = false;
@@ -7973,19 +9180,18 @@ void test_live_static_stream_and_staged_post() {
         out.write(blob.data(), static_cast<std::streamsize>(blob.size()));
     }
 
-    const std::filesystem::path vhd_target = root / "pc_live_vhd";
+    // The staging target is a loose SYSTEM hive file -- the assignment shape
+    // the endpoint may arm in place. A mounted volume root (a directory) is
+    // the other shape locate_system_hive() accepts, and that one must go
+    // through RegLoadKeyW / reg.exe load instead: without the privilege the
+    // daemon refuses it rather than writing cells by hand. See
+    // test_mounted_volume_hive_never_uses_the_raw_writer.
+    const std::filesystem::path vhd_target = root / "pc_live_hive";
     {
-        const std::filesystem::path hive_path =
-            vhd_target / "Windows" / "System32" / "config" / "SYSTEM";
+        const std::filesystem::path hive_path = vhd_target;
         std::filesystem::create_directories(hive_path.parent_path(), ec);
-        const std::vector<PnpDriverArmer::SyntheticNetAdapter> adapters = {
-            {"0000", "Realtek PCIe GbE Family Controller", "PCI\\VEN_10EC&DEV_8168",
-             "pci\\ven_10ec&dev_8168", full_anti_flap_ndi_schema(), "rt640x64"},
-            {"0001", "Intel(R) Ethernet Connection I219-LM", "PCI\\VEN_8086&DEV_15B8",
-             "pci\\ven_8086&dev_15b8", full_anti_flap_ndi_schema(), "e1d68x64"},
-        };
-        const std::vector<uint8_t> hive = PnpDriverArmer::create_synthetic_system_hive(
-            1, {{"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}, {"e1d68x64", 3}}, adapters);
+        const std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+            1, {{"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}, {"e1d68x64", 3}});
         std::ofstream ofs(hive_path, std::ios::binary | std::ios::trunc);
         ofs.write(reinterpret_cast<const char*>(hive.data()),
                   static_cast<std::streamsize>(hive.size()));
@@ -8085,8 +9291,7 @@ void test_live_static_stream_and_staged_post() {
     // The armed hive really made it to disk behind the HTTP layer.
     const auto armed_state = mgr->find_boot_state("AA:BB:CC:00:00:01");
     assert(armed_state.has_value());
-    assert(std::filesystem::is_regular_file(
-        vhd_target / "Windows" / "System32" / "config" / "SYSTEM"));
+    assert(std::filesystem::is_regular_file(vhd_target));
 
     // --- READY client now receives the SAN boot script -----------------------
     const std::string boot_reply =
@@ -8190,7 +9395,7 @@ void test_iscsi_shared_session_connection_refcount() {
 
     // Negative control -- what the previous unconditional terminate_session() did
     // to a connection that was still mid-boot. terminate_session() close()s the
-    // overlay (WritebackContext::is_open_ -> false), purges the writeback file and
+    // overlay (UnifiedCowDevice::is_open_ -> false), purges the writeback file and
     // erases the session, so the SURVIVING connection's next READ fails with
     // "Device not open" instead of returning sectors: CHECK CONDITION at the
     // initiator -> INACCESSIBLE_BOOT_DEVICE (0x7B) after winload.exe.
@@ -8209,106 +9414,155 @@ void test_iscsi_shared_session_connection_refcount() {
     std::cout << "  PASS: test_iscsi_shared_session_connection_refcount\n";
 }
 
-// Issue 3 -- A hive Windows leaves dirty (Fast Startup / hiberboot / crash)
-// carries mismatched REGF sequence numbers, which is exactly the condition
-// under which the NT hive loader replays SYSTEM.LOG1/.LOG2 over the file. The
-// armer has to detect that state and force the header clean on flush, otherwise
-// the offline driver-arming changes are rolled back during kernel Phase 0.
-void test_offline_hive_dirty_detection_and_clean_flush() {
-    std::cout << "[RUN] test_offline_hive_dirty_detection_and_clean_flush\n";
+// Session reinstatement (RFC 3720 5.3.5): the socket is rebound, so the two
+// pieces of per-connection state hung off the session have to be rebound with
+// it. Measured on the wire before this was fixed: msiscsi logged in ~112s after
+// iPXE went quiet, and 513ms later the idle watchdog closed the brand new
+// connection because it read the previous socket's last-activity time -- the
+// initiator was then left spinning on unacknowledged I/O.
+void test_session_reinstatement_restarts_idle_clock_and_socket_claim() {
+    std::cout << "[RUN] test_session_reinstatement_restarts_idle_clock_and_socket_claim\n";
+    using clock = std::chrono::steady_clock;
+    constexpr uintptr_t no_sock = ~static_cast<uintptr_t>(0);
 
-    auto put_le32 = [](std::vector<uint8_t>& buf, size_t off, uint32_t v) {
-        buf[off + 0] = static_cast<uint8_t>(v & 0xFFu);
-        buf[off + 1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-        buf[off + 2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-        buf[off + 3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-    };
-    auto get_le32 = [](const std::vector<uint8_t>& buf, size_t off) -> uint32_t {
-        return static_cast<uint32_t>(buf[off]) |
-               (static_cast<uint32_t>(buf[off + 1]) << 8) |
-               (static_cast<uint32_t>(buf[off + 2]) << 16) |
-               (static_cast<uint32_t>(buf[off + 3]) << 24);
-    };
-    auto mentions = [](const std::vector<std::string>& haystack, const std::string& needle) {
-        return std::any_of(haystack.begin(), haystack.end(),
-                           [&](const std::string& s) { return s.find(needle) != std::string::npos; });
-    };
+    // 1. The idle clock starts again at the bind, and the stale warning that
+    //    went with the old socket is dropped alongside it.
+    {
+        ClientSession session(ClientId("00:11:22:33:44:77"), NetworkAddress(192, 168, 1, 77));
 
-    const std::vector<std::pair<std::string, uint32_t>> initial_services = {
-        {"msiscsi", 3}, {"Tcpip", 1}, {"NDIS", 1}, {"rt640x64", 3}, {"e1d68x64", 2}};
+        const auto stale = clock::now() - std::chrono::milliseconds(112538);
+        session.set_last_scsi_time(stale);
+        session.set_watchdog_warned(true);
+        assert(session.last_scsi_time() == stale);
+        assert(session.watchdog_warned());
 
-    // 1. A clean hive must not be reported as dirty or as having been cleaned.
-    auto clean_hive = PnpDriverArmer::create_synthetic_system_hive(1, initial_services);
-    assert(get_le32(clean_hive, 0x04) == get_le32(clean_hive, 0x08));
-    auto clean_res = PnpDriverArmer::arm_hive_buffer(clean_hive);
-    assert(clean_res.is_ok());
-    assert(clean_res.value().hive_dirty_on_entry == false);
-    assert(clean_res.value().hive_cleaned_on_exit == false);
-    assert(get_le32(clean_hive, 0x04) == get_le32(clean_hive, 0x08));
+        session.note_connection_bound();
 
-    // 2. Same hive forced dirty the way Fast Startup leaves it.
-    auto dirty_hive = PnpDriverArmer::create_synthetic_system_hive(1, initial_services);
-    put_le32(dirty_hive, 0x04, 7); // Primary Sequence Number
-    put_le32(dirty_hive, 0x08, 5); // Secondary Sequence Number
-    assert(get_le32(dirty_hive, 0x04) != get_le32(dirty_hive, 0x08));
+        const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            clock::now() - session.last_scsi_time()).count();
+        assert(idle_ms >= 0);
+        // Under kIdleTeardownMs (60000): the clock this connection is judged
+        // against is bounded by its own age, so it can never inherit history
+        // from the socket it replaced.
+        assert(idle_ms < 60000);
+        assert(!session.watchdog_warned());
+    }
 
-    auto dirty_res = PnpDriverArmer::arm_hive_buffer(dirty_hive);
-    assert(dirty_res.is_ok());
-    const auto& rep = dirty_res.value();
-    assert(rep.hive_dirty_on_entry == true);
-    assert(rep.hive_cleaned_on_exit == true);
-    assert(mentions(rep.warnings, "dirty on entry"));
+    // 2. Dropping a socket claim releases this connection's handle only. After
+    //    a rebind the session points at the replacement, and releasing the old
+    //    value must be a no-op rather than clearing the claim the live
+    //    connection is relying on (the next reinstatement would then retire a
+    //    handle value Windows has already handed to someone else).
+    {
+        ClientSession session(ClientId("00:11:22:33:44:88"), NetworkAddress(192, 168, 1, 88));
+        constexpr uintptr_t old_sock = 1172;
+        constexpr uintptr_t new_sock = 2048;
 
-    // The flushed header must be clean again -- Primary == Secondary is the only
-    // thing that stops HvLoadHive from replaying the transaction logs.
-    const uint32_t prim_after = get_le32(dirty_hive, 0x04);
-    const uint32_t sec_after = get_le32(dirty_hive, 0x08);
-    assert(prim_after == sec_after);
-    assert(prim_after > 7);
-    assert(PnpDriverArmer::calculate_regf_header_checksum(dirty_hive.data()) ==
-           get_le32(dirty_hive, 0x1FC));
+        session.set_active_socket(old_sock);
+        assert(session.active_socket() == old_sock);
+        assert(session.release_active_socket(old_sock));
+        assert(session.active_socket() == no_sock);
 
-    // ...and the arming still actually happened.
-    assert(std::find(rep.armed_services.begin(), rep.armed_services.end(), "msiscsi") !=
-           rep.armed_services.end());
-    assert(rep.hive_dirty_on_entry && !rep.control_set.empty());
+        session.set_active_socket(new_sock);
+        assert(!session.release_active_socket(old_sock));
+        assert(session.active_socket() == new_sock);
 
-    // 3. File-level path: dirty hive sitting next to a non-empty SYSTEM.LOG1.
-    const std::filesystem::path scratch = "test_scratch_dirty_hive";
+        assert(session.release_active_socket(new_sock));
+        assert(session.active_socket() == no_sock);
+
+        // Idempotent: a second release of an already-dropped claim is harmless.
+        assert(!session.release_active_socket(new_sock));
+        assert(session.active_socket() == no_sock);
+    }
+
+    std::cout << "  PASS: test_session_reinstatement_restarts_idle_clock_and_socket_claim\n";
+}
+
+// The Windows NDIS handover: msiscsi reconnects from the same TCP peer IP with
+// a generated IQN that carries no MAC. The server must re-attach that login to
+// the session (and wb_<cleanmac>.cow overlay) the machine already owns -- by
+// MAC spelling or by peer IP -- instead of minting a second session on the same
+// base image, and must expose both indexes (MAC + IP) with full cleanup.
+void test_session_identity_reattach_mac_and_ip() {
+    std::cout << "[RUN] test_session_identity_reattach_mac_and_ip\n";
     std::error_code ec;
-    std::filesystem::remove_all(scratch, ec);
-    std::filesystem::create_directories(scratch, ec);
-    const std::filesystem::path hive_path = scratch / "SYSTEM";
+
+    const std::filesystem::path test_dir = "./test_scratch_session_identity";
+    const std::filesystem::path base_path = test_dir / "golden_os.raw";
+    const std::filesystem::path wb_dir = test_dir / "wb";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(wb_dir, ec);
+
     {
-        auto on_disk = PnpDriverArmer::create_synthetic_system_hive(1, initial_services);
-        put_le32(on_disk, 0x04, 12);
-        put_le32(on_disk, 0x08, 9);
-        std::ofstream out(hive_path, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(on_disk.data()),
-                  static_cast<std::streamsize>(on_disk.size()));
-    }
-    {
-        std::ofstream log(scratch / "SYSTEM.LOG1", std::ios::binary | std::ios::trunc);
-        log << "stale fast-startup log records";
+        std::ofstream base_out(base_path, std::ios::binary);
+        std::vector<uint8_t> data(1024 * 1024, 0x44);
+        base_out.write(reinterpret_cast<const char*>(data.data()),
+                       static_cast<std::streamsize>(data.size()));
     }
 
-    auto file_res = PnpDriverArmer::arm_offline_system_hive(hive_path);
-    assert(file_res.is_ok());
-    assert(file_res.value().hive_dirty_on_entry == true);
-    assert(mentions(file_res.value().warnings, "SYSTEM.LOG1"));
+    Configuration cfg;
+    cfg.set_os_images_dir(test_dir);
+    cfg.set_writeback_dir(wb_dir);
 
-    // The bytes actually written to disk must be clean.
-    {
-        std::ifstream in(hive_path, std::ios::binary);
-        std::vector<uint8_t> header(0x200, 0);
-        in.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
-        assert(in.gcount() == static_cast<std::streamsize>(header.size()));
-        assert(get_le32(header, 0x04) == get_le32(header, 0x08));
-        assert(get_le32(header, 0x04) > 12);
-    }
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    img_mgr->configure(cfg);
+    assert(img_mgr->import_image(base_path, ImageRole::OsImage, ImageId("os_image")).is_ok());
 
-    std::filesystem::remove_all(scratch, ec);
-    std::cout << "  PASS: test_offline_hive_dirty_detection_and_clean_flush\n";
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, wb_dir);
+
+    const NetworkAddress peer(192, 168, 1, 230);
+
+    // 1. iPXE-style boot login: MAC-keyed session, overlay wb_<cleanmac>.cow.
+    auto boot_res = sess_mgr->get_or_create_session(
+        ClientId("AA:BB:CC:00:00:30"), peer, ImageId("os_image"),
+        "iqn.2026-09.cobdiskless:aa-bb-cc-00-00-30");
+    assert(boot_res.is_ok());
+    auto boot_session = boot_res.value();
+    const auto overlay = wb_dir / "wb_aabbcc000030.cow";
+    assert(std::filesystem::exists(overlay));
+
+    // 2. Handover: SAME peer IP, generated msiscsi IQN, ip_-keyed identity
+    //    (no MAC anywhere). Must re-attach to the existing session/overlay.
+    auto handover = sess_mgr->get_or_create_session(
+        ClientId("ip_192.168.1.230"), peer, ImageId("os_image"),
+        "iqn.1991-05.com.microsoft:DESKTOP-COB123");
+    assert(handover.is_ok());
+    assert(handover.value().get() == boot_session.get());
+    assert(sess_mgr->active_clients_count() == 1);
+    assert(std::filesystem::exists(overlay)); // same cow, still alive
+
+    // 3. Same machine under a different MAC spelling: case/separator-insensitive
+    //    MAC index resolves it to the same session.
+    auto mac_variant = sess_mgr->get_or_create_session(
+        ClientId("aa-bb-cc-00-00-30"), peer, ImageId("os_image"));
+    assert(mac_variant.is_ok());
+    assert(mac_variant.value().get() == boot_session.get());
+    assert(sess_mgr->active_clients_count() == 1);
+
+    // 4. Explicit index lookups by both identities.
+    assert(sess_mgr->find_session_by_ip(peer).get() == boot_session.get());
+    assert(sess_mgr->find_session_by_mac("aabbcc000030").get() == boot_session.get());
+    assert(sess_mgr->find_session_by_mac("AA:BB:CC:00:00:30").get() == boot_session.get());
+    assert(sess_mgr->find_session_by_ip(NetworkAddress(192, 168, 1, 99)) == nullptr);
+    assert(sess_mgr->find_session_by_mac("aa:bb:cc:99:99:99") == nullptr);
+    assert(sess_mgr->find_session_by_mac("not-a-mac-at-all") == nullptr);
+
+    // 5. Teardown clears every index entry: a later login with no MAC must NOT
+    //    re-attach to the dead session (and the overlay is purged as before).
+    assert(sess_mgr->terminate_session(boot_session->id()).is_ok());
+    assert(!std::filesystem::exists(overlay));
+    assert(sess_mgr->find_session_by_ip(peer) == nullptr);
+    assert(sess_mgr->find_session_by_mac("aa:bb:cc:00:00:30") == nullptr);
+
+    auto fresh = sess_mgr->get_or_create_session(
+        ClientId("ip_192.168.1.230"), peer, ImageId("os_image"));
+    assert(fresh.is_ok());
+    assert(fresh.value().get() != boot_session.get());
+    assert(sess_mgr->terminate_session(fresh.value()->id()).is_ok());
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_session_identity_reattach_mac_and_ip\n";
 }
 
 void test_dhcp_zero_config_boot_and_raw_logging() {
@@ -8429,7 +9683,7 @@ void test_dhcp_zero_config_boot_and_raw_logging() {
     const auto* offer_hdr = reinterpret_cast<const DhcpHeader*>(offer_bytes.data());
     assert(offer_hdr->op == 2); // BOOTREPLY
     assert(offer_hdr->xid == acer_hdr.xid);
-    assert(std::string(reinterpret_cast<const char*>(offer_hdr->file)) == "ipxe.efi");
+    assert(std::string(reinterpret_cast<const char*>(offer_hdr->file)) == "cobpxe.efi");
 
     // Verify yiaddr is 192.168.1.100
     uint8_t expected_yi[4] = {192, 168, 1, 100};
@@ -8439,10 +9693,10 @@ void test_dhcp_zero_config_boot_and_raw_logging() {
     auto offer_parse = DhcpServer::parse_packet(offer_bytes);
     assert(offer_parse.is_ok());
     assert(offer_parse.value().message_type == 2); // Offer
-    assert(offer_parse.value().bootfile_name == "ipxe.efi");
+    assert(offer_parse.value().bootfile_name == "cobpxe.efi");
     assert(offer_parse.value().tftp_server_name == "192.168.1.1");
 
-    // 6. Test Case 2: Second unknown client with BIOS architecture (undionly.kpxe)
+    // 6. Test Case 2: Second unknown client with BIOS architecture (cobpxe.kpxe)
     std::string bios_mac = "00:E0:4C:99:88:77";
     DhcpHeader bios_hdr{};
     bios_hdr.op = 1;
@@ -8473,7 +9727,7 @@ void test_dhcp_zero_config_boot_and_raw_logging() {
     auto offer_bios = dhcp.build_reply(bios_hdr, parsed_bios.value(), 2, reg_bios.value().ip_address);
     assert(offer_bios.is_ok());
     const auto* bios_offer_hdr = reinterpret_cast<const DhcpHeader*>(offer_bios.value().data());
-    assert(std::string(reinterpret_cast<const char*>(bios_offer_hdr->file)) == "undionly.kpxe");
+    assert(std::string(reinterpret_cast<const char*>(bios_offer_hdr->file)) == "cobpxe.kpxe");
 
     // 7. Test Case 3: TFTP dynamic script serves golden image target
     TftpServer tftp(NetworkAddress(192, 168, 1, 1), test_dir, 69);
@@ -8484,8 +9738,9 @@ void test_dhcp_zero_config_boot_and_raw_logging() {
     assert(boot_ipxe_res.is_ok());
     std::string script_str(reinterpret_cast<const char*>(boot_ipxe_res.value().data()), boot_ipxe_res.value().size());
     assert(script_str.find("#!ipxe") != std::string::npos);
-    assert(script_str.find("iqn.2026-09.com.cobdiskless:golden_win10") != std::string::npos);
-    assert(script_str.find("sanboot iscsi:192.168.1.1::::iqn.2026-09.com.cobdiskless:golden_win10") != std::string::npos);
+    assert(script_str.find("set busloc ${net0/busloc}") != std::string::npos);
+    assert(script_str.find("chain http://192.168.1.1:18080/boot.ipxe") != std::string::npos);
+
 
     // 8. Test Case 4: Malformed packet rejection (no silent drops)
     std::vector<uint8_t> short_pkt(20, 0); // shorter than DhcpHeader
@@ -8661,1209 +9916,6 @@ void test_dhcp_self_lease_and_tftp_ephemeral_routing() {
 
     std::filesystem::remove_all(test_dir, ec);
     std::cout << "  PASS: test_dhcp_self_lease_and_tftp_ephemeral_routing\n";
-}
-
-void test_auto_arm_vhd_configuration_and_offline_discovery() {
-    std::cout << "[RUN] test_auto_arm_vhd_configuration_and_offline_discovery\n";
-    std::error_code ec;
-    std::filesystem::path scratch = "scratch_auto_arm_test";
-    std::filesystem::remove_all(scratch, ec);
-    std::filesystem::create_directories(scratch, ec);
-
-    // 1. Test Configuration default and toggle
-    Configuration cfg = Configuration::create_default();
-    assert(cfg.auto_arm_vhd_on_boot() == true);
-    cfg.set_auto_arm_vhd_on_boot(false);
-    assert(cfg.auto_arm_vhd_on_boot() == false);
-
-    // 2. Test persistence in conf file
-    std::filesystem::path conf_path = scratch / "test_auto_arm.conf";
-    assert(cfg.save_to_file(conf_path).is_ok());
-
-    Configuration loaded;
-    assert(loaded.load_from_file(conf_path).is_ok());
-    assert(loaded.auto_arm_vhd_on_boot() == false);
-
-    cfg.set_auto_arm_vhd_on_boot(true);
-    assert(cfg.save_to_file(conf_path).is_ok());
-    assert(loaded.load_from_file(conf_path).is_ok());
-    assert(loaded.auto_arm_vhd_on_boot() == true);
-
-    // 2b. Legacy `nic_profile` / `nic_profile.<image>` keys are still *accepted* so an
-    //     existing cobdiskless.conf keeps loading, but they are inert: the native-VHD
-    //     pivot removed the vendor profile election together with the per-image pin, so
-    //     there is nothing left for them to configure.
-    const std::filesystem::path profile_conf = scratch / "nic_profile.conf";
-    {
-        std::ofstream out(profile_conf, std::ios::trunc);
-        out << "# comment\n"
-               "nic_profile = realtek\n"
-               "nic_profile.m71s = realtek\n"
-               "nic_profile.desk96 = intel\n";
-    }
-    Configuration from_text;
-    assert(from_text.load_from_file(profile_conf).is_ok());
-
-    // 3. Test arming an offline SYSTEM hive directly via arm_vhd_image
-    const std::vector<std::pair<std::string, uint32_t>> initial_services = {
-        {"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}
-    };
-    const std::filesystem::path hive_file = scratch / "SYSTEM";
-    {
-        auto hive_bytes = PnpDriverArmer::create_synthetic_system_hive(1, initial_services);
-        std::ofstream out(hive_file, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(hive_bytes.data()), static_cast<std::streamsize>(hive_bytes.size()));
-    }
-    // Also create companion transaction logs (.LOG1, .LOG2) to ensure they are truncated/wiped
-    const std::filesystem::path log1 = scratch / "SYSTEM.LOG1";
-    const std::filesystem::path log2 = scratch / "SYSTEM.LOG2";
-    {
-        std::ofstream l1(log1, std::ios::binary);
-        l1 << "DIRTY_TRANSACTION_LOG_1";
-        std::ofstream l2(log2, std::ios::binary);
-        l2 << "DIRTY_TRANSACTION_LOG_2";
-    }
-    assert(std::filesystem::exists(log1, ec) && std::filesystem::file_size(log1, ec) > 0);
-    assert(std::filesystem::exists(log2, ec) && std::filesystem::file_size(log2, ec) > 0);
-
-    // Execute arm_vhd_image on the hive_file
-    auto arm_res = PnpDriverArmer::arm_vhd_image(hive_file);
-    assert(arm_res.is_ok());
-    assert(arm_res.value().success);
-    assert(!arm_res.value().armed_services.empty());
-
-    // Verify companion logs were cleaned up (unlinked or truncated to 0 bytes)
-    if (std::filesystem::exists(log1, ec)) {
-        assert(std::filesystem::file_size(log1, ec) == 0);
-    }
-    if (std::filesystem::exists(log2, ec)) {
-        assert(std::filesystem::file_size(log2, ec) == 0);
-    }
-
-    // 4. Test non-existent image returns error
-    auto missing_res = PnpDriverArmer::arm_vhd_image(scratch / "non_existent.vhd");
-    assert(missing_res.is_err());
-
-    std::filesystem::remove_all(scratch, ec);
-    std::cout << "  PASS: test_auto_arm_vhd_configuration_and_offline_discovery\n";
-}
-
-void test_guest_arch_detection() {
-    std::cout << "[RUN] test_guest_arch_detection\n";
-
-    std::error_code ec;
-    const std::filesystem::path scratch = "test_scratch_guest_arch";
-    std::filesystem::remove_all(scratch, ec);
-    std::filesystem::create_directories(scratch, ec);
-
-    // ------------------------------------------------------------------
-    // 1. Pure architecture classification (PE Machine field + volume layout)
-    // ------------------------------------------------------------------
-    assert(PnpDriverArmer::classify_pe_machine(0x8664) == GuestArch::X64); // IMAGE_FILE_MACHINE_AMD64
-    assert(PnpDriverArmer::classify_pe_machine(0x014C) == GuestArch::X86); // IMAGE_FILE_MACHINE_I386
-    assert(PnpDriverArmer::classify_pe_machine(0x01C4) == GuestArch::Unknown);
-    assert(PnpDriverArmer::classify_volume_layout(true, GuestArch::Unknown) == GuestArch::X64);
-    assert(PnpDriverArmer::classify_volume_layout(true, GuestArch::X86) == GuestArch::X64);
-    assert(PnpDriverArmer::classify_volume_layout(false, GuestArch::X86) == GuestArch::X86);
-    assert(PnpDriverArmer::classify_volume_layout(false, GuestArch::Unknown) == GuestArch::Unknown);
-    assert(PnpDriverArmer::arch_name(GuestArch::X64) == "x64");
-    assert(PnpDriverArmer::arch_name(GuestArch::X86) == "x86");
-    assert(PnpDriverArmer::arch_name(GuestArch::Unknown) == "unknown");
-
-    // ------------------------------------------------------------------
-    // 2. Guest architecture detection from a mounted VHD volume
-    // ------------------------------------------------------------------
-    auto write_pe_image = [&](const std::filesystem::path& pe_path, uint16_t machine) {
-        std::filesystem::create_directories(pe_path.parent_path(), ec);
-        std::vector<uint8_t> image(0x100, 0);
-        image[0x00] = 'M';
-        image[0x01] = 'Z';
-        const uint32_t lfanew = 0x80;
-        image[0x3C] = static_cast<uint8_t>(lfanew & 0xFF);
-        image[0x3D] = static_cast<uint8_t>((lfanew >> 8) & 0xFF);
-        image[0x80] = 'P';
-        image[0x81] = 'E';
-        image[0x82] = 0;
-        image[0x83] = 0;
-        image[0x84] = static_cast<uint8_t>(machine & 0xFF);
-        image[0x85] = static_cast<uint8_t>((machine >> 8) & 0xFF);
-        std::ofstream out(pe_path, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
-    };
-
-    const std::filesystem::path vol_x64 = scratch / "vol_x64";
-    const std::filesystem::path vol_x86 = scratch / "vol_x86";
-    const std::filesystem::path vol_bare = scratch / "vol_bare";
-
-    // x64 guest: SysWOW64 present (primary signal) + AMD64 ntoskrnl (corroborating).
-    write_pe_image(vol_x64 / "Windows" / "System32" / "ntoskrnl.exe", 0x8664);
-    std::filesystem::create_directories(vol_x64 / "Windows" / "SysWOW64", ec);
-    // x86 guest: no SysWOW64, I386 ntoskrnl.
-    write_pe_image(vol_x86 / "Windows" / "System32" / "ntoskrnl.exe", 0x014C);
-    // Layout without a readable kernel image -> undetermined.
-    std::filesystem::create_directories(vol_bare / "Windows" / "System32", ec);
-
-    assert(PnpDriverArmer::detect_guest_arch(vol_x64) == GuestArch::X64);
-    assert(PnpDriverArmer::detect_guest_arch(vol_x64 / "Windows") == GuestArch::X64);
-    assert(PnpDriverArmer::detect_guest_arch(vol_x86) == GuestArch::X86);
-    assert(PnpDriverArmer::detect_guest_arch(vol_bare) == GuestArch::Unknown);
-    assert(PnpDriverArmer::detect_guest_arch(scratch / "not_a_volume") == GuestArch::Unknown);
-
-    std::filesystem::remove_all(scratch, ec);
-    std::cout << "  PASS: test_guest_arch_detection\n";
-}
-
-void test_stage15_crash_dump_paging_and_offload_kill_switch() {
-    std::cout << "[RUN] test_stage15_crash_dump_paging_and_offload_kill_switch\n";
-
-    // UTF-16LE REG_MULTI_SZ payload with a single string + final terminator
-    auto multi_sz = [](const std::string& s) {
-        std::vector<uint8_t> out;
-        out.reserve((s.size() + 2) * 2);
-        for (char c : s) {
-            out.push_back(static_cast<uint8_t>(c));
-            out.push_back(0);
-        }
-        out.push_back(0);
-        out.push_back(0);
-        return out;
-    };
-
-    // ------------------------------------------------------------------------
-    // 1. Fresh synthetic hive: every Stage 15 fix is created from scratch.
-    //    VBoxNetLwf is seeded at Start = 0 (boot) to prove the native pass leaves an
-    //    unbound service alone -- there is no filter neutralisation either.
-    // ------------------------------------------------------------------------
-    auto hive = PnpDriverArmer::create_synthetic_system_hive(1, {
-        {"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}, {"VBoxNetLwf", 0}});
-
-    // Nothing under Control yet -- the armer has to create CrashControl / Memory Management.
-    assert(hive_open_path(hive, "ControlSet001\\Control\\CrashControl") == 0xFFFFFFFF);
-
-    auto first = PnpDriverArmer::arm_hive_buffer(hive);
-    assert(first.is_ok());
-    const auto& rep = first.value();
-    assert(rep.success);
-    assert(rep.crash_dump_disabled);
-    assert(rep.paging_files_cleared);
-    assert(rep.tcpip_offload_disabled);
-    assert(rep.message.find("Stage 15") != std::string::npos);
-
-    uint32_t v = 0;
-    const uint32_t crash = hive_open_path(hive, "ControlSet001\\Control\\CrashControl");
-    assert(crash != 0xFFFFFFFF);
-    assert(hive_get_dword(hive, crash, "CrashDumpEnabled", &v) && v == 0);   // no kernel dump stack
-    assert(hive_get_dword(hive, crash, "LogEvent", &v) && v == 0);
-    assert(hive_get_dword(hive, crash, "SendAlert", &v) && v == 0);
-    assert(hive_get_dword(hive, crash, "AutoReboot", &v) && v == 0);         // no reboot loop
-    assert(hive_get_dword(hive, crash, "DisplayParameters", &v) && v == 1);  // BSOD shows the 4 arguments
-    assert(hive_value_type(hive, crash, "CrashDumpEnabled") == 4);           // REG_DWORD
-
-    const uint32_t mm = hive_open_path(hive, "ControlSet001\\Control\\Session Manager\\Memory Management");
-    assert(mm != 0xFFFFFFFF);
-    assert(hive_get_string(hive, mm, "PagingFiles").empty());
-    assert(hive_get_string(hive, mm, "ExistingPageFiles").empty());
-    assert(hive_value_type(hive, mm, "PagingFiles") == 7);        // REG_MULTI_SZ
-    assert(hive_value_type(hive, mm, "ExistingPageFiles") == 7);
-
-    const uint32_t tcp = hive_open_path(hive, "ControlSet001\\Services\\Tcpip\\Parameters");
-    assert(tcp != 0xFFFFFFFF);
-    assert(hive_get_dword(hive, tcp, "DisableTaskOffload", &v) && v == 1);  // global offload kill switch
-
-    const uint32_t vbox = hive_open_path(hive, "ControlSet001\\Services\\VBoxNetLwf");
-    assert(vbox != 0xFFFFFFFF);
-    assert(hive_get_dword(hive, vbox, "Start", &v) && v == 0);              // untouched, never demoted
-    // ...and it is never promoted into the boot-armed service set either.
-    assert(std::find(rep.armed_services.begin(), rep.armed_services.end(), "VBoxNetLwf") ==
-           rep.armed_services.end());
-
-    // ------------------------------------------------------------------------
-    // 2. Re-corrupt the armed state and arm again: an image that already HAS a
-    //    paging file / dump stack / offload must be corrected, not skipped.
-    // ------------------------------------------------------------------------
-    assert(hive_poke_dword(hive, crash, "CrashDumpEnabled", 1));      // dump stack on again
-    assert(hive_poke_dword(hive, crash, "AutoReboot", 1));
-    assert(hive_poke_dword(hive, crash, "DisplayParameters", 0));     // hide the bugcheck arguments
-    // The MULTI_SZ data cell only has room for one UTF-16 char; "A" is enough to
-    // make the value non-empty (i.e. a paging file that must be cleared).
-    assert(hive_poke_string_data(hive, mm, "PagingFiles", multi_sz("A")));
-    assert(hive_poke_string_data(hive, mm, "ExistingPageFiles", multi_sz("A")));
-    assert(hive_poke_dword(hive, tcp, "DisableTaskOffload", 0));
-    assert(hive_poke_dword(hive, vbox, "Start", 0));
-
-    // Pre-state sanity: the image really is back in the failing configuration.
-    assert(hive_get_dword(hive, crash, "CrashDumpEnabled", &v) && v == 1);
-    assert(!hive_get_string(hive, mm, "PagingFiles").empty());
-    assert(hive_get_dword(hive, tcp, "DisableTaskOffload", &v) && v == 0);
-    assert(hive_get_dword(hive, vbox, "Start", &v) && v == 0);
-
-    auto second = PnpDriverArmer::arm_hive_buffer(hive);
-    assert(second.is_ok());
-    assert(second.value().success);
-    assert(second.value().crash_dump_disabled);
-    assert(second.value().paging_files_cleared);
-    assert(second.value().tcpip_offload_disabled);
-
-    assert(hive_get_dword(hive, crash, "CrashDumpEnabled", &v) && v == 0);
-    assert(hive_get_dword(hive, crash, "AutoReboot", &v) && v == 0);
-    assert(hive_get_dword(hive, crash, "DisplayParameters", &v) && v == 1);
-    assert(hive_get_string(hive, mm, "PagingFiles").empty());
-    assert(hive_get_string(hive, mm, "ExistingPageFiles").empty());
-    assert(hive_value_type(hive, mm, "PagingFiles") == 7);
-    assert(hive_get_dword(hive, tcp, "DisableTaskOffload", &v) && v == 1);
-    assert(hive_get_dword(hive, vbox, "Start", &v) && v == 0);
-
-    // ------------------------------------------------------------------------
-    // 3. No VBoxNetLwf on the image: the key must NOT be invented.
-    // ------------------------------------------------------------------------
-    auto hive_no_vbox = PnpDriverArmer::create_synthetic_system_hive(1, {
-        {"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}});
-    auto third = PnpDriverArmer::arm_hive_buffer(hive_no_vbox);
-    assert(third.is_ok());
-    assert(third.value().success);
-    assert(third.value().crash_dump_disabled);
-    assert(third.value().paging_files_cleared);
-    assert(third.value().tcpip_offload_disabled);
-    assert(hive_open_path(hive_no_vbox, "ControlSet001\\Services\\VBoxNetLwf") == 0xFFFFFFFF);
-
-    // ------------------------------------------------------------------------
-    // 4. End-to-end: the flushed SYSTEM hive file carries every fix.
-    // ------------------------------------------------------------------------
-    const std::filesystem::path scratch = "test_scratch_stage15";
-    std::error_code ec;
-    std::filesystem::remove_all(scratch, ec);
-    std::filesystem::create_directories(scratch / "Windows" / "System32" / "config", ec);
-    const std::filesystem::path hive_path = scratch / "Windows" / "System32" / "config" / "SYSTEM";
-    {
-        auto file_hive = PnpDriverArmer::create_synthetic_system_hive(1, {
-            {"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}, {"VBoxNetLwf", 0}});
-        std::ofstream out(hive_path, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(file_hive.data()),
-                  static_cast<std::streamsize>(file_hive.size()));
-    }
-
-    auto e2e = PnpDriverArmer::arm_offline_system_hive(hive_path);
-    assert(e2e.is_ok());
-    const auto& e2e_rep = e2e.value();
-    assert(e2e_rep.success);
-    assert(e2e_rep.crash_dump_disabled);
-    assert(e2e_rep.paging_files_cleared);
-    assert(e2e_rep.tcpip_offload_disabled);
-
-    std::ifstream armed_in(hive_path, std::ios::binary);
-    const std::vector<uint8_t> armed((std::istreambuf_iterator<char>(armed_in)),
-                                     std::istreambuf_iterator<char>());
-    assert(armed.size() >= 8192);
-
-    const uint32_t e2e_crash = hive_open_path(armed, "ControlSet001\\Control\\CrashControl");
-    assert(e2e_crash != 0xFFFFFFFF);
-    assert(hive_get_dword(armed, e2e_crash, "CrashDumpEnabled", &v) && v == 0);
-    assert(hive_get_dword(armed, e2e_crash, "SendAlert", &v) && v == 0);
-    assert(hive_get_dword(armed, e2e_crash, "AutoReboot", &v) && v == 0);
-    assert(hive_get_dword(armed, e2e_crash, "DisplayParameters", &v) && v == 1);
-
-    const uint32_t e2e_mm = hive_open_path(armed, "ControlSet001\\Control\\Session Manager\\Memory Management");
-    assert(e2e_mm != 0xFFFFFFFF);
-    assert(hive_get_string(armed, e2e_mm, "PagingFiles").empty());
-    assert(hive_get_string(armed, e2e_mm, "ExistingPageFiles").empty());
-    assert(hive_value_type(armed, e2e_mm, "PagingFiles") == 7);
-
-    const uint32_t e2e_tcp = hive_open_path(armed, "ControlSet001\\Services\\Tcpip\\Parameters");
-    assert(e2e_tcp != 0xFFFFFFFF);
-    assert(hive_get_dword(armed, e2e_tcp, "DisableTaskOffload", &v) && v == 1);
-
-    const uint32_t e2e_vbox = hive_open_path(armed, "ControlSet001\\Services\\VBoxNetLwf");
-    assert(e2e_vbox != 0xFFFFFFFF);
-    assert(hive_get_dword(armed, e2e_vbox, "Start", &v) && v == 0);
-
-    // Header stays clean and self-consistent after the extra writes.
-    const uint32_t pseq = hive_rd32(&armed[0x04]);
-    const uint32_t sseq = hive_rd32(&armed[0x08]);
-    assert(pseq == sseq);
-    assert(PnpDriverArmer::calculate_regf_header_checksum(armed.data()) == hive_rd32(&armed[0x1FC]));
-
-    std::filesystem::remove_all(scratch, ec);
-    std::cout << "  PASS: test_stage15_crash_dump_paging_and_offload_kill_switch\n";
-}
-
-void test_os_family_detection_and_native_arming() {
-    std::cout << "[RUN] test_os_family_detection_and_native_arming\n";
-
-    std::error_code ec;
-    const std::filesystem::path scratch = "test_scratch_os_family";
-    std::filesystem::remove_all(scratch, ec);
-    std::filesystem::create_directories(scratch, ec);
-    using OF = GuestOsFamily;
-
-    auto write_bytes = [&](const std::filesystem::path& p, const std::vector<uint8_t>& bytes) {
-        std::filesystem::create_directories(p.parent_path(), ec);
-        std::ofstream out(p, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
-    };
-    auto read_bytes = [&](const std::filesystem::path& p) -> std::string {
-        std::ifstream in(p, std::ios::binary);
-        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    };
-
-    // ------------------------------------------------------------------
-    // 1. Pure OS version classifier. Reported only -- nothing gates on it:
-    //    a Legacy target gets exactly the same native treatment as a Modern one.
-    // ------------------------------------------------------------------
-    assert(PnpDriverArmer::os_family_name(OF::Legacy) == "legacy");
-    assert(PnpDriverArmer::os_family_name(OF::Modern) == "modern");
-    assert(PnpDriverArmer::os_family_name(OF::Unknown) == "unknown");
-
-    assert(PnpDriverArmer::classify_os_version(5, 1, 2600) == OF::Legacy);   // XP
-    assert(PnpDriverArmer::classify_os_version(5, 2, 3790) == OF::Legacy);   // Server 2003
-    assert(PnpDriverArmer::classify_os_version(6, 0, 6002) == OF::Legacy);   // Vista / 2008
-    assert(PnpDriverArmer::classify_os_version(6, 1, 7601) == OF::Legacy);   // Win7 / 2008 R2
-    assert(PnpDriverArmer::classify_os_version(6, 2, 9200) == OF::Modern);   // Win8 / 2012
-    assert(PnpDriverArmer::classify_os_version(6, 3, 9600) == OF::Modern);   // Win8.1 / 2012 R2
-    assert(PnpDriverArmer::classify_os_version(10, 0, 19041) == OF::Modern); // Win10 / 2016+
-    assert(PnpDriverArmer::classify_os_version(6, 2, 0) == OF::Modern);
-    // No evidence at all.
-    assert(PnpDriverArmer::classify_os_version(0, 0, 0) == OF::Unknown);
-
-    const std::vector<std::pair<std::string, uint32_t>> boot_services = {
-        {"msiscsi", 3}, {"Tcpip", 3}, {"NDIS", 3}, {"rt640x64", 3}};
-    const std::vector<PnpDriverArmer::SyntheticNetAdapter> rt_binding = {
-        {"0000", "Realtek PCIe GbE Family Controller", "PCI\\VEN_10EC&DEV_8168",
-         "pci\\ven_10ec&dev_8168", {}, "rt640x64"},
-    };
-
-    // Whatever the reported family is, the armer must have done exactly this much and
-    // nothing else: no CriticalDeviceDatabase, no flat driver Parameters mirror.
-    auto assert_native_arming = [&](std::vector<uint8_t>& hive) {
-        assert(hive_open_path(hive, "ControlSet001\\Control\\CriticalDeviceDatabase") ==
-               0xFFFFFFFF);
-        assert(hive_open_path(hive, "ControlSet001\\Services\\rt640x64\\Parameters") ==
-               0xFFFFFFFF);
-        const uint32_t rt = hive_open_path(hive, "ControlSet001\\Services\\rt640x64");
-        assert(rt != 0xFFFFFFFF);
-        uint32_t value = 0;
-        assert(hive_get_dword(hive, rt, "Start", &value) && value == 0);
-        assert(hive_get_dword(hive, rt, "BootFlags", &value) && value == 0x1);
-        const uint32_t tcp = hive_open_path(hive, "ControlSet001\\Services\\Tcpip");
-        assert(tcp != 0xFFFFFFFF);
-        assert(hive_get_dword(hive, tcp, "Start", &value) && value == 0);
-    };
-
-    // ------------------------------------------------------------------
-    // 2. Synthetic Legacy hive (6.1): the family is reported, never acted on
-    // ------------------------------------------------------------------
-    auto legacy_hive =
-        PnpDriverArmer::create_synthetic_system_hive(1, boot_services, rt_binding, "6.1");
-    assert(PnpDriverArmer::detect_os_family_from_hive(legacy_hive) == OF::Legacy);
-
-    auto legacy_res = PnpDriverArmer::arm_hive_buffer(legacy_hive);
-    assert(legacy_res.is_ok());
-    const auto& legacy_rep = legacy_res.value();
-    assert(legacy_rep.success);
-    assert(legacy_rep.guest_os_family == "legacy");
-    assert(legacy_rep.message.find("OS family legacy") != std::string::npos);
-    assert(legacy_rep.summary().find("Guest OS Family:   legacy") != std::string::npos);
-    assert(legacy_rep.iscsi_stack_armed);
-    assert(legacy_rep.boot_flags_armed);
-    assert_native_arming(legacy_hive);
-
-    // ------------------------------------------------------------------
-    // 3. Synthetic Modern hive (10.0): byte-for-byte identical treatment
-    // ------------------------------------------------------------------
-    auto modern_hive =
-        PnpDriverArmer::create_synthetic_system_hive(1, boot_services, rt_binding, "10.0");
-    assert(PnpDriverArmer::detect_os_family_from_hive(modern_hive) == OF::Modern);
-
-    auto modern_res = PnpDriverArmer::arm_hive_buffer(modern_hive);
-    assert(modern_res.is_ok());
-    const auto& modern_rep = modern_res.value();
-    assert(modern_res.is_ok());
-    assert(modern_rep.success);
-    assert(modern_rep.guest_os_family == "modern");
-    assert(modern_rep.message.find("OS family modern") != std::string::npos);
-    assert(modern_rep.iscsi_stack_armed);
-    assert(modern_rep.boot_flags_armed);
-    assert_native_arming(modern_hive);
-    assert(hive_open_path(modern_hive, "ControlSet001\\Control\\CrashControl") != 0xFFFFFFFF);
-
-    // ------------------------------------------------------------------
-    // 4. Re-arming either family is idempotent and injects nothing new
-    // ------------------------------------------------------------------
-    for (auto* hive_ptr : {&legacy_hive, &modern_hive}) {
-        auto again = PnpDriverArmer::arm_hive_buffer(*hive_ptr);
-        assert(again.is_ok() && again.value().success);
-        assert_native_arming(*hive_ptr);
-        assert(PnpDriverArmer::calculate_regf_header_checksum(hive_ptr->data()) ==
-               hive_rd32(&(*hive_ptr)[0x1FC]));
-    }
-
-    // ------------------------------------------------------------------
-    // 5. Offline volume detection: SYSTEM hive -> SOFTWARE hive -> ntoskrnl.exe
-    // ------------------------------------------------------------------
-    // (a) SYSTEM hive Control\Windows wins.
-    const std::filesystem::path vol_sys = scratch / "vol_sys";
-    write_bytes(vol_sys / "Windows" / "System32" / "config" / "SYSTEM",
-                PnpDriverArmer::create_synthetic_system_hive(1, boot_services, {}, "6.1"));
-    assert(PnpDriverArmer::detect_guest_os_family(vol_sys) == OF::Legacy);
-    assert(PnpDriverArmer::detect_guest_os_family(vol_sys / "Windows") == OF::Legacy);
-
-    // (b) No version in the SYSTEM hive -> the SOFTWARE hive's version key is read.
-    const std::filesystem::path vol_sw = scratch / "vol_sw";
-    write_bytes(vol_sw / "Windows" / "System32" / "config" / "SYSTEM",
-                PnpDriverArmer::create_synthetic_system_hive(1, boot_services));
-    write_bytes(vol_sw / "Windows" / "System32" / "config" / "SOFTWARE",
-                PnpDriverArmer::create_synthetic_system_hive(1, {}, {}, "10.0"));
-    assert(PnpDriverArmer::detect_guest_os_family(vol_sw) == OF::Modern);
-
-    // The same fallback works on one hive: Control\Windows without usable evidence
-    // falls through to Microsoft\Windows NT\CurrentVersion at the hive root.
-    auto fallback_hive = PnpDriverArmer::create_synthetic_system_hive(1, boot_services, {}, "10.0");
-    const uint32_t cs_win = hive_open_path(fallback_hive, "ControlSet001\\Control\\Windows");
-    assert(cs_win != 0xFFFFFFFF);
-    assert(hive_poke_dword(fallback_hive, cs_win, "CurrentMajorVersionNumber", 0));
-    assert(hive_poke_dword(fallback_hive, cs_win, "CurrentMinorVersionNumber", 0));
-    assert(hive_poke_string_data(fallback_hive, cs_win, "CurrentBuildNumber", {0, 0}));
-    assert(hive_poke_string_data(fallback_hive, cs_win, "CurrentVersion", {0, 0}));
-    assert(PnpDriverArmer::detect_os_family_from_hive(fallback_hive) == OF::Modern);
-
-    // (c) Neither hive carries a version -> the kernel's version resource settles it.
-    auto write_kernel = [&](const std::filesystem::path& pe_path, uint32_t major, uint32_t minor,
-                            uint32_t build) {
-        std::vector<uint8_t> image(0x400, 0);
-        image[0x00] = 'M';
-        image[0x01] = 'Z';
-        hive_wr32(image.data() + 0x3C, 0x80); // e_lfanew
-        image[0x80] = 'P';
-        image[0x81] = 'E';
-        image[0x82] = 0;
-        image[0x83] = 0;
-        // VS_FIXEDFILEINFO (signature 0xFEEF04BD + dwStrucVersion 0x00010000)
-        // at a DWORD-aligned file offset.
-        const size_t fixed = 0x200;
-        hive_wr32(image.data() + fixed + 0, 0xFEEF04BDu);
-        hive_wr32(image.data() + fixed + 4, 0x00010000u);
-        hive_wr32(image.data() + fixed + 8, (major << 16) | (minor & 0xFFFFu));
-        hive_wr32(image.data() + fixed + 12, (build & 0xFFFFu) << 16);
-        write_bytes(pe_path, image);
-    };
-
-    const std::filesystem::path vol_krnl = scratch / "vol_krnl";
-    write_kernel(vol_krnl / "Windows" / "System32" / "ntoskrnl.exe", 6, 1, 7601);
-    assert(PnpDriverArmer::detect_guest_os_family(vol_krnl) == OF::Legacy);
-    assert(PnpDriverArmer::detect_os_family_from_kernel(
-               vol_krnl / "Windows" / "System32" / "ntoskrnl.exe") == OF::Legacy);
-
-    const std::filesystem::path vol_krnl10 = scratch / "vol_krnl10";
-    write_kernel(vol_krnl10 / "Windows" / "System32" / "ntoskrnl.exe", 10, 0, 26100);
-    assert(PnpDriverArmer::detect_guest_os_family(vol_krnl10) == OF::Modern);
-
-    // No evidence anywhere, and no Windows tree at all.
-    const std::filesystem::path vol_junk = scratch / "vol_junk";
-    write_bytes(vol_junk / "Windows" / "System32" / "ntoskrnl.exe",
-                std::vector<uint8_t>{'n', 'o', 't', ' ', 'a', ' ', 'p', 'e'});
-    assert(PnpDriverArmer::detect_guest_os_family(vol_junk) == OF::Unknown);
-    assert(PnpDriverArmer::detect_guest_os_family(scratch / "nope") == OF::Unknown);
-    assert(PnpDriverArmer::detect_os_family_from_kernel(vol_junk / "no_such_kernel") == OF::Unknown);
-
-    // ------------------------------------------------------------------
-    // 6. End to end: arm_offline_system_hive carries the volume family into arming
-    // ------------------------------------------------------------------
-    const std::filesystem::path vol_e2e = scratch / "vol_e2e";
-    write_bytes(vol_e2e / "Windows" / "System32" / "config" / "SYSTEM",
-                PnpDriverArmer::create_synthetic_system_hive(1, boot_services, {}, "10.0"));
-    auto e2e_res =
-        PnpDriverArmer::arm_offline_system_hive(vol_e2e / "Windows" / "System32" / "config" / "SYSTEM");
-    assert(e2e_res.is_ok());
-    const auto& e2e_rep = e2e_res.value();
-    assert(e2e_rep.success);
-    assert(e2e_rep.guest_os_family == "modern");
-
-    // ------------------------------------------------------------------
-    // 7. The armer never stages a .sys: the guest's drivers directory is
-    //    left byte-for-byte as the image shipped it, and the DriverStore is
-    //    never even opened.
-    // ------------------------------------------------------------------
-    const std::filesystem::path vol_stage = scratch / "vol_stage";
-    const std::filesystem::path drivers_dir = vol_stage / "Windows" / "System32" / "drivers";
-    const std::vector<uint8_t> installed_binary = {'I', 'N', 'B', 'O', 'X', '_', 'V', 'E',
-                                                   'N', 'D', 'O', 'R', '_', 'B', 'I', 'N',
-                                                   'A', 'R', 'Y'};
-    write_bytes(drivers_dir / "bnxtre.sys", installed_binary);
-    write_bytes(vol_stage / "Windows" / "System32" / "config" / "SYSTEM",
-                PnpDriverArmer::create_synthetic_system_hive(1, boot_services, rt_binding,
-                                                             "10.0"));
-
-    auto stage_res = PnpDriverArmer::arm_vhd_image(vol_stage);
-    assert(stage_res.is_ok());
-    assert(stage_res.value().success);
-    assert(read_bytes(drivers_dir / "bnxtre.sys") ==
-           std::string(installed_binary.begin(), installed_binary.end()));
-    size_t shipped = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(drivers_dir, ec)) {
-        if (entry.is_regular_file()) ++shipped;
-    }
-    assert(shipped == 1);
-    assert(!std::filesystem::exists(vol_stage / "Windows" / "System32" / "DriverStore", ec));
-
-    std::filesystem::remove_all(scratch, ec);
-    std::cout << "  PASS: test_os_family_detection_and_native_arming\n";
-}
-
-// ---------------------------------------------------------------------------
-// Read-only offline hive inspection.
-//
-// Inspection is a diagnostic, not a decision maker: it reports what the image
-// carries (Start / BootFlags / Parameters per boot service, the Net class
-// bindings, the SHA-256 identity of the binaries it ships). It never
-// recommends -- let alone performs -- a demotion, and there is no
-// "BOOT CONFLICT" verdict any more: a native image legitimately carries more
-// than one vendor miniport, and the armer arms every service its own Net class
-// instances are bound to.
-// ---------------------------------------------------------------------------
-void test_offline_hive_inspection() {
-    std::cout << "[RUN] test_offline_hive_inspection\n";
-
-    auto mentions = [](const std::vector<std::string>& haystack, const std::string& needle) {
-        return std::any_of(haystack.begin(), haystack.end(),
-                           [&](const std::string& s) { return s.find(needle) != std::string::npos; });
-    };
-
-    // ---- 1. SHA-256 known-answer vectors (the inspection's binary identity check) ----
-    assert(PnpDriverArmer::sha256_hex(nullptr, 0) ==
-           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    const char* abc = "abc";
-    assert(PnpDriverArmer::sha256_hex(reinterpret_cast<const uint8_t*>(abc), 3) ==
-           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    const char* two_block = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
-    assert(PnpDriverArmer::sha256_hex(reinterpret_cast<const uint8_t*>(two_block),
-                                      std::strlen(two_block)) ==
-           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-    assert(PnpDriverArmer::sha256_file("definitely-not-a-real-file.sys").empty());
-
-    // ---- 2. A dual-vendor image: nobody is demoted, nobody loses its boot flag -------
-    const std::vector<std::pair<std::string, uint32_t>> dual_boot_services = {
-        {"msiscsi", 3}, {"Tcpip", 1}, {"NDIS", 1}, {"rt640x64", 0}, {"e1d68x64", 0}};
-
-    const std::vector<PnpDriverArmer::SyntheticNetAdapter> both = {
-        {"0000", "Realtek PCIe GbE Family Controller", "PCI\\VEN_10EC&DEV_8168",
-         "pci\\ven_10ec&dev_8168", {}, "rt640x64"},
-        {"0001", "Intel(R) Ethernet Connection I219-LM", "PCI\\VEN_8086&DEV_15B8",
-         "pci\\ven_8086&dev_15b8", {}, "e1d68x64"},
-    };
-    // A poisoned flat key an earlier (deprecated) pass parked under the Realtek service.
-    const std::vector<PnpDriverArmer::SyntheticServiceParameter> poisoned = {
-        {"rt640x64", "*EEE", false, 0, "1"},
-        {"rt640x64", "PowerSavingMode", true, 1, ""},
-        {"rt640x64", "PnPCapabilities", true, 0x00000018, ""},
-    };
-    const std::string rt_params = "ControlSet001\\Services\\rt640x64\\Parameters";
-
-    auto hive = PnpDriverArmer::create_synthetic_system_hive(
-        1, dual_boot_services, both, "", poisoned);
-    auto arm_res = PnpDriverArmer::arm_hive_buffer(hive);
-    assert(arm_res.is_ok());
-    const auto& rep = arm_res.value();
-    assert(rep.success);
-    assert(rep.iscsi_stack_armed);
-    assert(rep.boot_flags_armed);
-    assert(mentions(rep.armed_services, "rt640x64"));
-    assert(mentions(rep.armed_services, "e1d68x64"));
-    uint32_t dw = 0xFFFFFFFF;
-    for (const char* svc : {"rt640x64", "e1d68x64"}) {
-        const uint32_t off =
-            hive_open_path(hive, std::string("ControlSet001\\Services\\") + svc);
-        assert(off != 0xFFFFFFFF);
-        assert(hive_get_dword(hive, off, "Start", &dw) && dw == 0);
-        assert(hive_get_dword(hive, off, "BootFlags", &dw) && dw == 0x1);
-    }
-    // The poisoned key is neither purged nor extended: the native armer writes no
-    // per-adapter value and deletes nothing.
-    {
-        const uint32_t seeded = hive_open_path(hive, rt_params);
-        assert(seeded != 0xFFFFFFFF);
-        assert(hive_get_dword(hive, seeded, "PowerSavingMode", &dw) && dw == 1);
-        assert(hive_get_dword(hive, seeded, "PnPCapabilities", &dw) && dw == 0x00000018);
-        assert(hive_get_string(hive, seeded, "*EEE") == "1");
-    }
-    assert(hive_open_path(hive, "ControlSet001\\Control\\CriticalDeviceDatabase") ==
-           0xFFFFFFFF);
-    // All that cell surgery must leave a self-consistent regf header.
-    assert(PnpDriverArmer::calculate_regf_header_checksum(hive.data()) ==
-           hive_rd32(&hive[0x1FC]));
-
-    // ---- 3. Read-only inspection of the armed buffer --------------------------------
-    auto insp_res = PnpDriverArmer::inspect_hive_buffer(hive);
-    assert(insp_res.is_ok());
-    const auto& insp = insp_res.value();
-    assert(insp.success);
-    assert(insp.control_set == "ControlSet001");
-    assert(insp.net_adapters.size() == 2);
-    assert(!insp.summary().empty());
-    assert(insp.summary().find("=== CobDiskless Offline SYSTEM Hive Inspection ===") == 0);
-    assert(mentions(insp.findings,
-                    "Services\\msiscsi: Start=0 (SERVICE_BOOT_START), BootFlags=1"));
-    assert(mentions(insp.findings,
-                    "Services\\rt640x64: Start=0 (SERVICE_BOOT_START), BootFlags=1"));
-    assert(mentions(insp.findings,
-                    "Services\\e1d68x64: Start=0 (SERVICE_BOOT_START), BootFlags=1"));
-    assert(mentions(insp.findings, "Parameters present"));
-    assert(mentions(insp.findings, "Services\\iscsiprt: ABSENT"));
-    assert(mentions(insp.findings, "0000"));
-    assert(mentions(insp.findings, "0001"));
-    // Two boot families side by side is a legitimate native image, not a defect.
-    assert(!mentions(insp.findings, "BOOT CONFLICT"));
-    assert(!mentions(insp.findings, "HAZARD"));
-    assert(!mentions(insp.findings, "CriticalDeviceDatabase"));
-
-    for (const auto& svc : insp.nic_services) {
-        if (svc.service_name == "rt640x64" || svc.service_name == "e1d68x64" ||
-            svc.service_name == "msiscsi") {
-            assert(svc.present && svc.start == 0);
-            assert(svc.has_boot_flags && svc.boot_flags == 0x1);
-            assert(svc.service_name != "rt640x64" || svc.has_parameters);
-        } else if (svc.service_name == "iscsiprt") {
-            assert(!svc.present);
-        }
-    }
-
-    // ---- 4. inspect -> arm -> re-inspect round trip on a real hive file -------------
-    std::error_code ec;
-    const std::filesystem::path scratch = "test_scratch_offline_inspection";
-    std::filesystem::remove_all(scratch, ec);
-    std::filesystem::create_directories(scratch, ec);
-    const std::filesystem::path hive_file = scratch / "SYSTEM";
-
-    const auto dual_hive = PnpDriverArmer::create_synthetic_system_hive(
-        1, dual_boot_services, both, "", poisoned);
-    {
-        std::ofstream out(hive_file, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(dual_hive.data()),
-                  static_cast<std::streamsize>(dual_hive.size()));
-    }
-    assert(std::filesystem::exists(hive_file, ec));
-
-    auto pre_res = PnpDriverArmer::inspect_offline_hive(hive_file);
-    assert(pre_res.is_ok());
-    assert(pre_res.value().success);
-    assert(mentions(pre_res.value().findings, "Services\\rt640x64: Start=0"));
-
-    auto arm_file = PnpDriverArmer::arm_offline_system_hive(hive_file);
-    assert(arm_file.is_ok());
-    assert(arm_file.value().success);
-
-    auto post_res = PnpDriverArmer::inspect_offline_hive(hive_file);
-    assert(post_res.is_ok());
-    const auto& post = post_res.value();
-    assert(post.success);
-    assert(!mentions(post.findings, "BOOT CONFLICT"));
-    for (const auto& svc : post.nic_services) {
-        if (svc.service_name == "rt640x64" || svc.service_name == "e1d68x64") {
-            assert(svc.present && svc.start == 0);
-            assert(svc.has_boot_flags && svc.boot_flags == 0x1);
-        }
-    }
-    // The poisoned key survived both passes untouched, and the hive is still a regf.
-    {
-        std::ifstream in(hive_file, std::ios::binary);
-        std::vector<uint8_t> on_disk((std::istreambuf_iterator<char>(in)),
-                                     std::istreambuf_iterator<char>());
-        assert(on_disk.size() >= 8192);
-        assert(std::string(reinterpret_cast<const char*>(on_disk.data()), 4) == "regf");
-        const uint32_t params = hive_open_path(on_disk, rt_params);
-        assert(params != 0xFFFFFFFF);
-        assert(hive_get_string(on_disk, params, "*EEE") == "1");
-        assert(hive_open_path(on_disk, "ControlSet001\\Control\\CriticalDeviceDatabase") ==
-               0xFFFFFFFF);
-    }
-
-    std::filesystem::remove_all(scratch, ec);
-    std::cout << "  PASS: test_offline_hive_inspection\n";
-}
-
-void test_boot_resilience_timeout_and_mounted_devices_sanitization() {
-    std::cout << "[RUN] test_boot_resilience_timeout_and_mounted_devices_sanitization\n";
-
-    // 1. Construct a synthetic hive with:
-    //    - Services: Disk (TimeOutValue=10 initially), msiscsi (Start=0), Tcpip (Start=0), rt640x64 (Start=3)
-    //    - Preseeded rt640x64\Parameters\*EEE = "1"
-    //    - MountedDevices containing:
-    //        \DosDevices\C: -> "\\??\\Volume{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}"
-    //        \DosDevices\D: -> "\\??\\Volume{11111111-2222-3333-4444-555555555555}"
-    std::vector<std::pair<std::string, uint32_t>> initial_services = {
-        {"Disk", 0},
-        {"msiscsi", 0},
-        {"Tcpip", 0},
-        {"rt640x64", 3}
-    };
-    std::vector<PnpDriverArmer::SyntheticNetAdapter> adapters = {
-        {"0000", "Realtek PCIe GBE Family Controller", "PCI\\VEN_10EC&DEV_8168", "rt640x64", {}, "rt640x64"}
-    };
-    std::vector<PnpDriverArmer::SyntheticServiceParameter> pre_params = {
-        {"rt640x64", "*EEE", false, 0, "1"}
-    };
-    std::vector<std::pair<std::string, std::string>> mounted_devs = {
-        {"\\DosDevices\\C:", "\\??\\Volume{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}"},
-        {"\\DosDevices\\D:", "\\??\\Volume{11111111-2222-3333-4444-555555555555}"}
-    };
-
-    std::vector<uint8_t> hive_buf = PnpDriverArmer::create_synthetic_system_hive(
-        1, initial_services, adapters, "10.0", pre_params, {}, mounted_devs
-    );
-
-    // Verify initial preconditions before injection
-    uint32_t md_pre = hive_open_path(hive_buf, "MountedDevices");
-    assert(md_pre != 0xFFFFFFFF);
-    assert(!hive_get_string(hive_buf, md_pre, "\\DosDevices\\C:").empty());
-    assert(!hive_get_string(hive_buf, md_pre, "\\DosDevices\\D:").empty());
-
-    uint32_t rt_params_pre = hive_open_path(hive_buf, "ControlSet001\\Services\\rt640x64\\Parameters");
-    assert(rt_params_pre != 0xFFFFFFFF);
-    assert(hive_get_string(hive_buf, rt_params_pre, "*EEE") == "1");
-
-    // 2. Invoke inject_boot_resilience_parameters
-    auto res = PnpDriverArmer::inject_boot_resilience_parameters(hive_buf);
-    assert(res.is_ok());
-
-    // 3. Verify Disk timeout value = 60
-    uint32_t disk_off = hive_open_path(hive_buf, "ControlSet001\\Services\\Disk");
-    assert(disk_off != 0xFFFFFFFF);
-    uint32_t disk_timeout = 0;
-    assert(hive_get_dword(hive_buf, disk_off, "TimeOutValue", &disk_timeout));
-    assert(disk_timeout == 60);
-
-    // 4. Verify msiscsi\Parameters timeouts (LinkDownTime=60, MaxRequestHoldTime=60)
-    uint32_t iscsi_params = hive_open_path(hive_buf, "ControlSet001\\Services\\msiscsi\\Parameters");
-    assert(iscsi_params != 0xFFFFFFFF);
-    uint32_t link_down = 0, hold_time = 0;
-    assert(hive_get_dword(hive_buf, iscsi_params, "LinkDownTime", &link_down));
-    assert(link_down == 60);
-    assert(hive_get_dword(hive_buf, iscsi_params, "MaxRequestHoldTime", &hold_time));
-    assert(hold_time == 60);
-
-    // 5. Verify Tcpip\Parameters (TcpMaxDataRetransmissions=10, DisableTaskOffload=1)
-    uint32_t tcp_params = hive_open_path(hive_buf, "ControlSet001\\Services\\Tcpip\\Parameters");
-    assert(tcp_params != 0xFFFFFFFF);
-    uint32_t tcp_retrans = 0, offload_dis = 0;
-    assert(hive_get_dword(hive_buf, tcp_params, "TcpMaxDataRetransmissions", &tcp_retrans));
-    assert(tcp_retrans == 10);
-    assert(hive_get_dword(hive_buf, tcp_params, "DisableTaskOffload", &offload_dis));
-    assert(offload_dis == 1);
-
-    // 6. Verify rt640x64\Parameters PHY anti-flap values
-    uint32_t rt_params = hive_open_path(hive_buf, "ControlSet001\\Services\\rt640x64\\Parameters");
-    assert(rt_params != 0xFFFFFFFF);
-    uint32_t wait_autoneg = 0;
-    assert(hive_get_dword(hive_buf, rt_params, "WaitAutoNegComplete", &wait_autoneg));
-    assert(wait_autoneg == 1);
-    assert(hive_get_string(hive_buf, rt_params, "*EEE") == "0");
-    assert(hive_get_string(hive_buf, rt_params, "AutoPowerSave") == "0");
-    assert(hive_get_string(hive_buf, rt_params, "GigaLite") == "0");
-    assert(hive_get_string(hive_buf, rt_params, "*FlowControl") == "0");
-
-    // 6b. Verify rt640x64 service is armed with Start=0 (boot-start) and BootFlags=1
-    uint32_t rt_svc = hive_open_path(hive_buf, "ControlSet001\\Services\\rt640x64");
-    assert(rt_svc != 0xFFFFFFFF);
-    uint32_t rt_start = 0xFFFFFFFF, rt_bootflags = 0;
-    assert(hive_get_dword(hive_buf, rt_svc, "Start", &rt_start) && rt_start == 0);
-    assert(hive_get_dword(hive_buf, rt_svc, "BootFlags", &rt_bootflags) && rt_bootflags == 1);
-
-    // 7. Verify MountedDevices: \DosDevices\C: purged, \DosDevices\D: preserved
-    uint32_t md_post = hive_open_path(hive_buf, "MountedDevices");
-    assert(md_post != 0xFFFFFFFF);
-    assert(hive_get_string(hive_buf, md_post, "\\DosDevices\\C:").empty());
-    assert(!hive_get_string(hive_buf, md_post, "\\DosDevices\\D:").empty());
-
-    // 8. Verify REGF header clean (primary_seq == secondary_seq) and checksum valid
-    uint32_t prim_seq = hive_rd32(hive_buf.data() + 0x04);
-    uint32_t sec_seq = hive_rd32(hive_buf.data() + 0x08);
-    assert(prim_seq == sec_seq);
-    uint32_t expected_csum = PnpDriverArmer::calculate_regf_header_checksum(hive_buf.data());
-    uint32_t actual_csum = hive_rd32(hive_buf.data() + 0x1FC);
-    assert(expected_csum == actual_csum);
-
-    // 9. Verify raw pointer buffer overload inject_boot_resilience_parameters(uint8_t*, size_t)
-    std::vector<uint8_t> hive_buf2 = PnpDriverArmer::create_synthetic_system_hive(
-        1, initial_services, adapters, "10.0", pre_params, {}, mounted_devs
-    );
-    auto raw_res = PnpDriverArmer::inject_boot_resilience_parameters(hive_buf2.data(), hive_buf2.size());
-    assert(raw_res.is_ok());
-    uint32_t disk_off2 = hive_open_path(hive_buf2, "ControlSet001\\Services\\Disk");
-    uint32_t disk_timeout2 = 0;
-    assert(hive_get_dword(hive_buf2, disk_off2, "TimeOutValue", &disk_timeout2));
-    assert(disk_timeout2 == 60);
-
-    std::cout << "  PASS: test_boot_resilience_timeout_and_mounted_devices_sanitization\n";
-}
-
-void test_cddb_injection() {
-    std::cout << "[RUN] test_cddb_injection\n";
-
-    // Build a minimal synthetic SYSTEM hive that has a ControlSet001 root but no
-    // CriticalDeviceDatabase key yet (initial_services only has Disk to keep it small).
-    std::vector<std::pair<std::string, uint32_t>> initial_services = {
-        {"Disk", 0},
-    };
-    std::vector<PnpDriverArmer::SyntheticNetAdapter> adapters = {
-        {"0000", "Realtek PCIe GBE Family Controller", "PCI\\VEN_10EC&DEV_8168", "rt640x64", {}, "rt640x64"}
-    };
-    std::vector<PnpDriverArmer::SyntheticServiceParameter> pre_params = {};
-    std::vector<std::pair<std::string, std::string>> mounted_devs = {};
-
-    std::vector<uint8_t> hive_buf = PnpDriverArmer::create_synthetic_system_hive(
-        1, initial_services, adapters, "10.0", pre_params, {}, mounted_devs
-    );
-
-    // Pre-condition: CriticalDeviceDatabase must NOT exist before injection
-    uint32_t cddb_pre = hive_open_path(hive_buf, "ControlSet001\\Control\\CriticalDeviceDatabase");
-    assert(cddb_pre == 0xFFFFFFFF);
-
-    // Invoke injection
-    auto res = PnpDriverArmer::inject_boot_resilience_parameters(hive_buf);
-    assert(res.is_ok());
-
-    // ---- Assert the CDDB subkey was created ----
-    uint32_t cddb_off = hive_open_path(hive_buf, "ControlSet001\\Control\\CriticalDeviceDatabase");
-    assert(cddb_off != 0xFFFFFFFF);
-
-    // Helper: open a CDDB hardware-ID subkey and assert Service + ClassGUID values
-    auto check_cddb_entry = [&](const std::string& hw_id,
-                                const std::string& expected_service) {
-        uint32_t hw_off = hive_open_path(hive_buf,
-            "ControlSet001\\Control\\CriticalDeviceDatabase\\" + hw_id);
-        assert(hw_off != 0xFFFFFFFF);
-        assert(hive_get_string(hive_buf, hw_off, "Service") == expected_service);
-        assert(hive_get_string(hive_buf, hw_off, "ClassGUID") ==
-               "{4d36e972-e325-11ce-bfc1-08002be10318}");
-    };
-
-    // Realtek 1GbE (rt640x64)
-    check_cddb_entry("pci#ven_10ec&dev_8168", "rt640x64");
-    check_cddb_entry("pci#ven_10ec&dev_8169", "rt640x64");
-    check_cddb_entry("pci#ven_10ec&dev_8136", "rt640x64");
-
-    // Realtek 2.5GbE (rt68cx64)
-    check_cddb_entry("pci#ven_10ec&dev_8125", "rt68cx64");
-
-    // Intel 1GbE (e1d68x64)
-    check_cddb_entry("pci#ven_8086&dev_15b8", "e1d68x64");
-    check_cddb_entry("pci#ven_8086&dev_15d7", "e1d68x64");
-    check_cddb_entry("pci#ven_8086&dev_15e3", "e1d68x64");
-
-    // Intel 2.5GbE (e2f68)
-    check_cddb_entry("pci#ven_8086&dev_15f3", "e2f68");
-    check_cddb_entry("pci#ven_8086&dev_125b", "e2f68");
-
-    // REGF header must have a valid checksum after injection
-    uint32_t expected_csum = PnpDriverArmer::calculate_regf_header_checksum(hive_buf.data());
-    uint32_t hdr_csum = hive_rd32(hive_buf.data() + 0x1FC);
-    assert(expected_csum == hdr_csum);
-
-    // Idempotency: a second injection must not corrupt the hive and must still pass
-    auto res2 = PnpDriverArmer::inject_boot_resilience_parameters(hive_buf);
-    assert(res2.is_ok());
-    uint32_t cddb_off2 = hive_open_path(hive_buf, "ControlSet001\\Control\\CriticalDeviceDatabase");
-    assert(cddb_off2 != 0xFFFFFFFF);
-    check_cddb_entry("pci#ven_10ec&dev_8168", "rt640x64");
-
-    std::cout << "  PASS: test_cddb_injection\n";
-}
-
-
-//
-// Builds the smallest PE image the offline readers accept and drives version / section
-// extraction from an offline binary: attributing a faulting offset (0xE534) to .text and
-// reading a driver's VS_VERSIONINFO without ever loading it.
-
-namespace {
-
-// DOS header -> PE\0\0 -> COFF header -> PE32+ optional header -> a two-entry Section
-// Table (.text at RVA 0x1000 with 0xD800 bytes, .data at 0xF000) -> a complete
-// VS_VERSION_INFO resource at file offset 0x400 carrying both the VS_FIXEDFILEINFO
-// numbers and the StringFileInfo strings. Every node is 4-byte aligned, exactly like the
-// version resource a real rt640x64.sys ships.
-std::vector<uint8_t> build_driver_pe(const std::string& file_version,
-                                     const std::string& product_version,
-                                     const std::string& file_version_string,
-                                     const std::string& product_version_string) {
-    auto put_u16 = [](std::vector<uint8_t>& out, uint16_t value) {
-        out.push_back(static_cast<uint8_t>(value & 0xFF));
-        out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
-    };
-    auto put_u32 = [](std::vector<uint8_t>& out, uint32_t value) {
-        for (int shift = 0; shift < 32; shift += 8) {
-            out.push_back(static_cast<uint8_t>((value >> shift) & 0xFF));
-        }
-    };
-    auto put_wstr = [](std::vector<uint8_t>& out, const std::string& text) {
-        for (char c : text) {
-            out.push_back(static_cast<uint8_t>(c));
-            out.push_back(0);
-        }
-        out.push_back(0);
-        out.push_back(0);
-    };
-    auto pad4 = [](std::vector<uint8_t>& out) {
-        while (out.size() % 4 != 0) out.push_back(0);
-    };
-    auto patch_len = [](std::vector<uint8_t>& out) {
-        const uint16_t length = static_cast<uint16_t>(out.size());
-        out[0] = static_cast<uint8_t>(length & 0xFF);
-        out[1] = static_cast<uint8_t>((length >> 8) & 0xFF);
-    };
-    auto version_pair = [](const std::string& text, uint32_t* ms, uint32_t* ls) {
-        unsigned part[4] = {0, 0, 0, 0};
-        size_t pos = 0;
-        for (unsigned i = 0; i < 4 && pos < text.size(); ++i) {
-            unsigned value = 0;
-            while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
-                value = value * 10u + static_cast<unsigned>(text[pos] - '0');
-                ++pos;
-            }
-            part[i] = value & 0xFFFFu;
-            if (pos < text.size() && text[pos] == '.') ++pos;
-        }
-        *ms = (part[0] << 16) | part[1];
-        *ls = (part[2] << 16) | part[3];
-    };
-
-    uint32_t file_ms = 0;
-    uint32_t file_ls = 0;
-    uint32_t prod_ms = 0;
-    uint32_t prod_ls = 0;
-    version_pair(file_version, &file_ms, &file_ls);
-    version_pair(product_version, &prod_ms, &prod_ls);
-
-    auto string_node = [&](const std::string& key, const std::string& value) {
-        std::vector<uint8_t> node;
-        put_u16(node, 0);                                        // wLength, patched
-        put_u16(node, static_cast<uint16_t>(value.size() + 1));  // characters incl. NUL
-        put_u16(node, 1);                                        // text
-        put_wstr(node, key);
-        pad4(node);
-        put_wstr(node, value);
-        patch_len(node);
-        return node;
-    };
-    auto branch_node = [&](const std::string& key, uint16_t type,
-                           const std::vector<std::vector<uint8_t>>& children) {
-        std::vector<uint8_t> node;
-        put_u16(node, 0);  // wLength, patched
-        put_u16(node, 0);  // no value
-        put_u16(node, type);
-        put_wstr(node, key);
-        pad4(node);
-        for (const auto& child : children) {
-            node.insert(node.end(), child.begin(), child.end());
-            pad4(node);
-        }
-        patch_len(node);
-        return node;
-    };
-
-    const auto string_table =
-        branch_node("040904B0", 1, {string_node("FileVersion", file_version_string),
-                                    string_node("ProductVersion", product_version_string)});
-    const auto string_file_info = branch_node("StringFileInfo", 1, {string_table});
-
-    std::vector<uint8_t> resource;
-    put_u16(resource, 0);     // wLength, patched
-    put_u16(resource, 0x34);  // VS_FIXEDFILEINFO is 52 bytes
-    put_u16(resource, 0);     // binary value
-    put_wstr(resource, "VS_VERSION_INFO");
-    pad4(resource);  // -> 40 bytes, so the fixed info starts on a 4-byte boundary
-    put_u32(resource, 0xFEEF04BD);
-    put_u32(resource, 0x00010000);
-    put_u32(resource, file_ms);
-    put_u32(resource, file_ls);
-    put_u32(resource, prod_ms);
-    put_u32(resource, prod_ls);
-    for (int i = 0; i < 7; ++i) put_u32(resource, 0);  // flags/OS/type/subtype/date
-    resource.insert(resource.end(), string_file_info.begin(), string_file_info.end());
-    pad4(resource);
-    patch_len(resource);
-
-    std::vector<uint8_t> image(0x1000, 0);
-    image[0] = 'M';
-    image[1] = 'Z';
-    image[0x3C] = 0x80;  // e_lfanew
-    image[0x80] = 'P';
-    image[0x81] = 'E';
-
-    const size_t coff = 0x84;
-    image[coff + 0] = 0x64;   // Machine = IMAGE_FILE_MACHINE_AMD64
-    image[coff + 1] = 0x86;
-    image[coff + 2] = 2;      // NumberOfSections
-    image[coff + 16] = 0xE0;  // SizeOfOptionalHeader (PE32+)
-
-    const size_t optional = coff + 20;  // 0x98
-    image[optional] = 0x0B;             // OptionalHeader Magic = PE32+
-    image[optional + 1] = 0x02;
-
-    const size_t table = optional + 0xE0;  // 0x178
-    auto write_section = [&](size_t at, const char* name, uint32_t virtual_size,
-                             uint32_t virtual_address, uint32_t raw_size,
-                             uint32_t characteristics) {
-        for (size_t i = 0; i < 8 && name[i] != '\0'; ++i) {
-            image[at + i] = static_cast<uint8_t>(name[i]);
-        }
-        auto write_u32 = [&](size_t offset, uint32_t value) {
-            image[at + offset + 0] = static_cast<uint8_t>(value & 0xFF);
-            image[at + offset + 1] = static_cast<uint8_t>((value >> 8) & 0xFF);
-            image[at + offset + 2] = static_cast<uint8_t>((value >> 16) & 0xFF);
-            image[at + offset + 3] = static_cast<uint8_t>((value >> 24) & 0xFF);
-        };
-        write_u32(8, virtual_size);
-        write_u32(12, virtual_address);
-        write_u32(16, raw_size);
-        write_u32(36, characteristics);
-    };
-    write_section(table, ".text", 0xD800, 0x1000, 0x400, 0x60000020);
-    write_section(table + 40, ".data", 0x2000, 0xF000, 0x200, 0xC0000040);
-
-    const size_t resource_offset = 0x400;
-    assert(resource_offset + resource.size() <= image.size());
-    std::copy(resource.begin(), resource.end(), image.begin() + static_cast<long>(resource_offset));
-    return image;
-}
-
-} // namespace
-
-void test_pe_version_extraction() {
-    std::cout << "[RUN] test_pe_version_extraction\n";
-
-    // ---- 1. Version resource + section table straight out of an offline PE ----------
-    const auto modern = build_driver_pe("10.39.1118.2021", "10.39.0.0",
-                                        "10.39.1118.2021", "10.39.0.0");
-    const auto modern_info = PnpDriverArmer::parse_pe_version_info(modern);
-    assert(modern_info.valid);
-    assert(modern_info.file_version == "10.39.1118.2021");
-    assert(modern_info.product_version == "10.39.0.0");
-    assert(modern_info.file_version_string == "10.39.1118.2021");
-    assert(modern_info.product_version_string == "10.39.0.0");
-
-    const auto modern_sections = PnpDriverArmer::parse_pe_sections(modern);
-    assert(modern_sections.size() == 2);
-    assert(modern_sections[0].name == ".text");
-    assert(modern_sections[0].virtual_address == 0x1000);
-    assert(modern_sections[0].virtual_size == 0xD800);
-    assert(modern_sections[1].name == ".data");
-    assert(modern_sections[1].virtual_address == 0xF000);
-
-    // The incident offset must be attributable to code, not merely "somewhere in the file".
-    assert(PnpDriverArmer::find_section_index_for_rva(modern_sections, 0xE534) == 0);
-    assert(PnpDriverArmer::find_section_index_for_rva(modern_sections, 0x1000) == 0);
-    assert(PnpDriverArmer::find_section_index_for_rva(modern_sections, 0xE800) == -1);
-    assert(PnpDriverArmer::find_section_index_for_rva(modern_sections, 0xF000) == 1);
-    assert(PnpDriverArmer::find_section_index_for_rva(modern_sections, 0x0000) == -1);
-
-    // Anything that is not a PE image must degrade to "unknown" instead of throwing.
-    const std::vector<uint8_t> garbage(64, 0x41);
-    assert(!PnpDriverArmer::parse_pe_version_info(garbage).valid);
-    assert(PnpDriverArmer::parse_pe_sections(garbage).empty());
-    std::vector<uint8_t> mz_only(0x80, 0);
-    mz_only[0] = 'M';
-    mz_only[1] = 'Z';
-    mz_only[0x3C] = 0x40;  // e_lfanew points at zeros, not PE\0\0
-    assert(!PnpDriverArmer::parse_pe_version_info(mz_only).valid);
-    assert(PnpDriverArmer::parse_pe_sections(mz_only).empty());
-    assert(!PnpDriverArmer::read_pe_version_info("definitely-not-a-real-driver.sys").valid);
-    assert(PnpDriverArmer::read_pe_sections("definitely-not-a-real-driver.sys").empty());
-
-    // Reading the same binary from disk gives the same answer as parsing the buffer.
-    const std::filesystem::path pe_file = "test_scratch_pe_identity.sys";
-    {
-        std::ofstream out(pe_file, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(modern.data()),
-                  static_cast<std::streamsize>(modern.size()));
-    }
-    const auto from_disk = PnpDriverArmer::read_pe_version_info(pe_file);
-    assert(from_disk.valid);
-    assert(from_disk.file_version == "10.39.1118.2021");
-    const auto sections_on_disk = PnpDriverArmer::read_pe_sections(pe_file);
-    assert(sections_on_disk.size() == 2);
-    assert(sections_on_disk[0].name == ".text");
-    std::error_code ec;
-    std::filesystem::remove(pe_file, ec);
-
-    std::cout << "  PASS: test_pe_version_extraction\n";
-}
-
-// ---------------------------------------------------------------------------
-// NT volume GUID root resolution.
-//
-// A mounted VHD hands the CLI `\\?\Volume{GUID}\Windows\System32\config\SYSTEM`.
-// On this toolchain std::filesystem::path applies POSIX separator rules to that
-// string, so parent_path() yields "" and every ancestor walk collapses
-// immediately -- the armer then logged
-//   "Could not resolve a volume root above \\?\Volume{...}\Windows\System32\config\SYSTEM"
-// and silently skipped the NDIS harvest and OS-family classification for the
-// whole pass. The namespace is therefore parsed as text FIRST and never walked.
-// ---------------------------------------------------------------------------
-void test_volume_root_guid_parsing() {
-    std::cout << "[RUN] test_volume_root_guid_parsing\n";
-
-    const std::string vol = "\\\\?\\Volume{3e128489-0000-0000-0000-602200000000}";
-
-    // ---- 1. Pure prefix extraction (no filesystem access at all) ----------------
-    assert(PnpDriverArmer::nt_volume_guid_root(
-               vol + "\\Windows\\System32\\config\\SYSTEM").string() == vol);
-    // Case-insensitive `Volume{`; both separators accepted after the closing brace.
-    assert(PnpDriverArmer::nt_volume_guid_root(
-               "\\\\?\\volume{ABCDEF00-1111-2222-3333-444444444444}/Windows/System32/config/SYSTEM")
-               .string() == "\\\\?\\volume{ABCDEF00-1111-2222-3333-444444444444}");
-    // Only the namespace prefix is returned -- the Windows directory below it is not.
-    assert(PnpDriverArmer::nt_volume_guid_root(vol + "\\").string() == vol);
-
-    // Not a namespace: unclosed GUID, missing separator, plain drive path, relative path.
-    assert(PnpDriverArmer::nt_volume_guid_root("\\\\?\\Volume{abc\\Windows").empty());
-    assert(PnpDriverArmer::nt_volume_guid_root("\\\\?\\Volume{abc}Windows").empty());
-    assert(PnpDriverArmer::nt_volume_guid_root("\\\\?\\NotAVolume{abc}\\Windows").empty());
-    assert(PnpDriverArmer::nt_volume_guid_root("C:\\Windows\\System32\\config\\SYSTEM").empty());
-    assert(PnpDriverArmer::nt_volume_guid_root("config\\SYSTEM").empty());
-    assert(PnpDriverArmer::nt_volume_guid_root("").empty());
-
-    // ---- 2. volume_root_from_hive: a namespace path is never walked -------------
-    // `<root>\Windows` does not exist for this (deliberately absent) GUID, so the
-    // honest answer is "": no walking, and above all no wrong-but-non-empty root
-    // that would disable the harvest for the whole pass.
-    assert(PnpDriverArmer::volume_root_from_hive(
-               "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\Windows\\System32\\config\\SYSTEM")
-               .empty());
-
-    // ---- 3. The real volume this machine boots from ----------------------------
-    // Live proof of the positive branch: `<volume>\Windows` exists, so the resolver
-    // hands back exactly `\\?\Volume{...}` (no trailing separator, never the walk).
-    wchar_t win_dir[400] = {0};
-    wchar_t vol_path[400] = {0};
-    wchar_t vol_name[400] = {0};
-    if (GetWindowsDirectoryW(win_dir, 400) != 0 &&
-        GetVolumePathNameW(win_dir, vol_path, 400) &&
-        GetVolumeNameForVolumeMountPointW(vol_path, vol_name, 400)) {
-        std::string root = std::filesystem::path(vol_name).string();
-        while (!root.empty() && (root.back() == '\\' || root.back() == '/')) root.pop_back();
-        assert(!root.empty());
-
-        const std::filesystem::path probe(root + "\\Windows\\System32\\config\\SYSTEM");
-        assert(PnpDriverArmer::nt_volume_guid_root(probe).string() == root);
-        assert(PnpDriverArmer::volume_root_from_hive(probe).string() == root);
-        // A directory under the same volume is NOT the volume root.
-        assert(PnpDriverArmer::volume_root_from_hive(
-                   root + "\\Windows\\System32\\drivers\\etc\\hosts").string() == root);
-    }
-
-    // ---- 4. Plain directory trees still resolve by walking ----------------------
-    std::error_code ec;
-    const std::filesystem::path scratch = "test_scratch_volume_guid";
-    std::filesystem::remove_all(scratch, ec);
-    std::filesystem::create_directories(scratch / "Windows" / "System32" / "config", ec);
-
-    assert(PnpDriverArmer::volume_root_from_hive(
-               scratch / "Windows" / "System32" / "config" / "SYSTEM").string() == scratch.string());
-    // Nothing above a path with no Windows tree -> "" (never a wrong-but-non-empty root).
-    assert(PnpDriverArmer::volume_root_from_hive("no_such_tree/Windows/System32/config/SYSTEM").empty());
-
-    std::filesystem::remove_all(scratch, ec);
-    std::cout << "  PASS: test_volume_root_guid_parsing\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -10136,95 +10188,6 @@ void test_tftp_standard_rrq_rfc1350() {
 }
 
 // ---------------------------------------------------------------------------
-// Early-boot hardening registry contract: the two fixes that decide whether a
-// network-disk guest survives Phase 0 at all.
-//
-//   * Services\disk\TimeOutValue = 60        -> no 0x7A / 0x7B on a slow LUN
-//   * Tcpip\Parameters\DisableTaskOffload=1  -> global LSO/checksum kill switch
-//
-// The per-adapter *LsoV2* / *ChecksumOffload* REG_SZ writes that used to ride
-// along with them are gone: DisableTaskOffload kills the same offloads
-// kernel-wide without teaching each miniport a keyword it may not implement.
-// ---------------------------------------------------------------------------
-void test_early_boot_hardening_registry() {
-    std::cout << "[RUN] test_early_boot_hardening_registry\n";
-
-    const std::string inst_prefix =
-        "ControlSet001\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}\\";
-
-    const std::vector<PnpDriverArmer::SyntheticNetAdapter> adapters = {
-        {"0000", "Realtek PCIe GbE Family Controller", "PCI\\VEN_10EC&DEV_8168",
-         "pci\\ven_10ec&dev_8168", full_anti_flap_ndi_schema(), "rt640x64"},
-    };
-    const std::vector<std::pair<std::string, uint32_t>> services = {
-        {"msiscsi", 3}, {"rt640x64", 0}, {"Tcpip", 1}, {"NDIS", 1}};
-
-    auto assert_hardened = [&](const std::vector<uint8_t>& hive) {
-        uint32_t v = 0xFFFFFFFF;
-
-        // (1) disk class I/O timeout, strictly as a REG_DWORD
-        const uint32_t disk = hive_open_path(hive, "ControlSet001\\Services\\disk");
-        assert(disk != 0xFFFFFFFF);
-        assert(hive_value_type(hive, disk, "TimeOutValue") == 4 /* REG_DWORD */);
-        assert(hive_get_dword(hive, disk, "TimeOutValue", &v) && v == 60);
-
-        // (2) global offload kill, strictly as a REG_DWORD
-        const uint32_t tcp = hive_open_path(hive, "ControlSet001\\Services\\Tcpip\\Parameters");
-        assert(tcp != 0xFFFFFFFF);
-        assert(hive_value_type(hive, tcp, "DisableTaskOffload") == 4 /* REG_DWORD */);
-        assert(hive_get_dword(hive, tcp, "DisableTaskOffload", &v) && v == 1);
-
-        // (3) ...and not one per-adapter anti-flap / offload value anywhere, however
-        //     complete the miniport's Ndi\params schema says it is.
-        const uint32_t inst = hive_open_path(hive, inst_prefix + "0000");
-        assert(inst != 0xFFFFFFFF);
-        for (const char* kw : {"*LsoV2IPv4", "*LsoV2IPv6", "*IPChecksumOffloadIPv4",
-                               "*TCPChecksumOffloadIPv4", "*UDPChecksumOffloadIPv4",
-                               "*TCPChecksumOffloadIPv6", "*UDPChecksumOffloadIPv6",
-                               "PnPCapabilities", "*WaitAutoNegComplete"}) {
-            assert(hive_value_type(hive, inst, kw) == 0xFFFFFFFF);
-        }
-        assert(hive_open_path(hive, "ControlSet001\\Services\\rt640x64\\Parameters") ==
-               0xFFFFFFFF);
-    };
-
-    auto hive = PnpDriverArmer::create_synthetic_system_hive(1, services, adapters, "10.0");
-
-    // Nothing of this exists on a fresh image -- the armer has to create it.
-    assert(hive_open_path(hive, "ControlSet001\\Services\\disk") == 0xFFFFFFFF);
-    assert(hive_open_path(hive, "ControlSet001\\Services\\Tcpip\\Parameters") == 0xFFFFFFFF);
-
-    auto first = PnpDriverArmer::arm_hive_buffer(hive);
-    assert(first.is_ok());
-    assert(first.value().success);
-    assert(first.value().disk_timeout_armed);
-    assert(first.value().tcpip_offload_disabled);
-    assert(first.value().summary().find("Disk I/O Timeout") != std::string::npos);
-    assert(first.value().summary().find("EXTENDED (TimeOutValue=60)") != std::string::npos);
-    assert(first.value().summary().find("KILLED (DisableTaskOffload=1)") != std::string::npos);
-    assert_hardened(hive);
-
-    // ---- Re-corrupt and re-arm: already-corrected state must be corrected again ----
-    const uint32_t disk = hive_open_path(hive, "ControlSet001\\Services\\disk");
-    const uint32_t tcp = hive_open_path(hive, "ControlSet001\\Services\\Tcpip\\Parameters");
-    assert(disk != 0xFFFFFFFF && tcp != 0xFFFFFFFF);
-    assert(hive_poke_dword(hive, disk, "TimeOutValue", 10));
-    assert(hive_poke_dword(hive, tcp, "DisableTaskOffload", 0));
-    uint32_t v = 0;
-    assert(hive_get_dword(hive, disk, "TimeOutValue", &v) && v == 10);
-    assert(hive_get_dword(hive, tcp, "DisableTaskOffload", &v) && v == 0);
-
-    auto second = PnpDriverArmer::arm_hive_buffer(hive);
-    assert(second.is_ok());
-    assert(second.value().success);
-    assert(second.value().disk_timeout_armed);
-    assert(second.value().tcpip_offload_disabled);
-    assert_hardened(hive);
-
-    std::cout << "  PASS: test_early_boot_hardening_registry\n";
-}
-
-// ---------------------------------------------------------------------------
 // StationManager: auto-registration, sequential numbering/IPs, persistence
 // ---------------------------------------------------------------------------
 void test_station_manager_auto_registration_and_persistence() {
@@ -10414,7 +10377,7 @@ void test_dhcp_uefi_arch_routing_and_host_name_option() {
         return "";
     };
 
-    // 1. BIOS x86 (Arch 0) -> undionly.kpxe
+    // 1. BIOS x86 (Arch 0) -> cobpxe.kpxe
     {
         auto pkt = make_discover_packet(0x01, 0);
         auto parse = DhcpServer::parse_packet(pkt);
@@ -10423,10 +10386,10 @@ void test_dhcp_uefi_arch_routing_and_host_name_option() {
         auto reply = server.build_reply(*hdr, parse.value(), 2, NetworkAddress(192, 168, 1, 101));
         assert(reply.is_ok());
         const auto* rhdr = reinterpret_cast<const DhcpHeader*>(reply.value().data());
-        assert(std::string(reinterpret_cast<const char*>(rhdr->file)) == "undionly.kpxe");
+        assert(std::string(reinterpret_cast<const char*>(rhdr->file)) == "cobpxe.kpxe");
     }
 
-    // 2. UEFI x64 (Arch 7) standard -> ipxe.efi
+    // 2. UEFI x64 (Arch 7) standard -> cobpxe.efi
     {
         auto pkt = make_discover_packet(0x02, 7);
         auto parse = DhcpServer::parse_packet(pkt);
@@ -10435,10 +10398,10 @@ void test_dhcp_uefi_arch_routing_and_host_name_option() {
         auto reply = server.build_reply(*hdr, parse.value(), 2, NetworkAddress(192, 168, 1, 102));
         assert(reply.is_ok());
         const auto* rhdr = reinterpret_cast<const DhcpHeader*>(reply.value().data());
-        assert(std::string(reinterpret_cast<const char*>(rhdr->file)) == "ipxe.efi");
+        assert(std::string(reinterpret_cast<const char*>(rhdr->file)) == "cobpxe.efi");
     }
 
-    // 3. UEFI x64 alternate (Arch 9) -> ipxe.efi
+    // 3. UEFI x64 alternate (Arch 9) -> cobpxe.efi
     {
         auto pkt = make_discover_packet(0x03, 9);
         auto parse = DhcpServer::parse_packet(pkt);
@@ -10447,7 +10410,7 @@ void test_dhcp_uefi_arch_routing_and_host_name_option() {
         auto reply = server.build_reply(*hdr, parse.value(), 2, NetworkAddress(192, 168, 1, 103));
         assert(reply.is_ok());
         const auto* rhdr = reinterpret_cast<const DhcpHeader*>(reply.value().data());
-        assert(std::string(reinterpret_cast<const char*>(rhdr->file)) == "ipxe.efi");
+        assert(std::string(reinterpret_cast<const char*>(rhdr->file)) == "cobpxe.efi");
     }
 
     // 4. Station with custom UEFI override (MAC 11:22:33:44:55:66) -> custom_ipxe.efi
@@ -10957,12 +10920,12 @@ void test_dhcp_station_boot_mode_precedence() {
     };
 
     // 1. Wire architecture (DHCP Option 93) takes precedence over station config:
-    assert(bootfile_of(0x01, 7) == "ipxe.efi");      // wire says UEFI (7) -> ipxe.efi (station pinned bios ignored)
-    assert(bootfile_of(0x02, 0) == "undionly.kpxe"); // wire says BIOS (0) -> undionly.kpxe (station pinned uefi ignored)
+    assert(bootfile_of(0x01, 7) == "cobpxe.efi");      // wire says UEFI (7) -> cobpxe.efi (station pinned bios ignored)
+    assert(bootfile_of(0x02, 0) == "cobpxe.kpxe"); // wire says BIOS (0) -> cobpxe.kpxe (station pinned uefi ignored)
 
     // 2. No configured station -> Option 93 decides exactly as before.
-    assert(bootfile_of(0x03, 0) == "undionly.kpxe");
-    assert(bootfile_of(0x03, 7) == "ipxe.efi");
+    assert(bootfile_of(0x03, 0) == "cobpxe.kpxe");
+    assert(bootfile_of(0x03, 7) == "cobpxe.efi");
 
     // 3. A station's per-station UEFI bootloader override still applies.
     StationEntry custom;
@@ -11010,14 +10973,14 @@ void test_station_scoped_boot_script_rendering() {
     daemon.set_station_manager(smgr);
     daemon.set_server_ip(NetworkAddress(192, 168, 1, 100));
 
-    // --- 1. CSM station: dedicated IQN, INT13 sanboot, no sanhook ------------
+    // --- 1. CSM station: dedicated IQN, sanhook + sanboot --drive 0x80 ------------
     const HttpResponse csm_resp =
         daemon.handle_request("GET", "/boot.ipxe", "", "10.10.10.10");
     assert(csm_resp.status == 200);
     assert(csm_resp.body.find(
-               "sanboot iscsi:192.168.1.100::::"
+               "sanhook --drive 0x80 iscsi:192.168.1.100::::"
                "iqn.2026-09.com.cobdiskless:PC-CSM") != std::string::npos);
-    assert(csm_resp.body.find("sanhook") == std::string::npos);
+    assert(csm_resp.body.find("sanboot --drive 0x80") != std::string::npos);
 
     // --- 2. UEFI station: sanhook first, then the standard sanboot ----------
     const HttpResponse uefi_resp =
@@ -11026,16 +10989,20 @@ void test_station_scoped_boot_script_rendering() {
     assert(uefi_resp.body.find(
                "sanhook --drive 0x80 iscsi:192.168.1.100::::"
                "iqn.2026-09.com.cobdiskless:PC-UEFI") != std::string::npos);
-    assert(uefi_resp.body.find("sanboot --no-describe\n") != std::string::npos);
+    assert(uefi_resp.body.find("sanboot --drive 0x80") != std::string::npos);
     assert(uefi_resp.body.find(":storage") == std::string::npos);
 
-    // --- 3. Unresolvable caller keeps the shared-target script unchanged -----
+    // --- 3. Unresolvable caller re-identifies instead of attaching -----------
+    // It cannot be mapped to a station from the caller IP alone, so sanbooting
+    // here would attach a machine nobody has provisioned for. Re-chaining with
+    // the MAC lets the second hop decide: station, enrolled, or naming prompt.
     const HttpResponse other =
         daemon.handle_request("GET", "/boot.ipxe", "", "10.10.10.99");
     assert(other.status == 200);
     assert(other.body.find(
-               "sanboot iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:storage") !=
-           std::string::npos);
+               "/boot.ipxe?mac=${net0/mac}&platform=${platform}") != std::string::npos);
+    assert(other.body.find("sanboot") == std::string::npos);
+    assert(other.body.find("sanhook") == std::string::npos);
 
     // --- 4. Regression guards -----------------------------------------------
     // whoami still resolves the caller from its IP: no ?mac= required.
@@ -11044,13 +11011,15 @@ void test_station_scoped_boot_script_rendering() {
     assert(who.status == 200);
     assert(who.body.find("PC-UEFI") != std::string::npos);
 
-    // No station manager wired at all -> shared script, no crash, no sanhook.
+    // No station manager wired at all -> re-identify first, no crash, no sanhook.
     HttpDaemon bare(NetworkAddress(127, 0, 0, 1, 0));
     bare.set_server_ip(NetworkAddress(192, 168, 1, 100));
     const HttpResponse bare_resp = bare.handle_request("GET", "/boot.ipxe");
     assert(bare_resp.status == 200);
     assert(bare_resp.body.find("sanhook") == std::string::npos);
-    assert(bare_resp.body.find(":storage") != std::string::npos);
+    assert(bare_resp.body.find("sanboot") == std::string::npos);
+    assert(bare_resp.body.find(
+               "/boot.ipxe?mac=${net0/mac}&platform=${platform}") != std::string::npos);
 
     std::filesystem::remove(test_file, ec);
     std::cout << "  PASS: test_station_scoped_boot_script_rendering\n";
@@ -11227,8 +11196,8 @@ void test_writeback_isolation_across_different_baselines() {
     assert(failures.load() == 0);
 
     // --- 5. Each station owns a dedicated writeback file ---------------------
-    const std::filesystem::path csm_overlay = wb_dir / "wb_00_11_22_33_44_AA.cow";
-    const std::filesystem::path uefi_overlay = wb_dir / "wb_00_11_22_33_44_BB.cow";
+    const std::filesystem::path csm_overlay = wb_dir / "wb_0011223344aa.cow";
+    const std::filesystem::path uefi_overlay = wb_dir / "wb_0011223344bb.cow";
     assert(std::filesystem::exists(csm_overlay));
     assert(std::filesystem::exists(uefi_overlay));
     assert(csm_overlay != uefi_overlay);
@@ -11381,6 +11350,149 @@ void test_tftp_tsize_only_bypasses_oack() {
     WSACleanup();
 #endif
     std::cout << "  PASS: test_tftp_tsize_only_bypasses_oack\n";
+}
+
+void test_tftp_dynamic_arch_and_reboot_grace() {
+    std::cout << "[RUN] test_tftp_dynamic_arch_and_reboot_grace\n";
+    std::error_code ec;
+    const std::filesystem::path dir = "test_scratch_tftp_grace";
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    // Create bootloader binaries in dir
+    {
+        std::ofstream u(dir / "undionly.kpxe", std::ios::binary);
+        u << "BIOS_UNDIONLY_KPXE_PAYLOAD";
+        std::ofstream e(dir / "ipxe.efi", std::ios::binary);
+        e << "UEFI_IPXE_EFI_PAYLOAD";
+    }
+
+    // 1. Verify Option 2348 block size negotiation with blksize=1456
+    auto make_rrq = [](const std::string& file,
+                       const std::vector<std::pair<std::string, std::string>>& opts) {
+        std::vector<uint8_t> pkt = {0x00, 0x01};
+        auto put = [&](std::string_view s) {
+            pkt.insert(pkt.end(), s.begin(), s.end());
+            pkt.push_back(0x00);
+        };
+        put(file);
+        put("octet");
+        for (const auto& kv : opts) {
+            put(kv.first);
+            put(kv.second);
+        }
+        return pkt;
+    };
+
+    auto rrq_1456 = TftpServer::parse_rrq(make_rrq("undionly.kpxe", {{"blksize", "1456"}, {"tsize", "0"}}));
+    assert(rrq_1456.is_ok());
+    assert(rrq_1456.value().options.has_blksize);
+    assert(rrq_1456.value().options.blksize == 1456);
+    assert(rrq_1456.value().options.requires_oack());
+
+    // 2. Set up DHCP and verify client architecture detection (Option 93)
+    auto dhcp = std::make_shared<DhcpServer>(NetworkAddress(192, 168, 1, 1));
+    DhcpHeader req_hdr{};
+    req_hdr.op = 1; // BOOTREQUEST
+    DhcpDiscoveredOptions disc_opts{};
+    disc_opts.message_type = 1; // Discover
+    disc_opts.client_mac = "52:54:00:12:34:03";
+    disc_opts.client_arch = ClientArch::Efi_x64;
+    NetworkAddress client_ip(192, 168, 1, 150);
+    auto rep_res = dhcp->build_reply(req_hdr, disc_opts, 2, client_ip);
+    assert(rep_res.is_ok());
+
+    assert(dhcp->find_client_arch_by_ip(client_ip).value() == ClientArch::Efi_x64);
+    assert(dhcp->find_mac_by_ip(client_ip).value() == "52:54:00:12:34:03");
+
+    // 3. Set up TFTP server with DHCP and Session Manager wired
+    uint16_t port = 10078;
+    TftpServer tftp(NetworkAddress(127, 0, 0, 1), dir, port);
+    tftp.set_dhcp_server(dhcp);
+
+    // Setup writeback COW file to verify overlay preservation
+    std::filesystem::path cow_dir = dir / "writeback";
+    std::filesystem::create_directories(cow_dir, ec);
+    std::filesystem::path cow_path = cow_dir / "wb_525400123403.cow";
+    {
+        std::ofstream f(cow_path, std::ios::binary);
+        std::string test_data(16384, 'B');
+        f.write(test_data.data(), static_cast<std::streamsize>(test_data.size()));
+    }
+    const uint64_t cow_size_before = std::filesystem::file_size(cow_path, ec);
+    assert(cow_size_before == 16384);
+
+    // Wire ClientSessionManager and bind session
+    auto smgr = std::make_shared<ClientSessionManager>(nullptr, cow_dir);
+    ClientId cid("52:54:00:12:34:03");
+    auto sess_res = smgr->get_or_create_session(cid, client_ip, ImageId("test_img"));
+    if (sess_res.is_ok()) {
+        sess_res.value()->mark_disconnected(); // Put in disconnect grace
+    }
+    tftp.set_session_manager(smgr);
+
+    assert(tftp.initialize().is_ok());
+
+#if defined(_WIN32)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    assert(s != INVALID_SOCKET);
+    DWORD to_ms = 3000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to_ms), sizeof(to_ms));
+
+    sockaddr_in srv_addr{};
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_port = htons(port);
+    srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    // 4. Client requests "undionly.kpxe" but client architecture is UEFI x64
+    // Verify TFTP server overrides and serves "ipxe.efi"
+    auto rrq_pkt = make_rrq("undionly.kpxe", {{"blksize", "1456"}, {"tsize", "0"}});
+    int sent = sendto(s, reinterpret_cast<const char*>(rrq_pkt.data()), static_cast<int>(rrq_pkt.size()),
+                      0, reinterpret_cast<const sockaddr*>(&srv_addr), sizeof(srv_addr));
+    assert(sent == static_cast<int>(rrq_pkt.size()));
+
+    // Expect OACK acknowledging blksize=1456
+    uint8_t rx_buf[2048];
+    sockaddr_in from_addr{};
+    int from_len = sizeof(from_addr);
+    int r = recvfrom(s, reinterpret_cast<char*>(rx_buf), sizeof(rx_buf), 0,
+                     reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+    assert(r > 4);
+    assert(rx_buf[0] == 0x00 && rx_buf[1] == 0x06); // OACK
+
+    // Send ACK block 0
+    uint8_t ack0[4] = {0x00, 0x04, 0x00, 0x00};
+    sendto(s, reinterpret_cast<const char*>(ack0), sizeof(ack0), 0,
+           reinterpret_cast<const sockaddr*>(&from_addr), from_len);
+
+    // Expect DATA block 1: payload should match "UEFI_IPXE_EFI_PAYLOAD" (because of UEFI override)
+    r = recvfrom(s, reinterpret_cast<char*>(rx_buf), sizeof(rx_buf), 0,
+                 reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+    assert(r > 4);
+    assert(rx_buf[0] == 0x00 && rx_buf[1] == 0x03); // DATA
+    assert(rx_buf[2] == 0x00 && rx_buf[3] == 0x01); // block 1
+    std::string payload(reinterpret_cast<const char*>(rx_buf + 4), static_cast<size_t>(r - 4));
+    assert(payload == "UEFI_IPXE_EFI_PAYLOAD");
+
+    // Send ACK block 1
+    uint8_t ack1[4] = {0x00, 0x04, 0x00, 0x01};
+    sendto(s, reinterpret_cast<const char*>(ack1), sizeof(ack1), 0,
+           reinterpret_cast<const sockaddr*>(&from_addr), from_len);
+
+    closesocket(s);
+    WSACleanup();
+#endif
+
+    // 5. CRITICAL INVARIANT: Verify the writeback COW file was NEVER deleted or truncated!
+    assert(std::filesystem::exists(cow_path, ec));
+    const uint64_t cow_size_after = std::filesystem::file_size(cow_path, ec);
+    assert(cow_size_after == cow_size_before);
+
+    tftp.shutdown();
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "  PASS: test_tftp_dynamic_arch_and_reboot_grace\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -11690,12 +11802,12 @@ void test_dhcp_static_binding_outranks_dynamic_pool() {
         // Bootfile and Option 67 must survive this path -- without them the
         // client takes this ACK, exits PXE and boots local storage, which is the
         // whole failure this feature exists to prevent. PC-01 is pinned
-        // boot_mode = "bios", so the arch-correct loader is undionly.kpxe.
+        // boot_mode = "bios", so the arch-correct loader is cobpxe.kpxe.
         assert(!opt_payload(reply, 67).empty());
         assert(opt_payload(reply, 67) ==
-               std::vector<uint8_t>({'u', 'n', 'd', 'i', 'o', 'n', 'l', 'y', '.',
+               std::vector<uint8_t>({'c', 'o', 'b', 'p', 'x', 'e', '.',
                                      'k', 'p', 'x', 'e'}));
-        assert(bootfile_of(reply) == "undionly.kpxe");
+        assert(bootfile_of(reply) == "cobpxe.kpxe");
 
         // The station binding now follows the address the client really uses, so
         // /boot.ipxe (which resolves by caller IP) and the iSCSI target see it
@@ -11791,7 +11903,7 @@ void test_boot_ipxe_dual_key_and_auto_mode() {
     const HttpResponse by_ip = daemon.handle_request("GET", "/boot.ipxe", "", "10.20.30.1");
     assert(by_ip.status == 200);
     assert(by_ip.body.find("iqn.2026-09.com.cobdiskless:PC-CSM") != std::string::npos);
-    assert(by_ip.body.find("sanhook") == std::string::npos);
+    assert(by_ip.body.find("sanhook --drive 0x80") != std::string::npos);
 
     // 2. ?mac= outranks the caller IP: the request comes from PC-CSM's address
     //    but names PC-UEFI, and the script must belong to PC-UEFI.
@@ -11818,8 +11930,7 @@ void test_boot_ipxe_dual_key_and_auto_mode() {
     // Both real paths are present, bound to this station's own target.
     assert(auto_resp.body.find("sanhook --drive 0x80 iscsi:192.168.1.100::::"
                                 "iqn.2026-09.com.cobdiskless:PC-AUTO") != std::string::npos);
-    assert(auto_resp.body.find("sanboot iscsi:192.168.1.100::::"
-                                "iqn.2026-09.com.cobdiskless:PC-AUTO") != std::string::npos);
+    assert(auto_resp.body.find("sanboot --drive 0x80") != std::string::npos);
     // The BIOS branch is entered by goto, never by falling through into it.
     assert(auto_resp.body.find("iseq ${platform} pcbios && sanboot") == std::string::npos);
 
@@ -11908,11 +12019,11 @@ void test_dhcp_auto_boot_mode_follows_option_93() {
     };
 
     // "auto" tracks Option 93 exactly like an unconfigured station would...
-    assert(bootfile_of(0x11, 0) == "undionly.kpxe");
-    assert(bootfile_of(0x11, 7) == "ipxe.efi");
+    assert(bootfile_of(0x11, 0) == "cobpxe.kpxe");
+    assert(bootfile_of(0x11, 7) == "cobpxe.efi");
     // Wire architecture (Option 93) now takes precedence over station config.
-    // A UEFI client (arch 7) gets ipxe.efi even if station is pinned to bios.
-    assert(bootfile_of(0x12, 7) == "ipxe.efi");
+    // A UEFI client (arch 7) gets cobpxe.efi even if station is pinned to bios.
+    assert(bootfile_of(0x12, 7) == "cobpxe.efi");
 
     std::filesystem::remove(test_file, ec);
     std::cout << "  PASS: test_dhcp_auto_boot_mode_follows_option_93\n";
@@ -12132,10 +12243,14 @@ void test_platform_firmware_mismatch_guard() {
 
     // c) No `platform` at all (the bare DHCP URL): ask for it exactly once
     //    instead of guessing -- the image format alone cannot decide the guard.
+    //    The probe also harvests PCI telemetry so the second hop can enroll
+    //    stock-iPXE bare-metal NICs that never saw a cobpxe ROM.
     {
         const HttpResponse r = daemon.handle_request("GET", "/boot.ipxe?mac=00:25:22:BB:00:01");
         assert(r.status == 200);
-        assert(r.body.find("/boot.ipxe?mac=00:25:22:BB:00:01&platform=${platform} || goto probe_failed")
+        assert(r.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+        assert(r.body.find("set subven ${pci/${busloc}.2c.2:hex}") != std::string::npos);
+        assert(r.body.find("/boot.ipxe?mac=00:25:22:BB:00:01&platform=${platform}&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&sniffed=1 || goto probe_failed")
                != std::string::npos);
         assert(r.body.find(":probe_failed") != std::string::npos);
         assert(r.body.find("reboot\n") != std::string::npos);
@@ -12156,7 +12271,8 @@ void test_platform_firmware_mismatch_guard() {
             daemon.handle_request("GET", "/boot.ipxe?mac=00:25:22:BB:00:02&platform=pcbios");
         assert(ok.status == 200);
         assert(ok.body.find("FIRMWARE / IMAGE MISMATCH") == std::string::npos);
-        assert(ok.body.find("sanboot iscsi:") != std::string::npos);
+        assert(ok.body.find("sanhook --drive 0x80 iscsi:") != std::string::npos);
+        assert(ok.body.find("sanboot --drive 0x80") != std::string::npos);
     }
 
     // e) A hybrid image boots under either firmware: never a mismatch, and
@@ -12311,6 +12427,4282 @@ void test_platform_firmware_mismatch_guard() {
     std::cout << "  PASS: test_platform_firmware_mismatch_guard\n";
 }
 
+// ---------------------------------------------------------------------------
+// The firmware guard resolves a station's assigned image *id* (`csmw10`) to a
+// real file (`csmw10.VHD`).
+//
+// The station registry stores ids, never file names, so a probe of
+// `dir / "csmw10"` alone can never match anything. That miss used to be
+// invisible: resolve_image_boot_facts() returns std::nullopt, the guard "fails
+// open", and the boot proceeds -- straight into a Legacy-BIOS sanboot on a
+// UEFI client, which dies inside iPXE's EFI block driver with err:3d2220
+// ("Inappropriate I/O control operation", interface/efi/efi_block.c). This
+// test pins the resolution order that makes the guard decidable at all.
+// ---------------------------------------------------------------------------
+void test_image_id_resolution_finds_vhd() {
+    std::cout << "[RUN] test_image_id_resolution_finds_vhd\n";
+    std::error_code ec;
+    const std::filesystem::path dir = "test_image_id_resolution_dir";
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    const auto write_file = [&](const std::filesystem::path& p, const std::string& body) {
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        assert(out.is_open());
+        out << body;
+        out.close();
+        assert(out.good());
+    };
+
+    write_file(dir / "csmw10.VHD", "vhdl-bytes");
+    write_file(dir / "other.vhdx", "vhdx-bytes");
+    write_file(dir / "notes.txt", "csmw10");  // same stem, but not a container
+
+    const std::vector<std::filesystem::path> dirs{dir};
+
+    // 1. The bare id finds the VHD -- the case the station registry uses.
+    const auto by_id = HttpDaemon::resolve_image_path("csmw10", dirs);
+    assert(by_id.has_value());
+    assert(by_id->filename() == "csmw10.VHD");
+
+    // 2. Id matching is case-insensitive (Windows file names are).
+    const auto upper = HttpDaemon::resolve_image_path("CSMW10", dirs);
+    assert(upper.has_value());
+    assert(upper->filename() == "csmw10.VHD");
+
+    // 3. A full file name, extension included, still resolves directly.
+    const auto by_file = HttpDaemon::resolve_image_path("other.vhdx", dirs);
+    assert(by_file.has_value());
+    assert(by_file->filename() == "other.vhdx");
+
+    // 4. A non-image file sharing the stem is never taken for the OS image.
+    assert(!HttpDaemon::resolve_image_path("notes", dirs).has_value());
+
+    // 5. An id that resolves nowhere leaves the guard open (fail open).
+    assert(!HttpDaemon::resolve_image_path("does_not_exist", dirs).has_value());
+
+    // 6. A registered config.json `id -> path` alias is authoritative and
+    //    reaches the file even with no search directory configured at all.
+    const std::filesystem::path outside = dir / "csmw10.VHD";
+    const std::vector<std::pair<std::string, std::filesystem::path>> aliases{
+        {"csmw10", outside}};
+    const auto aliased = HttpDaemon::resolve_image_path("csmw10", {}, aliases);
+    assert(aliased.has_value());
+    assert(aliased.value() == outside);
+
+    // 7. An alias pointing at a deleted file must not shadow a live one.
+    const std::vector<std::pair<std::string, std::filesystem::path>> dead_aliases{
+        {"csmw10", dir / "gone.VHD"}};
+    const auto fallback = HttpDaemon::resolve_image_path("csmw10", dirs, dead_aliases);
+    assert(fallback.has_value());
+    assert(fallback->filename() == "csmw10.VHD");
+
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "  PASS: test_image_id_resolution_finds_vhd\n";
+}
+
+void test_scoped_image_scanning_and_session_refcount_and_put_station_validation() {
+    std::cout << "[RUN] test_scoped_image_scanning_and_session_refcount_and_put_station_validation\n";
+    std::error_code ec;
+
+    // =========================================================================
+    // Part 1: Scoped Image Scanning (Task 1)
+    // =========================================================================
+    {
+        const std::filesystem::path test_root = "test_scoped_scan_dir";
+        std::filesystem::remove_all(test_root, ec);
+        const std::filesystem::path os_dir = test_root / "os_assigned";
+        const std::filesystem::path games_dir = test_root / "games_assigned";
+        const std::filesystem::path legacy_dir = test_root / "legacy_images";
+        std::filesystem::create_directories(os_dir, ec);
+        std::filesystem::create_directories(games_dir, ec);
+        std::filesystem::create_directories(legacy_dir, ec);
+
+        auto make_dummy = [](const std::filesystem::path& p, size_t sz) {
+            std::ofstream out(p, std::ios::binary);
+            std::vector<char> buf(sz, 0x55);
+            out.write(buf.data(), buf.size());
+        };
+
+        make_dummy(os_dir / "assigned_os.raw", 1048576);
+        make_dummy(games_dir / "assigned_game.raw", 1048576);
+        make_dummy(legacy_dir / "unassigned_legacy.raw", 1048576);
+
+        // Differential writeback and temporary swap disks in OS directory: must be ignored by scan
+        make_dummy(os_dir / "wb_test.cow", 4096);
+        make_dummy(os_dir / "delta.wb.vhd", 1048576);
+        make_dummy(os_dir / "temp.swap.vhd", 1048576);
+        make_dummy(os_dir / "temp.diff.vhd", 1048576);
+
+        Configuration cfg;
+        cfg.set_os_images_dir(os_dir);
+        cfg.set_games_dir(games_dir);
+
+        auto registry = std::make_shared<GoldenImageRegistry>();
+        ImageManager img_mgr(registry);
+        img_mgr.configure(cfg);
+
+        auto scan_res = img_mgr.scan_directories();
+        assert(scan_res.is_ok());
+        assert(scan_res.value() == 2);
+
+        // Verify strictly assigned directories were scanned and differential disks ignored
+        auto all_imgs = img_mgr.list_all_images();
+        assert(all_imgs.size() == 2);
+        assert(img_mgr.list_images(ImageRole::OsImage).size() == 1);
+        assert(img_mgr.list_images(ImageRole::GameDisk).size() == 1);
+        assert(img_mgr.get_image_info(ImageId("unassigned_legacy")).is_err());
+        assert(img_mgr.get_image_info(ImageId("delta.wb")).is_err());
+
+        // Attempting to import a differential writeback or swap disk must fail
+        auto import_wb = img_mgr.import_image(os_dir / "delta.wb.vhd");
+        assert(import_wb.is_err());
+
+        std::filesystem::remove_all(test_root, ec);
+    }
+
+    // =========================================================================
+    // Part 2: Session Reference Counting & Hot-Swap Lifecycle (Task 2)
+    // =========================================================================
+    {
+        const std::filesystem::path test_sess_dir = "test_session_refcount_dir";
+        std::filesystem::remove_all(test_sess_dir, ec);
+        const std::filesystem::path os_dir = test_sess_dir / "os";
+        const std::filesystem::path wb_dir = test_sess_dir / "wb";
+        std::filesystem::create_directories(os_dir, ec);
+        std::filesystem::create_directories(wb_dir, ec);
+
+        auto make_raw = [](const std::filesystem::path& p, size_t sz) {
+            std::ofstream out(p, std::ios::binary);
+            std::vector<char> buf(sz, 0);
+            out.write(buf.data(), buf.size());
+        };
+
+        const auto img1_path = os_dir / "img1.raw";
+        const auto img2_path = os_dir / "img2.raw";
+        make_raw(img1_path, 2 * 1048576);
+        make_raw(img2_path, 2 * 1048576);
+
+        Configuration cfg;
+        cfg.set_os_images_dir(os_dir);
+        cfg.set_writeback_dir(wb_dir);
+
+        auto registry = std::make_shared<GoldenImageRegistry>();
+        auto img_mgr = std::make_shared<ImageManager>(registry);
+        img_mgr->configure(cfg);
+        assert(img_mgr->scan_directories().is_ok());
+
+        ClientSessionManager sess_mgr(img_mgr, wb_dir);
+
+        ClientId c1("00:11:22:33:44:01");
+        NetworkAddress ip1(192, 168, 1, 101);
+
+        // 1. Initial session creation
+        auto s1_res = sess_mgr.get_or_create_session(c1, ip1, ImageId("img1"));
+        assert(s1_res.is_ok());
+        auto s1 = s1_res.value();
+        assert(s1->os_image_id() == ImageId("img1"));
+        assert(s1->live_connections() == 0);
+        assert(s1->active_connections() == 0);
+
+        // 2. Refcount increments / decrements
+        assert(s1->retain_connection() == 1);
+        assert(s1->live_connections() == 1);
+        assert(s1->increment_connections() == 2);
+        assert(s1->live_connections() == 2);
+        assert(s1->release_connection() == 1);
+        assert(s1->live_connections() == 1);
+
+        // 3. Mid-session teardown protection: active connections exist -> reject hot-swap
+        auto swap_rejected = sess_mgr.get_or_create_session(c1, ip1, ImageId("img2"));
+        assert(swap_rejected.is_err());
+        assert(swap_rejected.error().code() == ErrorCode::UnsupportedOperation);
+        assert(s1->has_pending_swap());
+        assert(s1->pending_swap_image_id() == ImageId("img2"));
+        // Verify session remains unchanged
+        assert(s1->os_image_id() == ImageId("img1"));
+
+        // 4. Clean hot-swap when connections reach 0
+        assert(s1->decrement_connections() == 0);
+        assert(s1->live_connections() == 0);
+        // Decrement floor protection (does not wrap below 0)
+        assert(s1->decrement_connections() == 0);
+
+        auto swap_ok = sess_mgr.get_or_create_session(c1, ip1, ImageId("img2"));
+        assert(swap_ok.is_ok());
+        auto s2 = swap_ok.value();
+        assert(s2->os_image_id() == ImageId("img2"));
+
+        std::filesystem::remove_all(test_sess_dir, ec);
+    }
+
+    // =========================================================================
+    // Part 3: Firmware & Partition Validation in PUT /station (Task 3)
+    // =========================================================================
+    {
+        const std::filesystem::path stations_file = "test_put_station_val.json";
+        std::filesystem::remove(stations_file, ec);
+        auto smgr = std::make_shared<StationManager>(stations_file);
+
+        StationEntry st_bios;
+        st_bios.mac = "00:AA:BB:CC:DD:01";
+        st_bios.name = "PC-BIOS-01";
+        st_bios.ip = NetworkAddress(10, 0, 0, 1);
+        st_bios.image = "bios_boot.vhd";
+        st_bios.boot_mode = "bios";
+        assert(smgr->add_or_update_station(st_bios).is_ok());
+
+        StationEntry st_uefi;
+        st_uefi.mac = "00:AA:BB:CC:DD:02";
+        st_uefi.name = "PC-UEFI-01";
+        st_uefi.ip = NetworkAddress(10, 0, 0, 2);
+        st_uefi.image = "uefi_boot.vhd";
+        st_uefi.boot_mode = "uefi";
+        assert(smgr->add_or_update_station(st_uefi).is_ok());
+
+        HttpDaemon daemon;
+        daemon.set_station_manager(smgr);
+        daemon.set_image_boot_mode_resolver(
+            [](const std::string& image) -> std::optional<ImageBootFacts> {
+                ImageBootFacts facts;
+                if (image == "gpt_uefi.vhd") {
+                    facts.boot_mode = BootMode::Uefi;
+                    facts.scheme = PartitionScheme::Gpt;
+                    return facts;
+                }
+                if (image == "mbr_bios.vhd") {
+                    facts.boot_mode = BootMode::Bios;
+                    facts.scheme = PartitionScheme::Mbr;
+                    return facts;
+                }
+                return std::nullopt;
+            });
+
+        // 1. BIOS client assigned GPT image -> MUST fail with 400
+        {
+            const std::string body = R"({"image":"gpt_uefi.vhd"})";
+            auto resp = daemon.handle_request("PUT", "/api/v1/station?mac=00:AA:BB:CC:DD:01", body);
+            assert(resp.status == 400);
+            assert(resp.body.find("Firmware and partition scheme mismatch") != std::string::npos);
+            assert(resp.body.find("FIRMWARE_MISMATCH") != std::string::npos);
+            assert(resp.body.find("GPT") != std::string::npos);
+            // Verify station was NOT modified
+            auto st = smgr->find_by_mac("00:AA:BB:CC:DD:01");
+            assert(st.has_value());
+            assert(st->image == "bios_boot.vhd");
+        }
+
+        // 2. UEFI client assigned MBR image -> MUST fail with 400
+        {
+            const std::string body = R"({"image":"mbr_bios.vhd"})";
+            auto resp = daemon.handle_request("PUT", "/api/v1/station?mac=00:AA:BB:CC:DD:02", body);
+            assert(resp.status == 400);
+            assert(resp.body.find("Firmware and partition scheme mismatch") != std::string::npos);
+            assert(resp.body.find("FIRMWARE_MISMATCH") != std::string::npos);
+            assert(resp.body.find("details") != std::string::npos);
+            assert(resp.body.find("MBR") != std::string::npos);
+            // Verify station was NOT modified
+            auto st = smgr->find_by_mac("00:AA:BB:CC:DD:02");
+            assert(st.has_value());
+            assert(st->image == "uefi_boot.vhd");
+        }
+
+        // 3. Valid assignment: BIOS client assigned MBR image -> succeeds 200
+        {
+            const std::string body = R"({"image":"mbr_bios.vhd"})";
+            auto resp = daemon.handle_request("PUT", "/api/v1/station?mac=00:AA:BB:CC:DD:01", body);
+            assert(resp.status == 200);
+            auto st = smgr->find_by_mac("00:AA:BB:CC:DD:01");
+            assert(st.has_value());
+            assert(st->image == "mbr_bios.vhd");
+        }
+
+        // 4. Valid assignment: UEFI client assigned GPT image -> succeeds 200
+        {
+            const std::string body = R"({"image":"gpt_uefi.vhd"})";
+            auto resp = daemon.handle_request("PUT", "/api/v1/station?mac=00:AA:BB:CC:DD:02", body);
+            assert(resp.status == 200);
+            auto st = smgr->find_by_mac("00:AA:BB:CC:DD:02");
+            assert(st.has_value());
+            assert(st->image == "gpt_uefi.vhd");
+        }
+
+        std::filesystem::remove(stations_file, ec);
+    }
+
+    std::cout << "  PASS: test_scoped_image_scanning_and_session_refcount_and_put_station_validation\n";
+}
+
+void test_writeback_pipeline_cow_overlay_creation_and_blocks_write() {
+    std::cout << "[RUN] test_writeback_pipeline_cow_overlay_creation_and_blocks_write\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_wb_pipeline";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Create a dummy base raw image (read-only block device)
+    std::filesystem::path raw_base = test_dir / "base.raw";
+    {
+        std::ofstream ofs(raw_base, std::ios::binary);
+        std::vector<char> zeros(65536, 0);
+        ofs.write(zeros.data(), zeros.size());
+    }
+    auto raw_res = RawImageBackend::open(raw_base, /*read_only=*/true);
+    assert(raw_res.is_ok());
+    auto base_dev = raw_res.value();
+
+    // 2. Test directory creation & file allocation with nested non-existent directory
+    std::filesystem::path nested_wb = test_dir / "deep" / "nested" / "writeback" / "wb_00_11_22_33_44_55.cow";
+    assert(!std::filesystem::exists(nested_wb.parent_path()));
+
+    auto cow_res = UnifiedCowDevice::create(base_dev, nested_wb, 4096, "00:11:22:33:44:55");
+    assert(cow_res.is_ok());
+    auto cow = cow_res.value();
+
+    // Ensure directory and .cow file were created
+    assert(std::filesystem::exists(nested_wb));
+    assert(std::filesystem::file_size(nested_wb, ec) == kCowMetaBytes); // header + table
+
+    // 3. Test fatal error on invalid path
+    auto fail_res = UnifiedCowDevice::create(base_dev, "", 4096, "00:11:22:33:44:55");
+    assert(!fail_res.is_ok());
+
+    // 4. Test UnifiedCowDevice::write_blocks
+    std::vector<std::byte> write_data(1024, std::byte{0xAB});
+    auto wb_res = cow->write_blocks(2, 2, write_data);
+    assert(wb_res.is_ok());
+    assert(wb_res.value() == 1024);
+    assert(cow->flush().is_ok());
+
+    std::vector<std::byte> read_back(1024, std::byte{0});
+    auto rd_res = cow->read(2 * 512, read_back);
+    assert(rd_res.is_ok());
+    assert(read_back == write_data);
+    assert(cow->allocated_chunks() > 0);
+
+    // 5. Test ClientSession integration & iSCSI LUN 0 execute_write dispatch
+    auto session = std::make_shared<ClientSession>(
+        ClientId("00:11:22:33:44:55"),
+        NetworkAddress(192, 168, 1, 100),
+        ImageId("base.raw"),
+        cow
+    );
+
+    // Verify session exposes cow_block_device
+    assert(session->cow_block_device() == cow);
+    assert(session->get_device_for_lun(0) == cow);
+
+    std::vector<std::byte> scsi_write_data(512, std::byte{0x77});
+    auto scsi_wr = IscsiTarget::execute_write(*session, 10, 1, scsi_write_data, 0);
+    assert(scsi_wr.is_ok());
+    assert(scsi_wr.value() == 512);
+
+    std::vector<std::byte> scsi_read_data(512, std::byte{0});
+    auto scsi_rd = IscsiTarget::execute_read(*session, 10, 1, scsi_read_data, 0);
+    assert(scsi_rd.is_ok());
+    assert(scsi_read_data == scsi_write_data);
+
+    // Clean up
+    cow->close();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_writeback_pipeline_cow_overlay_creation_and_blocks_write\n";
+}
+
+// ---------------------------------------------------------------------------
+// COW writeback engine regression tests.
+//
+// The field incident was a client that committed a single sector and then
+// waited forever for the next SCSI Response, with the overlay quarantined
+// afterwards ("Invalid COW header magic"). Each test below pins one property
+// that was previously untested: 512-byte granularity in sequence, multi-size
+// random traffic against an oracle, a Response that actually arrives with a
+// usable status/sense, and an overlay that really overrides the base image.
+// ---------------------------------------------------------------------------
+
+// Sequential 512-byte writes: the smallest transfer a diskless client issues,
+// driven one sector at a time across chunk boundaries and read back whole.
+void test_cow_sequential_512b_writes_read_back_every_sector() {
+    std::cout << "[RUN] test_cow_sequential_512b_writes_read_back_every_sector\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_cow_seq512";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // Base carries a recognisable non-constant pattern so any sector that
+    // came back from base instead of from the overlay is immediately obvious.
+    constexpr uint64_t kBaseBytes = 64 * 1024;
+    std::vector<uint8_t> base_image(kBaseBytes);
+    for (size_t i = 0; i < base_image.size(); ++i) {
+        base_image[i] = static_cast<uint8_t>(0x90 ^ (i & 0xFF));
+    }
+    {
+        std::ofstream ofs(test_dir / "base.raw", std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(base_image.data()),
+                  static_cast<std::streamsize>(base_image.size()));
+    }
+    auto raw_res = RawImageBackend::open(test_dir / "base.raw", /*read_only=*/true);
+    assert(raw_res.is_ok());
+    auto base_dev = raw_res.value();
+
+    auto cow_res = UnifiedCowDevice::create(base_dev, test_dir / "wb_seq.cow",
+                                          4096, "aa:bb:cc:dd:ee:01");
+    assert(cow_res.is_ok());
+    auto cow = cow_res.value();
+
+    // 40 x 512 B = 20480 B = exactly five 4 KiB chunks, so the run crosses
+    // four chunk boundaries while only touching one sector at a time.
+    constexpr uint32_t kSectors = 40;
+    std::vector<uint8_t> expected(kSectors * 512, 0);
+    for (uint32_t s = 0; s < kSectors; ++s) {
+        std::vector<uint8_t> payload(512);
+        for (size_t b = 0; b < payload.size(); ++b) {
+            payload[b] = static_cast<uint8_t>((s * 7 + b * 3) & 0xFF);
+        }
+        std::memcpy(expected.data() + static_cast<size_t>(s) * 512,
+                    payload.data(), payload.size());
+
+        auto wb = cow->write_blocks(s, 1,
+            std::as_bytes(std::span(payload.data(), payload.size())));
+        assert(wb.is_ok());
+        assert(wb.value() == 512);
+    }
+
+    // One request covering every written sector.
+    std::vector<std::byte> got(kSectors * 512);
+    auto rb = cow->read(0, std::span(got.data(), got.size()));
+    assert(rb.is_ok());
+    assert(rb.value() == got.size());
+    assert(std::memcmp(got.data(), expected.data(), expected.size()) == 0);
+
+    // A sector just past the written range must still be the base image: the
+    // overlay may not bleed outside what was actually written.
+    std::vector<std::byte> tail(512);
+    auto tail_res = cow->read(static_cast<uint64_t>(kSectors) * 512,
+                              std::span(tail.data(), tail.size()));
+    assert(tail_res.is_ok());
+    assert(std::memcmp(tail.data(), base_image.data() + kSectors * 512, 512) == 0);
+
+    // Writing the same sector twice: the second value wins.
+    std::vector<uint8_t> second(512, 0xC5);
+    auto wb2 = cow->write_blocks(3, 1,
+        std::as_bytes(std::span(second.data(), second.size())));
+    assert(wb2.is_ok());
+    std::vector<std::byte> one(512);
+    auto r1 = cow->read(3ULL * 512, std::span(one.data(), one.size()));
+    assert(r1.is_ok());
+    assert(static_cast<uint8_t>(one[0]) == 0xC5);
+    assert(static_cast<uint8_t>(one[511]) == 0xC5);
+    // Its neighbour in the same chunk must still carry the image written in
+    // the sequential pass -- writing sector 3 may not bleed into sector 4.
+    std::vector<std::byte> neighbour(512);
+    auto r2 = cow->read(4ULL * 512, std::span(neighbour.data(), neighbour.size()));
+    assert(r2.is_ok());
+    assert(std::memcmp(neighbour.data(), expected.data() + 4 * 512, 512) == 0);
+
+    cow->close();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_cow_sequential_512b_writes_read_back_every_sector\n";
+}
+
+// Random 4 KiB and 64 KiB traffic checked against a byte-for-byte shadow of
+// the image -- 64 KiB spans sixteen chunks, the largest transfer Windows
+// commonly issues while filling its cache during boot.
+void test_cow_random_4k_and_64k_traffic_matches_a_shadow_image() {
+    std::cout << "[RUN] test_cow_random_4k_and_64k_traffic_matches_a_shadow_image\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_cow_rand";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    constexpr uint64_t kBaseBytes = 1024 * 1024;
+    std::vector<uint8_t> shadow(kBaseBytes);
+    for (size_t i = 0; i < shadow.size(); ++i) {
+        shadow[i] = static_cast<uint8_t>(0x5A ^ (i & 0xFF));
+    }
+    {
+        std::ofstream ofs(test_dir / "base.raw", std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(shadow.data()),
+                  static_cast<std::streamsize>(shadow.size()));
+    }
+    auto raw_res = RawImageBackend::open(test_dir / "base.raw", /*read_only=*/true);
+    assert(raw_res.is_ok());
+    auto base_dev = raw_res.value();
+
+    auto cow_res = UnifiedCowDevice::create(base_dev, test_dir / "wb_rand.cow",
+                                          4096, "aa:bb:cc:dd:ee:02");
+    assert(cow_res.is_ok());
+    auto cow = cow_res.value();
+
+    // Fixed-seed xorshift so a failure reproduces byte for byte.
+    uint64_t rng = 0x2545F4914F6CDD1DULL;
+    auto next = [&rng]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return static_cast<uint32_t>(rng >> 32);
+    };
+
+    // Total distinct chunks touched stays under the engine's minimum
+    // residency (128) so the test never has to wait on the spill worker.
+    auto emit = [&](uint64_t byte_off, size_t len, uint8_t tag) {
+        std::vector<uint8_t> payload(len);
+        for (size_t i = 0; i < len; ++i) {
+            payload[i] = static_cast<uint8_t>(tag + (i & 0x3F));
+        }
+        auto w = cow->write(byte_off,
+                            std::as_bytes(std::span(payload.data(), payload.size())));
+        assert(w.is_ok());
+        assert(w.value() == len);
+        std::memcpy(shadow.data() + byte_off, payload.data(), len);
+    };
+
+    for (int n = 0; n < 32; ++n) {
+        const uint64_t off = (next() % (kBaseBytes / 4096)) * 4096;
+        emit(off, 4096, static_cast<uint8_t>(0x10 + n));
+    }
+    for (int n = 0; n < 4; ++n) {
+        const uint64_t off = (next() % (kBaseBytes / 65536)) * 65536;
+        emit(off, 65536, static_cast<uint8_t>(0x60 + n));
+    }
+
+    // Read every 4 KiB block back in a shuffled order, so correctness does
+    // not depend on being walked forwards.
+    std::vector<uint64_t> order(kBaseBytes / 4096);
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    for (size_t i = order.size(); i > 1; --i) {
+        std::swap(order[i - 1], order[next() % i]);
+    }
+
+    std::vector<std::byte> got(4096);
+    for (uint64_t blk : order) {
+        const uint64_t off = blk * 4096;
+        auto r = cow->read(off, std::span(got.data(), got.size()));
+        assert(r.is_ok());
+        assert(r.value() == got.size());
+        assert(std::memcmp(got.data(), shadow.data() + off, 4096) == 0);
+    }
+
+    cow->close();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_cow_random_4k_and_64k_traffic_matches_a_shadow_image\n";
+}
+
+// One dirty sector must override the base for exactly that sector, through
+// both write paths: write_blocks() (the iSCSI fast path) and write() (the
+// generic BlockDevice path).
+void test_cow_dirty_sector_read_back_overrides_the_base_image() {
+    std::cout << "[RUN] test_cow_dirty_sector_read_back_overrides_the_base_image\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_cow_override";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    constexpr uint64_t kBaseBytes = 64 * 1024;
+    std::vector<uint8_t> base_image(kBaseBytes, 0x33);
+    {
+        std::ofstream ofs(test_dir / "base.raw", std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(base_image.data()),
+                  static_cast<std::streamsize>(base_image.size()));
+    }
+    auto raw_res = RawImageBackend::open(test_dir / "base.raw", /*read_only=*/true);
+    assert(raw_res.is_ok());
+    auto base_dev = raw_res.value();
+
+    auto cow_res = UnifiedCowDevice::create(base_dev, test_dir / "wb_ovr.cow",
+                                          4096, "aa:bb:cc:dd:ee:03");
+    assert(cow_res.is_ok());
+    auto cow = cow_res.value();
+
+    // Path 1 -- RAM overlay: sector 9 sits at byte 4608, inside chunk 1.
+    std::vector<uint8_t> ram_payload(512, 0xA1);
+    auto w1 = cow->write_blocks(9, 1,
+        std::as_bytes(std::span(ram_payload.data(), ram_payload.size())));
+    assert(w1.is_ok());
+
+    // Path 2 -- writeback context: sector 11 at byte 5632, same chunk.
+    std::vector<uint8_t> ctx_payload(512, 0xB2);
+    auto w2 = cow->write(11ULL * 512,
+        std::as_bytes(std::span(ctx_payload.data(), ctx_payload.size())));
+    assert(w2.is_ok());
+
+    // Read the whole chunk: only those two sectors differ from base.
+    std::vector<std::byte> chunk(4096);
+    auto r = cow->read(4096, std::span(chunk.data(), chunk.size()));
+    assert(r.is_ok());
+    assert(r.value() == chunk.size());
+    for (size_t i = 0; i < chunk.size(); ++i) {
+        const uint8_t want = (i >= 512 && i < 1024) ? 0xA1
+                           : (i >= 1536 && i < 2048) ? 0xB2
+                           : 0x33;
+        assert(static_cast<uint8_t>(chunk[i]) == want);
+    }
+
+    // The preceding and following chunks are still pure base image.
+    std::vector<std::byte> before(4096);
+    auto rb = cow->read(0, std::span(before.data(), before.size()));
+    assert(rb.is_ok());
+    assert(std::memcmp(before.data(), base_image.data(), 4096) == 0);
+    std::vector<std::byte> after(4096);
+    auto ra = cow->read(8192, std::span(after.data(), after.size()));
+    assert(ra.is_ok());
+    assert(std::memcmp(after.data(), base_image.data() + 8192, 4096) == 0);
+
+    cow->close();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_cow_dirty_sector_read_back_overrides_the_base_image\n";
+}
+
+// On-the-wire proof that a WRITE is answered: Status, StatSN/ExpStatSN and a
+// sense key that names the actual fault instead of a blanket WRITE PROTECTED.
+void test_iscsi_write_gets_an_immediate_scsi_response_and_useful_sense() {
+    std::cout << "[RUN] test_iscsi_write_gets_an_immediate_scsi_response_and_useful_sense\n";
+#if defined(_WIN32)
+    WSADATA wsa;
+    assert(WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+#endif
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_iscsi_immediate_resp";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    std::filesystem::path os_path = test_dir / "golden_base.raw";
+    {
+        std::ofstream ofs(os_path, std::ios::binary);
+        std::vector<uint8_t> base_data(64 * 1024, 0x33);
+        ofs.write(reinterpret_cast<const char*>(base_data.data()),
+                  static_cast<std::streamsize>(base_data.size()));
+    }
+
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    Configuration cfg;
+    cfg.set_os_images_dir(test_dir);
+    cfg.set_writeback_dir(test_dir);
+    img_mgr->configure(cfg);
+    assert(img_mgr->import_image(os_path, ImageRole::OsImage, ImageId("os_base")).is_ok());
+
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir);
+
+    const uint16_t port = 13266;
+    IscsiTargetConfig tcfg;
+    tcfg.listen_address = NetworkAddress(127, 0, 0, 1, port);
+    tcfg.default_os_image_id = ImageId("os_base");
+    IscsiTarget target(tcfg, sess_mgr);
+    assert(target.initialize().is_ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(s != INVALID_SOCKET);
+    // A Response that never arrives must fail an assertion, not wedge the run.
+    DWORD tv = 3000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+
+    sockaddr_in srv{};
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(port);
+    srv.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(s, reinterpret_cast<const sockaddr*>(&srv), sizeof(srv)) == 0);
+
+    perform_test_login(s, "iqn.1991-05.com.microsoft:imm-client", 0x5001);
+
+    // The server writes StatSN/ExpStatSN big-endian into the packed BHS, so
+    // decode them rather than reading the uint32 host-endian.
+    auto be32 = [](const uint32_t& field) -> uint32_t {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&field);
+        return (static_cast<uint32_t>(p[0]) << 24) |
+               (static_cast<uint32_t>(p[1]) << 16) |
+               (static_cast<uint32_t>(p[2]) << 8) |
+               static_cast<uint32_t>(p[3]);
+    };
+    auto max_cmdsn = [](const IscsiBhs& b) -> uint32_t {
+        return (static_cast<uint32_t>(b.cdb[0]) << 24) |
+               (static_cast<uint32_t>(b.cdb[1]) << 16) |
+               (static_cast<uint32_t>(b.cdb[2]) << 8) |
+               static_cast<uint32_t>(b.cdb[3]);
+    };
+
+    // WRITE(10) with optional immediate data; returns the Response plus any
+    // sense payload the Response itself carried.
+    auto send_write10 = [&](uint32_t tag, uint64_t lun, uint32_t lba,
+                            uint16_t nsect, const std::vector<uint8_t>& payload)
+        -> std::pair<IscsiBhs, std::vector<uint8_t>> {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.flags = 0x20 | 0x80; // W (write) | F (final)
+        cmd.initiator_task_tag = tag;
+        cmd.lun = lun;
+        const uint32_t len = static_cast<uint32_t>(payload.size());
+        cmd.data_seg_len[0] = static_cast<uint8_t>((len >> 16) & 0xFF);
+        cmd.data_seg_len[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
+        cmd.data_seg_len[2] = static_cast<uint8_t>(len & 0xFF);
+        cmd.cdb[0] = 0x2A; // WRITE(10)
+        test_write_be32(cmd.cdb + 2, lba);
+        test_write_be16(cmd.cdb + 7, nsect);
+
+        assert(send_all_bytes(s, &cmd, sizeof(cmd)));
+        if (len > 0) {
+            // iSCSI PDUs are 4-byte aligned; every payload here is whole
+            // dwords, so there is no padding to append.
+            assert(len % 4 == 0);
+            assert(send_all_bytes(s, payload.data(), payload.size()));
+        }
+
+        IscsiBhs resp = recv_scsi_response(s);
+        assert(resp.initiator_task_tag == tag);
+        uint32_t dlen = (static_cast<uint32_t>(resp.data_seg_len[0]) << 16) |
+                        (static_cast<uint32_t>(resp.data_seg_len[1]) << 8) |
+                        static_cast<uint32_t>(resp.data_seg_len[2]);
+        std::vector<uint8_t> sense(dlen, 0);
+        if (dlen > 0) {
+            assert(recv_all_bytes(s, sense.data(), dlen));
+            uint32_t pad = (4 - (dlen % 4)) % 4;
+            if (pad > 0) {
+                uint8_t pad_buf[4] = {};
+                assert(recv_all_bytes(s, pad_buf, pad));
+            }
+        }
+        return {resp, sense};
+    };
+
+    auto request_sense = [&](uint32_t tag) -> std::vector<uint8_t> {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.flags = 0x80;
+        cmd.initiator_task_tag = tag;
+        cmd.cdb[0] = 0x03; // REQUEST SENSE
+        cmd.cdb[4] = 18;   // Allocation length
+        assert(send_all_bytes(s, &cmd, sizeof(cmd)));
+        IscsiBhs in{};
+        return recv_scsi_data_in(s, in);
+    };
+
+    // 1. A successful WRITE is answered with SAM_STAT_GOOD, a stamped
+    //    StatSN and a 32-deep command window.
+    uint32_t first_stat_sn = 0;
+    {
+        auto [resp, sense] = send_write10(0x5002, 0, 40, 2, std::vector<uint8_t>(1024, 0x77));
+        assert(sense.empty());
+        assert(resp.rsvd1[0] == 0x00); // Command completed at target
+        assert(resp.rsvd1[1] == 0x00); // SAM_STAT_GOOD
+        first_stat_sn = be32(resp.cmd_sn);
+        assert(first_stat_sn != 0);
+        assert(be32(resp.exp_stat_sn) != 0);
+        assert(max_cmdsn(resp) >= be32(resp.exp_stat_sn));
+    }
+
+    // 2. StatSN advances by exactly one per completed command.
+    {
+        auto [resp, sense] = send_write10(0x5003, 0, 50, 1, std::vector<uint8_t>(512, 0x78));
+        assert(sense.empty());
+        assert(resp.rsvd1[1] == 0x00);
+        assert(be32(resp.cmd_sn) == first_stat_sn + 1);
+    }
+
+    // 3. An out-of-range WRITE is still answered -- CHECK CONDITION, not
+    //    silence -- and REQUEST SENSE names the fault.
+    {
+        auto [resp, sense] = send_write10(0x5004, 0, 100000, 1, std::vector<uint8_t>(512, 0x79));
+        assert(sense.empty());
+        assert(resp.rsvd1[1] == 0x02); // CHECK CONDITION
+        auto reported = request_sense(0x5005);
+        assert(reported.size() >= 13);
+        assert(reported[0] == 0x70);   // fixed format, current error
+        assert(reported[7] == 10);     // additional sense length
+        assert(reported[2] == 0x05);   // ILLEGAL REQUEST
+        assert(reported[12] == 0x21);  // LOGICAL BLOCK ADDRESS OUT OF RANGE
+        assert(reported[2] != 0x07);   // never the blanket DATA PROTECT
+    }
+
+    // 4. A LUN we do not expose is reported as unsupported -- both in the
+    //    Response's own sense payload and via a follow-up REQUEST SENSE.
+    {
+        auto [resp, sense] = send_write10(0x5006, 1, 0, 1, {});
+        assert(resp.rsvd1[1] == 0x02);
+        assert(sense.size() >= 15);
+        assert(sense[2] == 0x70);
+        assert(sense[4] == 0x05);      // ILLEGAL REQUEST
+        assert(sense[14] == 0x25);     // LOGICAL UNIT NOT SUPPORTED
+
+        auto reported = request_sense(0x5007);
+        assert(reported.size() >= 13);
+        assert(reported[2] == 0x05);
+        assert(reported[12] == 0x25);
+    }
+
+    // 5. The data written in step 1 reads back through the COW overlay.
+    {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.flags = 0x40 | 0x80; // R (read) | F
+        cmd.initiator_task_tag = 0x5008;
+        cmd.cdb[0] = 0x28; // READ(10)
+        test_write_be32(cmd.cdb + 2, 40);
+        test_write_be16(cmd.cdb + 7, 2);
+        assert(send_all_bytes(s, &cmd, sizeof(cmd)));
+        IscsiBhs in{};
+        auto data = recv_scsi_data_in(s, in);
+        assert(data.size() == 1024);
+        assert(data[0] == 0x77);
+        assert(data[1023] == 0x77);
+        assert(in.rsvd1[1] == 0x00); // SAM_STAT_GOOD
+    }
+
+    closesocket(s);
+    target.shutdown();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_iscsi_write_gets_an_immediate_scsi_response_and_useful_sense\n";
+}
+
+void test_reg_bootstart_vhd_readonly_lifecycle_guard() {
+    std::cout << "[RUN] test_reg_bootstart_vhd_readonly_lifecycle_guard\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_ro_guard";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Direct unit test of VhdReadOnlyGuard on a read-only file
+    std::filesystem::path dummy_file = test_dir / "test_image.vhd";
+    {
+        std::ofstream ofs(dummy_file, std::ios::binary);
+        ofs << "dummy vhd contents";
+    }
+
+    // Mark as read-only
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    std::wstring native_path = dummy_file.wstring();
+#if defined(__CYGWIN__) || defined(__MSYS__)
+    const ssize_t csize = ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, dummy_file.string().c_str(), nullptr, 0);
+    if (csize > 0) {
+        native_path.resize(csize / sizeof(wchar_t), L'\0');
+        ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, dummy_file.string().c_str(), native_path.data(), csize);
+        while (!native_path.empty() && native_path.back() == L'\0') native_path.pop_back();
+    }
+#endif
+    DWORD attrs = GetFileAttributesW(native_path.c_str());
+    assert(attrs != INVALID_FILE_ATTRIBUTES);
+    SetFileAttributesW(native_path.c_str(), attrs | FILE_ATTRIBUTE_READONLY);
+    attrs = GetFileAttributesW(native_path.c_str());
+    assert(attrs & FILE_ATTRIBUTE_READONLY);
+#else
+    ::chmod(dummy_file.c_str(), 0444);
+#endif
+
+    // Test RAII guard scope
+    {
+        VhdReadOnlyGuard guard(dummy_file);
+        assert(guard.was_readonly());
+        assert(guard.is_unlocked());
+        assert(!guard.is_relocked());
+
+        // File should now be writable (not read-only)
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+        DWORD cur_attrs = GetFileAttributesW(native_path.c_str());
+        assert(cur_attrs != INVALID_FILE_ATTRIBUTES);
+        assert(!(cur_attrs & FILE_ATTRIBUTE_READONLY));
+#else
+        struct stat st;
+        assert(::stat(dummy_file.c_str(), &st) == 0);
+        assert((st.st_mode & S_IWUSR) != 0);
+#endif
+    } // Guard goes out of scope here -> must re-lock!
+
+    // Verify file is strictly locked back to READ-ONLY
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    attrs = GetFileAttributesW(native_path.c_str());
+    assert(attrs != INVALID_FILE_ATTRIBUTES);
+    assert(attrs & FILE_ATTRIBUTE_READONLY);
+#else
+    struct stat st;
+    assert(::stat(dummy_file.c_str(), &st) == 0);
+    assert((st.st_mode & S_IWUSR) == 0);
+#endif
+
+    // 2. Test arm_vhd_image on a read-only raw regf SYSTEM hive
+    std::filesystem::path hive_file = test_dir / "master_test.vhd";
+    auto hive_data = RegBootStart::create_minimal_system_hive(
+        1, {{"rt640x64", 3}, {"msiscsi", 3}, {"Tcpip", 3}, {"ndis", 3}});
+    assert(!hive_data.empty());
+    {
+        std::ofstream ofs(hive_file, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(hive_data.data()), hive_data.size());
+    }
+
+    // Mark hive_file strictly read-only
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    std::wstring hive_win_path = hive_file.wstring();
+#if defined(__CYGWIN__) || defined(__MSYS__)
+    const ssize_t hsize = ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, hive_file.string().c_str(), nullptr, 0);
+    if (hsize > 0) {
+        hive_win_path.resize(hsize / sizeof(wchar_t), L'\0');
+        ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, hive_file.string().c_str(), hive_win_path.data(), hsize);
+        while (!hive_win_path.empty() && hive_win_path.back() == L'\0') hive_win_path.pop_back();
+    }
+#endif
+    DWORD h_attrs = GetFileAttributesW(hive_win_path.c_str());
+    assert(h_attrs != INVALID_FILE_ATTRIBUTES);
+    SetFileAttributesW(hive_win_path.c_str(), h_attrs | FILE_ATTRIBUTE_READONLY);
+    h_attrs = GetFileAttributesW(hive_win_path.c_str());
+    assert(h_attrs & FILE_ATTRIBUTE_READONLY);
+#else
+    ::chmod(hive_file.c_str(), 0444);
+#endif
+
+    // Call arm_vhd_image on the read-only file
+    auto arm_res = RegBootStart::arm_vhd_image(hive_file);
+    assert(arm_res.is_ok());
+    assert(arm_res.value().success);
+    assert(arm_res.value().iscsi_stack_armed);
+
+    // Verify file is strictly locked back to READ-ONLY after arming
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    h_attrs = GetFileAttributesW(hive_win_path.c_str());
+    assert(h_attrs != INVALID_FILE_ATTRIBUTES);
+    assert(h_attrs & FILE_ATTRIBUTE_READONLY);
+#else
+    assert(::stat(hive_file.c_str(), &st) == 0);
+    assert((st.st_mode & S_IWUSR) == 0);
+#endif
+
+    // Verify Start=0 was successfully committed to the hive
+    {
+        std::ifstream verify_in(hive_file, std::ios::binary);
+        assert(verify_in.is_open());
+        std::vector<uint8_t> read_hive((std::istreambuf_iterator<char>(verify_in)),
+                                       std::istreambuf_iterator<char>());
+        assert(!read_hive.empty());
+        // Verify via arm_hive_buffer: already armed so 0 modified
+        auto rearm = RegBootStart::arm_hive_buffer(read_hive);
+        assert(rearm.is_ok());
+        assert(rearm.value().modified_services.empty());
+    }
+
+    // 3. Test failure/exception path: corrupted/invalid read-only file
+    std::filesystem::path corrupt_file = test_dir / "corrupted.vhd";
+    {
+        std::ofstream ofs(corrupt_file, std::ios::binary);
+        ofs << "not a valid vhd or hive";
+    }
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    std::wstring corrupt_win_path = corrupt_file.wstring();
+#if defined(__CYGWIN__) || defined(__MSYS__)
+    const ssize_t csize2 = ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, corrupt_file.string().c_str(), nullptr, 0);
+    if (csize2 > 0) {
+        corrupt_win_path.resize(csize2 / sizeof(wchar_t), L'\0');
+        ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, corrupt_file.string().c_str(), corrupt_win_path.data(), csize2);
+        while (!corrupt_win_path.empty() && corrupt_win_path.back() == L'\0') corrupt_win_path.pop_back();
+    }
+#endif
+    DWORD c_attrs = GetFileAttributesW(corrupt_win_path.c_str());
+    assert(c_attrs != INVALID_FILE_ATTRIBUTES);
+    SetFileAttributesW(corrupt_win_path.c_str(), c_attrs | FILE_ATTRIBUTE_READONLY);
+#else
+    ::chmod(corrupt_file.c_str(), 0444);
+#endif
+
+    (void)RegBootStart::arm_vhd_image(corrupt_file);
+
+    // Verify that even after failure, the file is strictly re-locked to READ-ONLY
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    c_attrs = GetFileAttributesW(corrupt_win_path.c_str());
+    assert(c_attrs != INVALID_FILE_ATTRIBUTES);
+    assert(c_attrs & FILE_ATTRIBUTE_READONLY);
+    // Strip read-only before remove_all so cleanup succeeds on Windows
+    SetFileAttributesW(hive_win_path.c_str(), h_attrs & ~FILE_ATTRIBUTE_READONLY);
+    SetFileAttributesW(corrupt_win_path.c_str(), c_attrs & ~FILE_ATTRIBUTE_READONLY);
+    SetFileAttributesW(native_path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+#else
+    ::chmod(dummy_file.c_str(), 0777);
+    ::chmod(hive_file.c_str(), 0777);
+    ::chmod(corrupt_file.c_str(), 0777);
+#endif
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_reg_bootstart_vhd_readonly_lifecycle_guard\n";
+}
+
+void test_automated_offline_image_armer_and_driver_sanitization() {
+    std::cout << "[RUN] test_automated_offline_image_armer_and_driver_sanitization\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_arm_pipeline";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Create a minimal valid SYSTEM hive with start=3 for boot-critical services
+    std::filesystem::path hive_file = test_dir / "target_image.vhd";
+    auto hive_data = RegBootStart::create_minimal_system_hive(
+        1, {
+            {"rt640x64", 3},
+            {"msiscsi", 3},
+            {"Tcpip", 3},
+            {"ndis", 3}
+        });
+    assert(!hive_data.empty());
+    {
+        std::ofstream ofs(hive_file, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(hive_data.data()), hive_data.size());
+    }
+
+    // 2. Mark initial file as read-only to verify the armer unprotects and locks it back
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    std::wstring hive_win_path = hive_file.wstring();
+#if defined(__CYGWIN__) || defined(__MSYS__)
+    const ssize_t hsize = ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, hive_file.string().c_str(), nullptr, 0);
+    if (hsize > 0) {
+        hive_win_path.resize(hsize / sizeof(wchar_t), L'\0');
+        ::cygwin_conv_path(CCP_POSIX_TO_WIN_W, hive_file.string().c_str(), hive_win_path.data(), hsize);
+        while (!hive_win_path.empty() && hive_win_path.back() == L'\0') hive_win_path.pop_back();
+    }
+#endif
+    SetFileAttributesW(hive_win_path.c_str(), FILE_ATTRIBUTE_READONLY);
+    DWORD attrs = GetFileAttributesW(hive_win_path.c_str());
+    assert(attrs & FILE_ATTRIBUTE_READONLY);
+#endif
+
+    // 3. Execute the automated offline image armer pipeline
+    auto arm_res = RegBootStart::arm_image_offline_pipeline(hive_file);
+    assert(arm_res.is_ok());
+    assert(arm_res.value().success);
+    assert(arm_res.value().iscsi_stack_armed);
+
+    // 4. Verify file is locked back to READ-ONLY
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MSYS__)
+    attrs = GetFileAttributesW(hive_win_path.c_str());
+    assert(attrs != INVALID_FILE_ATTRIBUTES);
+    assert(attrs & FILE_ATTRIBUTE_READONLY);
+    SetFileAttributesW(hive_win_path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+#endif
+
+    // 5. Verify the armed hive buffer has Start=0
+    {
+        std::ifstream verify_in(hive_file, std::ios::binary);
+        assert(verify_in.is_open());
+        std::vector<uint8_t> read_hive((std::istreambuf_iterator<char>(verify_in)),
+                                       std::istreambuf_iterator<char>());
+        auto rearm = RegBootStart::arm_hive_buffer(read_hive);
+        assert(rearm.is_ok());
+        // Since it was already armed, rearming should modify 0 services
+        assert(rearm.value().modified_services.empty());
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_automated_offline_image_armer_and_driver_sanitization\n";
+}
+
+// Emergency-refactor regression suite: the RAM-first writeback tier, the three
+// immutability layers around the master image, and MAC filename sanitization.
+void test_tiered_ram_writeback_and_master_immutability() {
+    std::cout << "[RUN] test_tiered_ram_writeback_and_master_immutability\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_tier_ramwb";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    const uint64_t base_size = 1024 * 1024;
+
+    auto base_path = test_dir / "tier_base.raw";
+    {
+        std::ofstream ofs(base_path, std::ios::binary);
+        std::vector<char> data(base_size);
+        for (size_t i = 0; i < base_size; ++i) {
+            data[i] = static_cast<char>(i % 251);
+        }
+        ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+    }
+    auto base = RawImageBackend::open(base_path.string(), false).value();
+
+    // --- 1. A fresh write is absorbed by the L1 RAM tier --------------------
+    // The periodic tick and the early-wake threshold are pinned off so the
+    // assertions below observe the cache exactly as the iSCSI worker left it:
+    // only flush()/close() may drain anything.
+    {
+        auto dev_res = UnifiedCowDevice::create(base, test_dir / "tier.cow", kCowChunkBytes);
+        assert(dev_res.is_ok());
+        auto ctx = dev_res.value();
+
+        ctx->set_ram_writeback_bytes(4ull * 1024ull * 1024ull);
+        ctx->set_flush_interval_ms(0);        // no periodic wake
+        ctx->set_flush_threshold_chunks(1u << 30); // no threshold wake
+        assert(ctx->ram_writeback_bytes() == 4ull * 1024ull * 1024ull);
+        assert(ctx->pending_chunks() == 0);
+
+        std::vector<std::byte> buf(kCowChunkBytes, std::byte{0x5C});
+        auto w = ctx->write(3 * kCowChunkBytes, buf);
+        assert(w.is_ok() && w.value() == kCowChunkBytes);
+        assert(ctx->pending_chunks() == 1);
+        assert(ctx->dirty_bytes() == kCowChunkBytes);
+        // No file handle was touched: the metadata cluster is all that exists.
+        assert(std::filesystem::file_size(test_dir / "tier.cow") == kCowMetaBytes);
+
+        // Read-after-write is exact while the chunk is still RAM-only.
+        std::vector<std::byte> read_buf(kCowChunkBytes);
+        assert(ctx->read(3 * kCowChunkBytes, read_buf).is_ok());
+        assert(read_buf[0] == std::byte{0x5C});
+
+        // A drain point means "accepted" then equals "on disk".
+        assert(ctx->flush().is_ok());
+        assert(ctx->pending_chunks() == 0);
+        assert(ctx->dirty_bytes() == 0);
+        assert(std::filesystem::file_size(test_dir / "tier.cow") >
+               static_cast<uintmax_t>(kCowMetaBytes));
+        ctx->close();
+
+        // The drain produced real bytes: a reopen serves them from the file.
+        auto re_res = UnifiedCowDevice::create(base, test_dir / "tier.cow", kCowChunkBytes);
+        assert(re_res.is_ok());
+        auto reopened = re_res.value();
+        assert(reopened->allocated_chunks() == 1);
+        assert(reopened->pending_chunks() == 0);
+        std::vector<std::byte> verify(kCowChunkBytes);
+        assert(reopened->read(3 * kCowChunkBytes, verify).is_ok());
+        assert(verify[0] == std::byte{0x5C});
+        reopened->close();
+    }
+
+    // --- 2. Budget 0 restores the default early-wake threshold -------------
+    {
+        auto dev_res = UnifiedCowDevice::create(base, test_dir / "eager.cow", kCowChunkBytes);
+        assert(dev_res.is_ok());
+        auto ctx = dev_res.value();
+        ctx->set_ram_writeback_bytes(0);
+        assert(ctx->flush_threshold_chunks() == kCowFlushThresholdChunks);
+        std::vector<std::byte> buf(kCowChunkBytes, std::byte{0x77});
+        assert(ctx->write(0, buf).is_ok());
+        assert(ctx->flush().is_ok());
+        ctx->close();
+    }
+
+    // --- 3. Master image attribute: refused by default, lifted only explicitly
+    {
+        auto master = test_dir / "master_like.bin";
+        {
+            std::ofstream ofs(master, std::ios::binary);
+            std::vector<char> data(8192, 0x33);
+            ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+        }
+        assert(set_read_only_attribute(master));
+        assert(has_read_only_attribute(master));
+
+        // A plain read-write open MUST fail with Access Denied: nothing ever
+        // clears FILE_ATTRIBUTE_READONLY behind the caller's back.
+        {
+            RandomAccessFile rw;
+            auto denied = rw.open(master, RandomAccessFile::Access::ReadWrite);
+            assert(!denied.is_ok());
+            assert(!rw.is_open());
+            assert(std::string(denied.error().to_string()).find("Access Denied") != std::string::npos);
+            assert(has_read_only_attribute(master)); // still locked
+
+            // Same contract through the image backends (std::fstream paths).
+            auto raw_denied = RawImageBackend::open(master, /*read_only=*/false);
+            assert(!raw_denied.is_ok());
+            assert(std::string(raw_denied.error().to_string()).find("Access Denied") != std::string::npos);
+            assert(has_read_only_attribute(master));
+        }
+
+        // The sanctioned Super Client lift clears the attribute, writes, and
+        // the attribute comes back the moment the handle is released.
+        {
+            RandomAccessFile rw;
+            assert(rw.open(master, RandomAccessFile::Access::ReadWrite,
+                           ReadOnlyAttributePolicy::Lift).is_ok());
+            assert(!has_read_only_attribute(master));
+            std::vector<std::byte> one(1, std::byte{0x44});
+            assert(rw.write_at(0, one).is_ok());
+            assert(rw.flush().is_ok());
+            rw.close();
+        }
+        assert(has_read_only_attribute(master));
+
+        // Backend lift: succeeds while open, re-locks on destruction.
+        {
+            auto lifted = RawImageBackend::open(master, /*read_only=*/false,
+                                                ReadOnlyAttributePolicy::Lift);
+            assert(lifted.is_ok());
+            assert(!has_read_only_attribute(master));
+            lifted.value().reset();
+        }
+        assert(has_read_only_attribute(master));
+
+        // Deletion of a locked file needs the force helper.
+        assert(force_remove_file(master));
+        assert(!std::filesystem::exists(master));
+        assert(force_remove_file(master)); // idempotent when already gone
+    }
+
+    // --- 4. Direct base writes are impossible without super-client status ---
+    {
+        auto cow_res = UnifiedCowDevice::create(base, test_dir / "decouple.cow",
+                                              4096, "00:11:22:33:44:77");
+        assert(cow_res.is_ok());
+        auto cow = cow_res.value();
+
+        cow->set_direct_base_writes(true);
+        assert(!cow->direct_base_writes()); // refused: not a super client
+        cow->set_super_client(true);
+        assert(cow->direct_base_writes());  // honored now
+        cow->set_direct_base_writes(false);
+        assert(!cow->direct_base_writes());
+        cow->set_super_client(false);
+        cow->set_direct_base_writes(true);
+        assert(!cow->direct_base_writes()); // losing super drops the bypass
+
+        // Settings survive a re-open of the overlay.
+        cow->set_ram_writeback_bytes(8ull * 1024ull * 1024ull);
+        cow->set_flush_interval_ms(250);
+        assert(cow->ram_writeback_bytes() == 8ull * 1024ull * 1024ull);
+        assert(cow->flush_interval_ms() == 250);
+        assert(cow->open(test_dir / "decouple2.cow").is_ok());
+        assert(cow->ram_writeback_bytes() == 8ull * 1024ull * 1024ull);
+        assert(cow->flush_interval_ms() == 250);
+        assert(cow->purge_overlay().is_ok());
+    }
+
+    // --- 5. MAC colons never reach the filesystem --------------------------
+    using cobdiskless::overlay_naming::overlay_file_name;
+    using cobdiskless::overlay_naming::resolve_writeback_overlay;
+    using cobdiskless::overlay_naming::sanitize_mac;
+    assert(sanitize_mac("00:11:22:33:44:AA") == "0011223344aa");
+    assert(sanitize_mac("AA-BB-CC-DD-EE-FF") == "aabbccddeeff");
+    assert(sanitize_mac("faulty_pc").empty()); // not a MAC: no half-destroyed name
+    assert(overlay_file_name("00:11:22:33:44:AA") == "wb_0011223344aa.cow");
+    assert(overlay_file_name("faulty_pc") == "wb_faulty_pc.cow");
+
+    // An overlay already on disk under the legacy colon naming is migrated,
+    // not silently orphaned into a fresh empty overlay.
+    auto legacy = test_dir / "wb_00_11_22_33_44_5D.cow";
+    {
+        std::ofstream ofs(legacy, std::ios::binary);
+        std::vector<char> junk(64, 0x7E);
+        ofs.write(junk.data(), static_cast<std::streamsize>(junk.size()));
+    }
+    auto resolved = resolve_writeback_overlay(test_dir, "00:11:22:33:44:5D");
+    assert(resolved.filename() == "wb_00112233445d.cow");
+    assert(std::filesystem::exists(resolved));
+    assert(!std::filesystem::exists(legacy));
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_tiered_ram_writeback_and_master_immutability\n";
+}
+
+void test_dual_tier_in_memory_acceleration() {
+    std::cout << "[RUN] test_dual_tier_in_memory_acceleration\n";
+    {
+        std::unique_lock<std::shared_mutex> lock(g_base_read_cache_mutex);
+        g_base_read_cache.clear();
+    }
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_dual_tier";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Test BaseCache (Tier 1 Read Acceleration)
+    {
+        const uint64_t img_size = 512 * 1024; // 512 KiB = 8 chunks of 64 KiB
+        auto raw_path = test_dir / "base_img.raw";
+        {
+            std::ofstream ofs(raw_path, std::ios::binary);
+            std::vector<uint8_t> buf(img_size);
+            for (size_t i = 0; i < img_size; ++i) {
+                buf[i] = static_cast<uint8_t>((i / (64 * 1024)) + 0xA0);
+            }
+            ofs.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+        }
+
+        auto backend_res = RawImageBackend::open(raw_path, true);
+        assert(backend_res.is_ok());
+        auto backend = backend_res.value();
+
+        // 256 KiB cache limit (4 chunks), prefetch 2 chunks
+        BaseCache cache(backend, 256 * 1024, 2);
+        assert(cache.size() == img_size);
+        assert(cache.cached_blocks_count() == 0);
+        assert(cache.hits() == 0);
+        assert(cache.misses() == 0);
+
+        // Read within chunk 0
+        std::vector<std::byte> read_buf(1024);
+        auto r_res = cache.read(0, read_buf);
+        assert(r_res.is_ok() && r_res.value() == 1024);
+        assert(cache.misses() == 1);
+        assert(cache.hits() == 0);
+        assert(read_buf[0] == std::byte{0xA0});
+
+        // Second read in chunk 0 must be a hit
+        auto r_res2 = cache.read(2048, read_buf);
+        assert(r_res2.is_ok() && r_res2.value() == 1024);
+        assert(cache.misses() == 1);
+        assert(cache.hits() == 1);
+
+        // Cross-chunk read across chunk 0 and chunk 1 boundary:
+        // offset = 64 KiB - 512, size = 1024 bytes (512 in chunk 0, 512 in chunk 1)
+        std::vector<std::byte> cross_buf(1024);
+        auto r_cross = cache.read(64 * 1024 - 512, cross_buf);
+        assert(r_cross.is_ok() && r_cross.value() == 1024);
+        assert(cross_buf[0] == std::byte{0xA0}); // from chunk 0
+        assert(cross_buf[512] == std::byte{0xA1}); // from chunk 1
+
+        // Verify prefetching or additional hit
+        assert(cache.is_block_cached(0));
+    }
+
+    // 2. Composite clean/dirty reads through the single writeback engine.
+    //    The two-tier CowOverlaySession facade is gone: the sector-accurate
+    //    L1 cache lives inside UnifiedCowDevice now, so this is the seam that
+    //    has to hold -- clean bytes still come from the base, dirty bytes from
+    //    RAM, in the same request.
+    {
+        const uint64_t dev_size = 512 * 1024; // 512 KiB
+        auto raw_path = test_dir / "cow_base.raw";
+        {
+            std::ofstream ofs(raw_path, std::ios::binary);
+            std::vector<uint8_t> buf(dev_size, 0x11);
+            ofs.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+        }
+
+        auto backend = RawImageBackend::open(raw_path, true).value();
+        auto cow_path = test_dir / "client.cow";
+
+        auto cow_res = UnifiedCowDevice::create(backend, cow_path, 4096);
+        assert(cow_res.is_ok());
+        auto cow_sess = cow_res.value();
+        cow_sess->set_flush_interval_ms(0);         // no periodic wake
+        cow_sess->set_flush_threshold_chunks(1u << 30); // no threshold wake
+        assert(cow_sess->size() == dev_size);
+        assert(cow_sess->dirty_chunks() == 0);
+        assert(cow_sess->dirty_bytes() == 0);
+
+        // Initial read of clean sectors returns 0x11
+        std::vector<std::byte> sec_buf(1024);
+        auto r_clean = cow_sess->read(0, sec_buf);
+        assert(r_clean.is_ok() && r_clean.value() == 1024);
+        assert(sec_buf[0] == std::byte{0x11} && sec_buf[512] == std::byte{0x11});
+
+        // Dirty exactly one sector at LBA 1
+        std::vector<std::byte> write_sec(512, std::byte{0x99});
+        auto w_res = cow_sess->write(512, write_sec);
+        assert(w_res.is_ok() && w_res.value() == 512);
+
+        assert(cow_sess->dirty_chunks() == 1);
+        assert(cow_sess->dirty_bytes() == 512);
+        assert(cow_sess->is_sector_dirty(1));
+        assert(!cow_sess->is_sector_dirty(0));
+        assert(!cow_sess->is_sector_dirty(2));
+        assert(cow_sess->has_chunk(0));
+        assert(cow_sess->allocated_chunks() == 1); // owned, but still RAM-only
+
+        // LBA 0 clean from base, LBA 1 dirty from RAM, LBA 2 clean from base.
+        std::vector<std::byte> composite_buf(1536);
+        auto r_comp = cow_sess->read(0, composite_buf);
+        assert(r_comp.is_ok() && r_comp.value() == 1536);
+        assert(composite_buf[0] == std::byte{0x11});     // LBA 0 base clean
+        assert(composite_buf[512] == std::byte{0x99});   // LBA 1 RAM dirty
+        assert(composite_buf[1024] == std::byte{0x11});  // LBA 2 base clean
+
+        // The drain lands on disk: the first 64 KiB of the file is metadata,
+        // the cluster itself starts strictly after it.
+        auto flush_res = cow_sess->flush();
+        assert(flush_res.is_ok());
+        assert(cow_sess->dirty_bytes() == 0);
+        assert(cow_sess->dirty_chunks() == 0);
+        assert(cow_sess->allocated_chunks() == 1);
+        assert(std::filesystem::exists(cow_path));
+        assert(std::filesystem::file_size(cow_path) > kCowMetaBytes);
+        cow_sess->close();
+    }
+
+    // 3. Test Integration with UnifiedCowDevice and RAM Overlay
+    {
+        const uint64_t dev_size = 256 * 1024;
+        auto raw_path = test_dir / "int_base.raw";
+        {
+            std::ofstream ofs(raw_path, std::ios::binary);
+            std::vector<uint8_t> buf(dev_size, 0x22);
+            ofs.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+        }
+
+        auto backend = RawImageBackend::open(raw_path, true).value();
+        auto dev_res = UnifiedCowDevice::create(backend, test_dir / "int.cow", 4096, "00:11:22:33:44:88");
+        assert(dev_res.is_ok());
+        auto cow_dev = dev_res.value();
+
+        // Write blocks via SCSI write_blocks interface
+        std::vector<std::byte> write_data(1024, std::byte{0x77});
+        auto wb_res = cow_dev->write_blocks(4, 2, write_data);
+        assert(wb_res.is_ok());
+
+        // Read back composite: sectors 0..3 clean (0x22), 4..5 dirty (0x77)
+        std::vector<std::byte> r_span(6 * 512);
+        auto rd_res = cow_dev->read(0, r_span);
+        assert(rd_res.is_ok());
+        assert(r_span[0] == std::byte{0x22});
+        assert(r_span[4 * 512] == std::byte{0x77});
+        assert(r_span[5 * 512] == std::byte{0x77});
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_dual_tier_in_memory_acceleration\n";
+}
+
+// Stand-in for QEMU's BdrvTrackedRequest: an in-flight write blocks any
+// request that overlaps it until it completes, so a reader can never observe a
+// half-applied range. This used to live inside the deleted CowOverlaySession
+// facade -- what is under test is the policy, not the class that held it.
+struct TrackedRequestTracker {
+    struct Req {
+        uint64_t offset;
+        uint64_t len;
+        bool is_write;
+        uint64_t id;
+    };
+
+    uint64_t begin_request(uint64_t offset, uint64_t len, bool is_write) {
+        std::unique_lock<std::mutex> lk(m_);
+        const uint64_t id = ++next_id_;
+        in_flight_.push_back(Req{offset, len, is_write, id});
+        cv_.wait(lk, [&] {
+            for (const auto& r : in_flight_) {
+                if (r.id == id) continue;
+                const bool overlaps =
+                    offset < r.offset + r.len && r.offset < offset + len;
+                if (overlaps && (r.is_write || is_write)) return false;
+            }
+            return true;
+        });
+        return id;
+    }
+
+    void end_request(uint64_t id) {
+        std::lock_guard<std::mutex> lk(m_);
+        in_flight_.erase(std::remove_if(in_flight_.begin(), in_flight_.end(),
+                                        [&](const Req& r) { return r.id == id; }),
+                         in_flight_.end());
+        cv_.notify_all();
+    }
+
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::vector<Req> in_flight_;
+    uint64_t next_id_{0};
+};
+
+void test_qemu_style_high_performance_storage_engine() {
+    std::cout << "[RUN] test_qemu_style_high_performance_storage_engine\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_qemu_storage_engine";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Test In-Memory Flattened QCOW2-Lite Translation & Geometry
+    {
+        // 2048 sectors (1 MiB), 64 KiB clusters (128 sectors) -> 16 clusters
+        const uint64_t total_sectors = 2048;
+        ClientSession session(ClientId("00:11:22:33:44:55"), NetworkAddress(192, 168, 1, 55));
+        session.init_cow_cluster_map(total_sectors);
+
+        assert(session.cow_cluster_map.size() == 16);
+        assert(session.next_free_cluster.load() == 0);
+        for (uint32_t val : session.cow_cluster_map) {
+            assert(val == 0xFFFFFFFF);
+        }
+
+        // Fast Address Resolution: virtual_cluster = lba >> 7
+        uint64_t lba = 256; // Sector 256 -> virtual_cluster = 256 >> 7 = 2
+        uint32_t virtual_cluster = static_cast<uint32_t>(lba >> 7);
+        assert(virtual_cluster == 2);
+        assert(session.cow_cluster_map[virtual_cluster] == 0xFFFFFFFF);
+
+        // Append-only allocation
+        uint32_t alloc = session.next_free_cluster.fetch_add(1);
+        session.cow_cluster_map[virtual_cluster] = alloc;
+        assert(session.cow_cluster_map[2] == 0);
+        assert(session.next_free_cluster.load() == 1);
+
+        // Re-write to same cluster reuses allocated offset in-place
+        uint32_t existing_file_cluster = session.cow_cluster_map[virtual_cluster];
+        assert(existing_file_cluster == 0);
+        // Data cluster c lives at 65536 + (c << 16). Cluster 0 is NOT offset 0:
+        // the first 64 KiB of a .cow file is header + allocation table, and no
+        // cluster index can ever be expressed as an offset that overlaps it.
+        uint64_t file_offset = kCowDataOffset + (static_cast<uint64_t>(existing_file_cluster) << 16);
+        assert(file_offset == kCowDataOffset);
+        assert(file_offset >= kCowMetaBytes);
+    }
+
+    // 2. Test Request Range Overlap Protection (QEMU BdrvTrackedRequest)
+    {
+        TrackedRequestTracker tracker;
+        // Start an in-flight write covering [1024, 2048) bytes
+        uint64_t write_req_id = tracker.begin_request(1024, 1024, true);
+
+        std::atomic<bool> read_started{false};
+        std::atomic<bool> read_completed{false};
+
+        // Concurrent read covering [1536, 2560) bytes (overlaps [1024, 2048))
+        std::thread read_th([&] {
+            read_started = true;
+            uint64_t read_req_id = tracker.begin_request(1536, 1024, false);
+            read_completed = true;
+            tracker.end_request(read_req_id);
+        });
+
+        // Wait until thread starts waiting
+        while (!read_started) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // Read must be waiting on overlapping write
+        assert(!read_completed.load());
+
+        // End in-flight write -> unlocks waiting read
+        tracker.end_request(write_req_id);
+
+        if (read_th.joinable()) {
+            read_th.join();
+        }
+        assert(read_completed.load());
+
+        // Non-overlapping read does not block
+        uint64_t w2 = tracker.begin_request(0, 512, true);
+        uint64_t r2 = tracker.begin_request(4096, 512, false);
+        tracker.end_request(r2);
+        tracker.end_request(w2);
+    }
+
+    // 3. Test Global Copy-on-Read (COR) & 256 KiB Spatial Read-Ahead Engine
+    {
+        const uint64_t base_size = 1024 * 1024; // 1 MiB = 16 clusters of 64 KiB
+        auto base_path = test_dir / "cor_base.raw";
+        {
+            std::ofstream ofs(base_path, std::ios::binary);
+            std::vector<uint8_t> data(base_size);
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = static_cast<uint8_t>((i / (64 * 1024)) + 0x10);
+            }
+            ofs.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        }
+
+        {
+            std::unique_lock<std::shared_mutex> lock(g_base_read_cache_mutex);
+            g_base_read_cache.clear();
+            assert(g_base_read_cache.empty());
+        }
+
+        auto backend = RawImageBackend::open(base_path, true).value();
+        BaseCache cache(backend, 4 * 1024 * 1024);
+
+        // Read 1 sector at offset 0
+        std::vector<std::byte> read_buf(512);
+        auto r_res = cache.read(0, read_buf);
+        assert(r_res.is_ok() && r_res.value() == 512);
+        assert(read_buf[0] == std::byte{0x10});
+
+        // 256 KiB aligned boundary means 4 clusters (clusters 0, 1, 2, 3) are populated
+        {
+            std::shared_lock<std::shared_mutex> lock(g_base_read_cache_mutex);
+            assert(g_base_read_cache.find(0) != g_base_read_cache.end());
+            assert(g_base_read_cache.find(1) != g_base_read_cache.end());
+            assert(g_base_read_cache.find(2) != g_base_read_cache.end());
+            assert(g_base_read_cache.find(3) != g_base_read_cache.end());
+            assert(g_base_read_cache.find(4) == g_base_read_cache.end());
+        }
+
+        // Subsequent read by another client session hitting cluster 2 (offset 128 KiB)
+        // must be served directly from g_base_read_cache with zero backend reads (cache hit)
+        uint64_t misses_before = cache.misses();
+        uint64_t hits_before = cache.hits();
+        auto r_res2 = cache.read(2 * 64 * 1024, read_buf);
+        assert(r_res2.is_ok());
+        assert(read_buf[0] == std::byte{0x12}); // Cluster 2 byte pattern
+        assert(cache.hits() > hits_before);
+        assert(cache.misses() == misses_before);
+    }
+
+    // 4. Test Background Elevator Lazy Flush & In-Memory Write Buffer
+    {
+        const uint64_t dev_size = 1024 * 1024; // 1 MiB = 16 clusters
+        auto base_path = test_dir / "elevator_base.raw";
+        {
+            std::ofstream ofs(base_path, std::ios::binary);
+            std::vector<uint8_t> data(dev_size, 0x55);
+            ofs.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        }
+
+        auto backend = RawImageBackend::open(base_path, true).value();
+        auto cow_path = test_dir / "elevator.cow";
+
+        ClientSession session(ClientId("00:11:22:33:44:66"), NetworkAddress(192, 168, 1, 66));
+        session.init_cow_cluster_map(dev_size / 512);
+
+        auto cow_res = UnifiedCowDevice::create(backend, cow_path, 4096);
+        assert(cow_res.is_ok());
+        auto cow_sess = cow_res.value();
+        // Keep the batches deterministic so the order below is observable.
+        cow_sess->set_flush_interval_ms(0);
+        cow_sess->set_flush_threshold_chunks(1u << 30);
+
+        // Write to cluster 7 (LBA 7 * 128 = 896), cluster 2 (LBA 256), cluster 5 (LBA 640)
+        std::vector<std::byte> w_chunk(kCowChunkBytes, std::byte{0x77});
+        auto w1 = cow_sess->write(static_cast<uint64_t>(7 * 128) * 512, w_chunk);
+        assert(w1.is_ok());
+
+        std::fill(w_chunk.begin(), w_chunk.end(), std::byte{0x22});
+        auto w2 = cow_sess->write(static_cast<uint64_t>(2 * 128) * 512, w_chunk);
+        assert(w2.is_ok());
+
+        std::fill(w_chunk.begin(), w_chunk.end(), std::byte{0x55});
+        auto w3 = cow_sess->write(static_cast<uint64_t>(5 * 128) * 512, w_chunk);
+        assert(w3.is_ok());
+
+        assert(cow_sess->dirty_chunks() == 3);
+        assert(std::filesystem::file_size(cow_path) == kCowMetaBytes); // RAM only so far
+
+        // Flush commits sorted clusters to disk sequentially
+        auto flush_res = cow_sess->flush();
+        assert(flush_res.is_ok());
+        assert(cow_sess->dirty_chunks() == 0);
+
+        // The elevator walked forward: cluster 2 was assigned before 5, and 5
+        // before 7, so the file clusters are in ascending virtual order.
+        {
+            uint32_t fc2 = 0, fc5 = 0, fc7 = 0;
+            assert(cow_sess->file_cluster(2, fc2));
+            assert(cow_sess->file_cluster(5, fc5));
+            assert(cow_sess->file_cluster(7, fc7));
+            assert(fc2 < fc5);
+            assert(fc5 < fc7);
+        }
+
+        // Verify data persisted in COW file
+        std::vector<std::byte> r_buf(512);
+        auto r1 = cow_sess->read(static_cast<uint64_t>(7 * 128) * 512, r_buf);
+        assert(r1.is_ok());
+        assert(r_buf[0] == std::byte{0x77});
+
+        auto r2 = cow_sess->read(static_cast<uint64_t>(2 * 128) * 512, r_buf);
+        assert(r2.is_ok());
+        assert(r_buf[0] == std::byte{0x22});
+
+        // Untouched cluster 0 returns base data 0x55
+        auto r0 = cow_sess->read(0, r_buf);
+        assert(r0.is_ok());
+        assert(r_buf[0] == std::byte{0x55});
+
+        // 5. Test Ephemeral COW File Destruction Lifecycle
+        cow_sess->close();
+        assert(cow_sess->purge_overlay().is_ok());
+        assert(!std::filesystem::exists(cow_path));
+    }
+
+    // 6. Test Mechanical HDD Game Disk Engine (LUN 1): C-SCAN & 512 KiB Prefetch
+    {
+        const uint64_t game_size = 4 * 1024 * 1024; // 4 MiB
+        auto game_path = test_dir / "game_disk.raw";
+        {
+            std::ofstream ofs(game_path, std::ios::binary);
+            std::vector<uint8_t> data(game_size);
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = static_cast<uint8_t>((i / (512 * 1024)) + 0x30);
+            }
+            ofs.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        }
+
+        auto game_backend = RawImageBackend::open(game_path, true).value();
+        // Sized with 2 MiB cache pool (4 blocks of 512 KiB)
+        GameDiskEngine game_engine(game_backend, 2 * 1024 * 1024);
+
+        assert(game_engine.size() == game_size);
+        assert(game_engine.cached_blocks_count() == 0);
+        assert(game_engine.hits() == 0);
+        assert(game_engine.misses() == 0);
+
+        // Read 1 sector at LBA 0 (offset 0) -> Miss, triggers 512 KiB prefetch
+        std::vector<std::byte> g_buf(512);
+        auto gr1 = game_engine.read(0, g_buf);
+        assert(gr1.is_ok() && gr1.value() == 512);
+        assert(g_buf[0] == std::byte{0x30});
+        assert(game_engine.misses() == 1);
+        assert(game_engine.hits() == 0);
+        assert(game_engine.cached_blocks_count() == 1);
+
+        // Read at LBA 500 (offset 256,000, within the 512 KiB window) -> Cache Hit!
+        auto gr2 = game_engine.read(500 * 512, g_buf);
+        assert(gr2.is_ok());
+        assert(g_buf[0] == std::byte{0x30});
+        assert(game_engine.hits() == 1);
+        assert(game_engine.misses() == 1);
+
+        // Read next 512 KiB block at offset 512 KiB (LBA 1024)
+        auto gr3 = game_engine.read(512 * 1024, g_buf);
+        assert(gr3.is_ok());
+        assert(g_buf[0] == std::byte{0x31});
+        assert(game_engine.misses() == 2);
+        assert(game_engine.cached_blocks_count() == 2);
+
+        // Exercise C-SCAN sweeps with concurrent read requests across different LBAs
+        std::vector<std::thread> readers;
+        std::atomic<int> success_count{0};
+        for (int i = 0; i < 6; ++i) {
+            readers.emplace_back([&, i] {
+                std::vector<std::byte> th_buf(512);
+                uint64_t target_lba = ((i * 37) % 7) * 512;
+                auto res = game_engine.read(target_lba * 512, th_buf);
+                if (res.is_ok()) {
+                    ++success_count;
+                }
+            });
+        }
+        for (auto& th : readers) {
+            th.join();
+        }
+        assert(success_count == 6);
+
+        // Deterministically exercise C-SCAN wrap-around sweep:
+        // Clear cache, advance head to a high LBA (e.g. 3000), then issue read at lower LBA (1000)
+        game_engine.clear_cache();
+        auto r_adv = game_engine.read(3000 * 512, g_buf);
+        assert(r_adv.is_ok());
+        auto r_wrap = game_engine.read(1000 * 512, g_buf);
+        assert(r_wrap.is_ok());
+        assert(game_engine.cscan_sweeps() > 0);
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_qemu_style_high_performance_storage_engine\n";
+}
+
+void test_dhcp_proxy_mode_and_option60_filtering() {
+    std::cout << "[RUN] test_dhcp_proxy_mode_and_option60_filtering\n";
+
+    DhcpServer server(NetworkAddress(192, 168, 1, 1));
+    assert(server.mode() == DhcpServerMode::AutoSnooping);
+
+    server.set_mode(DhcpServerMode::ProxyDhcp);
+    assert(server.mode() == DhcpServerMode::ProxyDhcp);
+
+    // 1. Non-PXE Client (Standard DHCPDISCOVER without Option 60)
+    DhcpHeader standard_hdr{};
+    standard_hdr.op = 1;
+    standard_hdr.htype = 1;
+    standard_hdr.hlen = 6;
+    standard_hdr.xid = 0x11223344;
+    standard_hdr.magic_cookie[0] = 99; standard_hdr.magic_cookie[1] = 130;
+    standard_hdr.magic_cookie[2] = 83; standard_hdr.magic_cookie[3] = 99;
+    standard_hdr.chaddr[0] = 0x00; standard_hdr.chaddr[1] = 0x11; standard_hdr.chaddr[2] = 0x22;
+    standard_hdr.chaddr[3] = 0x33; standard_hdr.chaddr[4] = 0x44; standard_hdr.chaddr[5] = 0x55;
+
+    std::vector<uint8_t> std_packet(reinterpret_cast<const uint8_t*>(&standard_hdr),
+                                    reinterpret_cast<const uint8_t*>(&standard_hdr) + sizeof(DhcpHeader));
+    // Option 53 (Discover)
+    std_packet.push_back(53); std_packet.push_back(1); std_packet.push_back(1);
+    std_packet.push_back(255); // End
+
+    auto std_parse = DhcpServer::parse_packet(std_packet);
+    assert(std_parse.is_ok());
+    assert(!std_parse.value().is_pxe_client);
+
+    // 2. PXE Client (DHCPDISCOVER with Option 60 = "PXEClient")
+    DhcpHeader pxe_hdr = standard_hdr;
+    pxe_hdr.xid = 0x55667788;
+    std::vector<uint8_t> pxe_packet(reinterpret_cast<const uint8_t*>(&pxe_hdr),
+                                    reinterpret_cast<const uint8_t*>(&pxe_hdr) + sizeof(DhcpHeader));
+    pxe_packet.push_back(53); pxe_packet.push_back(1); pxe_packet.push_back(1);
+    // Option 60: Vendor Class Identifier = "PXEClient"
+    const std::string vci = "PXEClient";
+    pxe_packet.push_back(60);
+    pxe_packet.push_back(static_cast<uint8_t>(vci.size()));
+    for (char c : vci) pxe_packet.push_back(static_cast<uint8_t>(c));
+    pxe_packet.push_back(255);
+
+    auto pxe_parse = DhcpServer::parse_packet(pxe_packet);
+    assert(pxe_parse.is_ok());
+    assert(pxe_parse.value().is_pxe_client);
+    assert(pxe_parse.value().vendor_class == "PXEClient");
+
+    // Build reply for PXE client in ProxyDHCP mode
+    auto reply_res = server.build_reply(pxe_hdr, pxe_parse.value(), 2 /* DHCPOFFER */, NetworkAddress(0, 0, 0, 0));
+    assert(reply_res.is_ok());
+    const auto& rep_pkt = reply_res.value();
+    assert(rep_pkt.size() >= sizeof(DhcpHeader));
+    const auto* rep_hdr = reinterpret_cast<const DhcpHeader*>(rep_pkt.data());
+
+    // In ProxyDHCP mode: yiaddr MUST be 0.0.0.0 (no conflicting IP lease!)
+    assert(rep_hdr->yiaddr == 0);
+
+    // Inspect options in reply
+    bool has_opt60 = false;
+    bool has_opt66 = false;
+    bool has_opt67 = false;
+    bool has_opt51 = false; // lease time (must NOT exist in proxy mode)
+    bool has_opt1 = false;  // subnet mask (must NOT exist in proxy mode)
+    bool has_opt3 = false;  // router gateway (must NOT exist in proxy mode)
+    bool has_opt6 = false;  // dns server (must NOT exist in proxy mode)
+
+    size_t opt_idx = sizeof(DhcpHeader);
+    while (opt_idx < rep_pkt.size()) {
+        uint8_t code = rep_pkt[opt_idx];
+        if (code == 255) break;
+        if (code == 0) { ++opt_idx; continue; }
+        if (opt_idx + 1 >= rep_pkt.size()) break;
+        uint8_t len = rep_pkt[opt_idx + 1];
+        if (opt_idx + 2 + len > rep_pkt.size()) break;
+
+        const uint8_t* val = &rep_pkt[opt_idx + 2];
+        if (code == 60) {
+            has_opt60 = true;
+            std::string opt60_str(reinterpret_cast<const char*>(val), len);
+            assert(opt60_str == "PXEClient");
+        } else if (code == 66) {
+            has_opt66 = true;
+        } else if (code == 67) {
+            has_opt67 = true;
+        } else if (code == 51) {
+            has_opt51 = true;
+        } else if (code == 1) {
+            has_opt1 = true;
+        } else if (code == 3) {
+            has_opt3 = true;
+        } else if (code == 6) {
+            has_opt6 = true;
+        }
+        opt_idx += 2 + len;
+    }
+
+    assert(has_opt60); // Option 60 PXEClient present
+    assert(has_opt66); // Option 66 Next Server present
+    assert(has_opt67); // Option 67 Bootfile present
+    assert(!has_opt51); // No rogue lease time
+    assert(!has_opt1);  // No rogue subnet mask
+    assert(!has_opt3);  // No rogue default gateway
+    assert(!has_opt6);  // No rogue DNS server
+
+    std::cout << "  PASS: test_dhcp_proxy_mode_and_option60_filtering\n";
+}
+
+void test_dhcp_rogue_server_detection_guard() {
+    std::cout << "[RUN] test_dhcp_rogue_server_detection_guard\n";
+
+    DhcpServer server(NetworkAddress(192, 168, 1, 10));
+    assert(server.mode() == DhcpServerMode::AutoSnooping);
+    assert(!server.rogue_dhcp_detected());
+
+    // 1. Probe when no external server is answering (short timeout)
+    bool detected = server.probe_rogue_dhcp_server(50);
+    if (!detected) {
+        assert(!server.rogue_dhcp_detected());
+        assert(server.mode() == DhcpServerMode::AutoSnooping);
+    }
+
+    // 2. Test simulated external rogue DHCP detection via parser & state transition
+    // Construct a simulated DHCPOFFER packet from an external gateway router 192.168.1.1
+    DhcpHeader offer_hdr{};
+    offer_hdr.op = 2; // BOOTREPLY
+    offer_hdr.htype = 1;
+    offer_hdr.hlen = 6;
+    offer_hdr.xid = htonl(0x524F4755); // 'ROGU'
+    offer_hdr.yiaddr = inet_addr("192.168.1.150");
+    offer_hdr.siaddr = inet_addr("192.168.1.1");
+    offer_hdr.magic_cookie[0] = 99; offer_hdr.magic_cookie[1] = 130;
+    offer_hdr.magic_cookie[2] = 83; offer_hdr.magic_cookie[3] = 99;
+
+    std::vector<uint8_t> offer_pkt(reinterpret_cast<const uint8_t*>(&offer_hdr),
+                                   reinterpret_cast<const uint8_t*>(&offer_hdr) + sizeof(DhcpHeader));
+    // Option 53: DHCPOFFER (2)
+    offer_pkt.push_back(53); offer_pkt.push_back(1); offer_pkt.push_back(2);
+    // Option 54: Server Identifier = 192.168.1.1
+    offer_pkt.push_back(54); offer_pkt.push_back(4);
+    offer_pkt.push_back(192); offer_pkt.push_back(168); offer_pkt.push_back(1); offer_pkt.push_back(1);
+    offer_pkt.push_back(255); // End
+
+    auto parsed_offer = DhcpServer::parse_packet(offer_pkt);
+    assert(parsed_offer.is_ok());
+    assert(parsed_offer.value().message_type == 2);
+    assert(parsed_offer.value().server_identifier == 0xC0A80101); // 192.168.1.1
+
+    // Verify auto-downgrade logic when external server ID != server_ip_
+    uint32_t ext_si = parsed_offer.value().server_identifier;
+    NetworkAddress ext_addr((ext_si >> 24) & 0xFF, (ext_si >> 16) & 0xFF, (ext_si >> 8) & 0xFF, ext_si & 0xFF);
+    assert(ext_addr != server.server_ip());
+
+    // When an external DHCP server is detected, server mode downgrades to ProxyDhcp
+    server.set_mode(DhcpServerMode::ProxyDhcp);
+    assert(server.mode() == DhcpServerMode::ProxyDhcp);
+
+    std::cout << "  PASS: test_dhcp_rogue_server_detection_guard\n";
+}
+
+void test_iscsi_session_reinstatement_reconnect_preserves_cow_data() {
+    std::cout << "[RUN] test_iscsi_session_reinstatement_reconnect_preserves_cow_data\n";
+#if defined(_WIN32)
+    WSADATA wsa;
+    assert(WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+#endif
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_iscsi_reinstatement";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    std::filesystem::path os_path = test_dir / "golden_reinstatement.raw";
+    {
+        std::ofstream ofs(os_path, std::ios::binary);
+        // Base image filled with pattern 0x44 (64 KiB = 128 sectors)
+        std::vector<uint8_t> base_data(64 * 1024, 0x44);
+        ofs.write(reinterpret_cast<const char*>(base_data.data()), base_data.size());
+    }
+
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    Configuration cfg;
+    cfg.set_os_images_dir(test_dir);
+    cfg.set_writeback_dir(test_dir);
+    img_mgr->configure(cfg);
+    assert(img_mgr->import_image(os_path, ImageRole::OsImage, ImageId("os_reinstatement")).is_ok());
+
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir);
+
+    uint16_t port = 13271;
+    IscsiTargetConfig tcfg;
+    tcfg.listen_address = NetworkAddress(127, 0, 0, 1, port);
+    tcfg.default_os_image_id = ImageId("os_reinstatement");
+    tcfg.target_iqn = "iqn.2026-09.com.cobdiskless:storage";
+    IscsiTarget target(tcfg, sess_mgr);
+    assert(target.initialize().is_ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    const std::string initiator_name = "iqn.1991-05.com.microsoft:reinstated-client";
+    const uint8_t isid[6] = {0x40, 0x00, 0x01, 0xAA, 0xBB, 0xCC};
+
+    // =========================================================================
+    // STEP 1: Connect Socket A, perform iSCSI login with ISID, and write to LBA 50
+    // =========================================================================
+    SOCKET s_a = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(s_a != INVALID_SOCKET);
+    DWORD tv = 3000;
+    setsockopt(s_a, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+
+    sockaddr_in srv{};
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(port);
+    srv.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(s_a, reinterpret_cast<const sockaddr*>(&srv), sizeof(srv)) == 0);
+
+    perform_test_login_with_isid(s_a, initiator_name, isid, 0x7001);
+
+    // Issue WRITE 10 to write 2 sectors (1024 bytes) at LBA 50 with pattern 0x88
+    {
+        uint32_t write_len = 1024;
+        std::vector<uint8_t> write_data(write_len, 0x88);
+
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01; // SCSI Command
+        cmd.flags = 0x20 | 0x80; // Write | Final
+        cmd.initiator_task_tag = 0x7002;
+        cmd.data_seg_len[0] = static_cast<uint8_t>((write_len >> 16) & 0xFF);
+        cmd.data_seg_len[1] = static_cast<uint8_t>((write_len >> 8) & 0xFF);
+        cmd.data_seg_len[2] = static_cast<uint8_t>(write_len & 0xFF);
+
+        cmd.cdb[0] = 0x2A; // WRITE 10
+        test_write_be32(cmd.cdb + 2, 50); // LBA = 50
+        test_write_be16(cmd.cdb + 7, 2);  // Sectors = 2
+
+        assert(send_all_bytes(s_a, &cmd, sizeof(cmd)));
+        assert(send_all_bytes(s_a, write_data.data(), write_data.size()));
+
+        auto resp = recv_scsi_response(s_a);
+        assert(resp.initiator_task_tag == 0x7002);
+        assert(resp.cdb[0] == 0x00); // SCSI Status Good
+    }
+
+    // Read back on Socket A to verify write committed to session COW overlay
+    {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.flags = 0x40; // Read
+        cmd.initiator_task_tag = 0x7003;
+        cmd.cdb[0] = 0x28; // READ 10
+        test_write_be32(cmd.cdb + 2, 50);
+        test_write_be16(cmd.cdb + 7, 2);
+
+        assert(send_all_bytes(s_a, &cmd, sizeof(cmd)));
+        IscsiBhs in_bhs{};
+        auto data = recv_scsi_data_in(s_a, in_bhs);
+        assert(data.size() == 1024);
+        for (size_t i = 0; i < data.size(); ++i) {
+            assert(data[i] == 0x88);
+        }
+    }
+
+    // =========================================================================
+    // STEP 2: Abruptly drop Socket A (simulate NIC link-flap / connection drop)
+    // =========================================================================
+    closesocket(s_a);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // =========================================================================
+    // STEP 3: Connect Socket B with identical InitiatorName & ISID (RFC 3720 §5.3.5 Reinstatement)
+    // =========================================================================
+    SOCKET s_b = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(s_b != INVALID_SOCKET);
+    setsockopt(s_b, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    assert(connect(s_b, reinterpret_cast<const sockaddr*>(&srv), sizeof(srv)) == 0);
+
+    // Perform login with identical ISID on Socket B
+    perform_test_login_with_isid(s_b, initiator_name, isid, 0x8001);
+
+    // =========================================================================
+    // STEP 4: Read LBA 50 via Socket B -> COW overlay must be completely intact!
+    // =========================================================================
+    {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.flags = 0x40; // Read
+        cmd.initiator_task_tag = 0x8002;
+        cmd.cdb[0] = 0x28; // READ 10
+        test_write_be32(cmd.cdb + 2, 50);
+        test_write_be16(cmd.cdb + 7, 2);
+
+        assert(send_all_bytes(s_b, &cmd, sizeof(cmd)));
+        IscsiBhs in_bhs{};
+        auto data = recv_scsi_data_in(s_b, in_bhs);
+        assert(data.size() == 1024);
+        // Verify COW overlay preserved the written 0x88 across reconnection!
+        for (size_t i = 0; i < data.size(); ++i) {
+            assert(data[i] == 0x88);
+        }
+    }
+
+    // Verify unwritten sector LBA 0 still returns base image data 0x44
+    {
+        IscsiBhs cmd{};
+        cmd.opcode = 0x01;
+        cmd.flags = 0x40;
+        cmd.initiator_task_tag = 0x8003;
+        cmd.cdb[0] = 0x28;
+        test_write_be32(cmd.cdb + 2, 0);
+        test_write_be16(cmd.cdb + 7, 1);
+
+        assert(send_all_bytes(s_b, &cmd, sizeof(cmd)));
+        IscsiBhs in_bhs{};
+        auto data = recv_scsi_data_in(s_b, in_bhs);
+        assert(data.size() == 512);
+        for (size_t i = 0; i < data.size(); ++i) {
+            assert(data[i] == 0x44);
+        }
+    }
+
+    // =========================================================================
+    // STEP 5: Clean Logout on Socket B & Target Shutdown
+    // =========================================================================
+    {
+        IscsiBhs logout_req{};
+        logout_req.opcode = 0x06;
+        logout_req.flags = 0x80;
+        logout_req.initiator_task_tag = 0x8004;
+        assert(send_all_bytes(s_b, &logout_req, sizeof(logout_req)));
+
+        IscsiBhs logout_resp{};
+        assert(recv_all_bytes(s_b, &logout_resp, sizeof(logout_resp)));
+        assert((logout_resp.opcode & 0x3F) == 0x26);
+    }
+
+    closesocket(s_b);
+    target.shutdown();
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_iscsi_session_reinstatement_reconnect_preserves_cow_data\n";
+}
+
+void test_pnp_driver_parameter_arming_and_msi_disable() {
+    std::cout << "[RUN] test_pnp_driver_parameter_arming_and_msi_disable\n";
+
+    // 1. Verify boot start services include pre-staged NICs and required network stack
+    const auto& svcs = RegBootStart::boot_start_services();
+    bool has_rt640 = false;
+    bool has_tcpip = false;
+    bool has_ndis = false;
+    bool has_msiscsi = false;
+    for (const auto& s : svcs) {
+        if (std::string(s.service) == "rt640x64") has_rt640 = true;
+        if (std::string(s.service) == "Tcpip") has_tcpip = true;
+        if (std::string(s.service) == "ndis") has_ndis = true;
+        if (std::string(s.service) == "msiscsi") has_msiscsi = true;
+    }
+    assert(has_rt640 && has_tcpip && has_ndis && has_msiscsi);
+
+    // 2. Test minimal hive generation and arming
+    std::vector<std::pair<std::string, uint32_t>> initial_services = {
+        {"Tcpip", 3},
+        {"ndis", 3},
+        {"rt640x64", 3}
+    };
+    auto hive_buf = RegBootStart::create_minimal_system_hive(1, initial_services);
+    assert(!hive_buf.empty());
+
+    auto arm_res = RegBootStart::arm_hive_buffer(hive_buf);
+    assert(arm_res.is_ok());
+    const auto& rep = arm_res.value();
+    assert(rep.success);
+    assert(rep.iscsi_stack_armed);
+    assert(rep.boot_flags_armed);
+
+    std::cout << "  PASS: test_pnp_driver_parameter_arming_and_msi_disable\n";
+}
+
+void test_vhd_compact_os_preflight_validation() {
+    std::cout << "[RUN] test_vhd_compact_os_preflight_validation\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_compact_os_validation";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir / "Windows" / "Boot" / "Resources" / "en-US", ec);
+
+    // 1. Clean / uncompressed directory test
+    std::filesystem::path bootres_path = test_dir / "Windows" / "Boot" / "Resources" / "en-US" / "bootres.dll.mui";
+    {
+        std::ofstream ofs(bootres_path, std::ios::binary);
+        std::vector<uint8_t> dummy(12800, 0x55);
+        ofs.write(reinterpret_cast<const char*>(dummy.data()), static_cast<std::streamsize>(dummy.size()));
+    }
+    // Clean file without reparse point or :WofCompressedData should return true (pass)
+    assert(RegBootStart::validate_vhd_compact_os(test_dir));
+
+#if defined(_WIN32)
+    // 2. CompactOS compression test: compress using compact.exe /c /exe:xpress4k
+    std::filesystem::path abs_bootres = std::filesystem::absolute(bootres_path);
+    abs_bootres.make_preferred();
+    std::string comp_cmd = "\"compact.exe /c /exe:xpress4k \"" + abs_bootres.string() + "\" >nul 2>&1\"";
+    int c_ret = std::system(comp_cmd.c_str());
+    if (c_ret == 0) {
+        // File with CompactOS / WOF compression MUST return false (fatal warning detected)
+        assert(!RegBootStart::validate_vhd_compact_os(test_dir));
+
+        // Now decompress using compact.exe /u /f /exe and /u /f
+        std::string uncomp_cmd = "\"compact.exe /u /f /exe \"" + abs_bootres.string() + "\" >nul 2>&1\"";
+        std::string uncomp_ntfs = "\"compact.exe /u /f \"" + abs_bootres.string() + "\" >nul 2>&1\"";
+        (void)std::system(uncomp_cmd.c_str());
+        (void)std::system(uncomp_ntfs.c_str());
+        // Clean uncompressed file MUST return true (pass)
+        assert(RegBootStart::validate_vhd_compact_os(test_dir));
+    }
+#endif
+
+    // 3. Real base VHD test (G:\G\csmw10.VHD) if present
+    std::filesystem::path real_vhd = "G:\\G\\csmw10.VHD";
+    if (std::filesystem::exists(real_vhd, ec)) {
+        bool vhd_clean = RegBootStart::validate_vhd_compact_os(real_vhd);
+        (void)vhd_clean;
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_vhd_compact_os_preflight_validation\n";
+}
+
+void test_dynamic_ipxe_dispatcher_and_zero_touch_enrollment() {
+    std::cout << "[RUN] test_dynamic_ipxe_dispatcher_and_zero_touch_enrollment\n";
+    std::error_code ec;
+    const std::filesystem::path test_dir = "test_scratch_zero_touch_enrollment";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir / "assets" / "boot", ec);
+
+    // Create dummy boot assets
+    {
+        std::ofstream(test_dir / "assets" / "boot" / "wimboot", std::ios::binary) << "MOCK_WIMBOOT";
+        std::ofstream(test_dir / "assets" / "boot" / "BCD", std::ios::binary) << "MOCK_BCD";
+        std::ofstream(test_dir / "assets" / "boot" / "boot.sdi", std::ios::binary) << "MOCK_BOOT_SDI";
+        std::ofstream(test_dir / "assets" / "boot" / "cob_pe.wim", std::ios::binary) << "MOCK_COB_PE_WIM";
+    }
+
+    const std::filesystem::path db_path = test_dir / "clients.json";
+    auto db = std::make_shared<ClientDatabase>(db_path);
+    db->configure_pool(NetworkAddress(192, 168, 1, 100), NetworkAddress(192, 168, 1, 200));
+    db->set_default_base_image("csmw10.VHD");
+
+    const std::filesystem::path st_path = test_dir / "stations.json";
+    auto smgr = std::make_shared<StationManager>(st_path);
+
+    auto cmgr = std::make_shared<ClientManager>(test_dir / "boot_states.json");
+
+    HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
+    daemon.set_client_database(db);
+    daemon.set_station_manager(smgr);
+    daemon.set_client_manager(cmgr);
+    daemon.set_static_root(test_dir / "assets");
+    daemon.set_server_ip(NetworkAddress(192, 168, 1, 100));
+    daemon.set_target_iqn("iqn.2026-10.local.cobdiskless:storage");
+
+    const std::string test_mac = "00:11:22:33:44:55";
+    const std::string test_uuid = "12345678-1234-1234-1234-123456789abc";
+
+    // 1. Case B: Unknown client hits /boot.ipxe -> routes to WinPE bootstrap script
+    HttpResponse r1 = daemon.handle_request("GET", "/boot.ipxe?mac=" + test_mac + "&uuid=" + test_uuid);
+    assert(r1.status == 200);
+    assert(r1.body.find("wimboot") != std::string::npos);
+    assert(r1.body.find("boot.sdi") != std::string::npos);
+    assert(r1.body.find("cob_pe.wim") != std::string::npos || r1.body.find("boot.wim") != std::string::npos);
+    assert(r1.body.find("sanboot") == std::string::npos);
+    assert(r1.body.find("iscsi:") == std::string::npos);
+
+    // 2. Stream static boot assets (/boot/<file>)
+    HttpResponse rw = daemon.handle_request("GET", "/boot/wimboot");
+    assert(rw.status == 200);
+    HttpResponse rp = daemon.handle_request("GET", "/boot/cob_pe.wim");
+    assert(rp.status == 200);
+
+    // 3. Automated Agent Enrollment via POST /api/v1/client/enroll
+    std::string enroll_payload = "{\n"
+        "  \"mac\": \"" + test_mac + "\",\n"
+        "  \"uuid\": \"" + test_uuid + "\",\n"
+        "  \"hardware_id\": \"PCI\\\\VEN_10EC&DEV_8168&SUBSYS_816810EC&REV_06\",\n"
+        "  \"subsystem_id\": \"SUBSYS_816810EC\",\n"
+        "  \"revision\": \"06\",\n"
+        "  \"device_instance\": \"PCI\\\\VEN_10EC&DEV_8168&SUBSYS_816810EC&REV_06\\\\4&387e07ef&0&00E4\"\n"
+        "}";
+
+    HttpResponse r_enroll = daemon.handle_request("POST", "/api/v1/client/enroll", enroll_payload);
+    assert(r_enroll.status == 200);
+    auto json_resp = JsonValue::parse(r_enroll.body);
+    assert(json_resp.has_value());
+    assert(json_resp->find("status")->as_string() == "OK");
+    assert(json_resp->find("is_validated")->as_bool() == true);
+    assert(json_resp->find("hardware_layer")->as_string().find(".vhdx") != std::string::npos);
+
+    // Verify machine record in DB is validated
+    auto opt_rec = db->store()->find(test_mac);
+    assert(opt_rec.has_value());
+    assert(opt_rec->is_validated);
+    assert(opt_rec->uuid == test_uuid);
+    assert(opt_rec->hardware_id.find("VEN_10EC") != std::string::npos);
+
+    // 4. Case A: Validated client hits /boot.ipxe -> routes to native iSCSI boot script
+    HttpResponse r2 = daemon.handle_request("GET", "/boot.ipxe?mac=" + test_mac + "&uuid=" + test_uuid);
+    assert(r2.status == 200);
+    assert(r2.body.find("sanboot") != std::string::npos);
+    assert(r2.body.find("iscsi:192.168.1.100") != std::string::npos);
+    assert(r2.body.find("wimboot") == std::string::npos);
+
+    // Cleanup
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::remove_all("hardware_profiles", ec);
+    std::cout << "  PASS: test_dynamic_ipxe_dispatcher_and_zero_touch_enrollment\n";
+}
+
+void test_tiered_storage_engine_3_layer_dispatch() {
+    std::cout << "[RUN] test_tiered_storage_engine_3_layer_dispatch\n";
+    std::error_code ec;
+    const std::filesystem::path test_dir = "test_scratch_tiered_storage";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    const std::filesystem::path base_path = test_dir / "base.raw";
+    const std::filesystem::path l1_cow_path = test_dir / "hw_profile.cow";
+    const std::filesystem::path l2_cow_path = test_dir / "session.cow";
+
+    // 1. Prepare Layer 0 (Base image) of 1 MB filled with pattern 0x11
+    {
+        std::ofstream base_out(base_path, std::ios::binary);
+        std::vector<uint8_t> base_data(1024 * 1024, 0x11);
+        base_out.write(reinterpret_cast<const char*>(base_data.data()), base_data.size());
+    }
+
+    auto base_dev_res = RawImageBackend::open(base_path, true);
+    assert(base_dev_res.is_ok());
+    auto layer0_base = base_dev_res.value();
+
+    // 2. Prepare Layer 1 (Hardware Profile COW) on top of base
+    auto l1_cow_res = UnifiedCowDevice::create(layer0_base, l1_cow_path, 4096);
+    assert(l1_cow_res.is_ok());
+    auto layer1_hw = l1_cow_res.value();
+
+    // 3. Prepare Layer 2 (Session Ephemeral COW) on top of base
+    auto l2_cow_res = UnifiedCowDevice::create(layer0_base, l2_cow_path, 4096);
+    assert(l2_cow_res.is_ok());
+    auto layer2_sess = l2_cow_res.value();
+
+    // 4. Construct TieredBlockDevice
+    TieredBlockDevice tiered(layer0_base, layer1_hw, layer2_sess);
+    assert(tiered.size() == 1024 * 1024);
+    assert(tiered.block_size() == 512);
+    assert(!tiered.is_read_only());
+
+    // 5. Initial Read: falls completely through to Layer 0 (0x11)
+    std::vector<std::byte> read_buf(4096, std::byte{0});
+    auto r0 = tiered.read(0, read_buf);
+    assert(r0.is_ok());
+    assert(r0.value() == 4096);
+    assert(std::to_integer<int>(read_buf[0]) == 0x11);
+    assert(std::to_integer<int>(read_buf[4095]) == 0x11);
+    assert(tiered.layer0_reads() > 0);
+
+    // 6. Write in Admin Capture Mode -> routes to Layer 1 (hw profile)
+    tiered.set_admin_capture_mode(true);
+    assert(tiered.admin_capture_mode());
+
+    // Write 0x22 to LBA 8 (offset 4096)
+    std::vector<std::byte> l1_write(4096, std::byte{0x22});
+    auto w_l1 = tiered.write(4096, l1_write);
+    assert(w_l1.is_ok());
+    assert(tiered.layer1_writes() == 1);
+    assert(tiered.is_layer1_dirty(8));
+    assert(!tiered.is_layer2_dirty(8));
+
+    // Turn off admin capture mode
+    tiered.set_admin_capture_mode(false);
+    assert(!tiered.admin_capture_mode());
+
+    // 7. Write in Standard Session Mode -> routes to Layer 2 (session COW)
+    // Write 0x33 to LBA 0 (offset 0)
+    std::vector<std::byte> l2_write(4096, std::byte{0x33});
+    auto w_l2 = tiered.write(0, l2_write);
+    assert(w_l2.is_ok());
+    assert(tiered.layer2_writes() == 1);
+    assert(tiered.is_layer2_dirty(0));
+    assert(!tiered.is_layer1_dirty(0));
+
+    // 8. Test 3-Tier Layering Precedence on Reads:
+    //  - LBA 0 (offset 0): Dirty in Layer 2 (0x33) -> returns 0x33 from Layer 2
+    //  - LBA 8 (offset 4096): Dirty in Layer 1 (0x22), clean in Layer 2 -> returns 0x22 from Layer 1
+    //  - LBA 16 (offset 8192): Clean in Layer 2 and Layer 1 -> returns 0x11 from Layer 0
+    std::fill(read_buf.begin(), read_buf.end(), std::byte{0});
+    assert(tiered.read(0, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0x33);
+
+    std::fill(read_buf.begin(), read_buf.end(), std::byte{0});
+    assert(tiered.read(4096, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0x22);
+
+    std::fill(read_buf.begin(), read_buf.end(), std::byte{0});
+    assert(tiered.read(8192, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0x11);
+
+    // 9. Layer 2 Overriding Layer 1:
+    // Write 0x44 to LBA 8 in normal session mode (Layer 2)
+    std::vector<std::byte> l2_override(4096, std::byte{0x44});
+    assert(tiered.write(4096, l2_override).is_ok());
+    assert(tiered.is_layer2_dirty(8));
+    assert(tiered.is_layer1_dirty(8)); // Still dirty in L1, but L2 has precedence
+
+    std::fill(read_buf.begin(), read_buf.end(), std::byte{0});
+    assert(tiered.read(4096, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0x44); // Now reads L2!
+
+    // 10. Multi-block / Multi-tier coalesced read:
+    // Read spanning 12KB (LBA 0 to LBA 24):
+    // bytes 0-4095: L2 (0x33)
+    // bytes 4096-8191: L2 (0x44)
+    // bytes 8192-12287: L0 (0x11)
+    std::vector<std::byte> span_buf(12288, std::byte{0});
+    auto span_r = tiered.read(0, span_buf);
+    assert(span_r.is_ok());
+    assert(span_r.value() == 12288);
+    assert(std::to_integer<int>(span_buf[0]) == 0x33);
+    assert(std::to_integer<int>(span_buf[4096]) == 0x44);
+    assert(std::to_integer<int>(span_buf[8192]) == 0x11);
+
+    // 11. Test write_blocks
+    std::vector<std::byte> wb_buf(1024, std::byte{0x55});
+    assert(tiered.write_blocks(32, 2, wb_buf).is_ok());
+    std::vector<std::byte> rb_buf(1024, std::byte{0});
+    assert(tiered.read(32 * 512, rb_buf).is_ok());
+    assert(std::to_integer<int>(rb_buf[0]) == 0x55);
+
+    // 12. Flush
+    assert(tiered.flush().is_ok());
+
+    // Cleanup
+    layer2_sess->close();
+    layer1_hw->close();
+    layer0_base.reset();
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_tiered_storage_engine_3_layer_dispatch\n";
+}
+
+// The 2-tier read path has exactly one contract, and this pins it down:
+// a block no overlay has touched comes back as the master's own bytes for that
+// same offset, unshifted and unmodified, and a layer that cannot supply the
+// whole run is an error rather than a success with a gap in it.
+void test_two_tier_read_miss_passes_through_and_short_read_fails() {
+    std::cout << "[RUN] test_two_tier_read_miss_passes_through_and_short_read_fails\n";
+    std::error_code ec;
+    const std::filesystem::path test_dir = "test_scratch_tiered_passthrough";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // A layer 0 whose byte at each offset is a function of that offset, so a
+    // wrong offset, a shifted read or a zero-filled sector cannot pass for a
+    // correct one. Constant fills hide exactly the bug being tested for.
+    const uint64_t kSize = 1024 * 1024;
+    auto base = std::make_shared<MemoryBlockDevice>(kSize);
+    std::vector<std::byte> expected(static_cast<size_t>(kSize));
+    for (uint64_t i = 0; i < kSize; ++i) {
+        expected[static_cast<size_t>(i)] = static_cast<std::byte>((i * 7 + 13) & 0xFF);
+    }
+    for (uint64_t off = 0; off < kSize; off += 65536) {
+        auto chunk = std::span<const std::byte>(expected.data() + off, 65536);
+        assert(base->write(off, chunk).is_ok());
+    }
+
+    auto cow_res = UnifiedCowDevice::create(base, test_dir / "session.cow", 4096);
+    assert(cow_res.is_ok());
+    auto cow = cow_res.value();
+
+    // Production wiring: layer 1 is never attached.
+    TieredBlockDevice tiered(base, nullptr, cow);
+    assert(tiered.size() == kSize);
+
+    // 1. Whole-run miss, sector aligned.
+    const uint64_t kMiss = 65536;
+    std::vector<std::byte> got(4096, std::byte{0});
+    auto r1 = tiered.read(kMiss, got);
+    assert(r1.is_ok());
+    assert(r1.value() == got.size());
+    assert(std::memcmp(got.data(), expected.data() + kMiss, got.size()) == 0);
+
+    // 2. Whole-run miss that starts and ends mid-sector: this is the case that
+    //    goes through the copy-in-temp-buffer branch.
+    const uint64_t kOdd = 1000;
+    std::vector<std::byte> odd(999, std::byte{0});
+    auto r2 = tiered.read(kOdd, odd);
+    assert(r2.is_ok());
+    assert(r2.value() == odd.size());
+    assert(std::memcmp(odd.data(), expected.data() + kOdd, odd.size()) == 0);
+
+    // 3. One dirty run inside an otherwise clean span: overlay bytes for the
+    //    dirty run, the master's bytes either side of it.
+    std::vector<std::byte> dirty(4096, std::byte{0x77});
+    assert(tiered.write(8192, dirty).is_ok());
+    assert(tiered.is_layer2_dirty(8192 / 512));
+
+    std::vector<std::byte> span(12288, std::byte{0});
+    auto r3 = tiered.read(4096, span);
+    assert(r3.is_ok());
+    assert(r3.value() == span.size());
+    assert(std::memcmp(span.data(), expected.data() + 4096, 4096) == 0);
+    for (size_t i = 0; i < 4096; ++i) {
+        assert(std::to_integer<int>(span[4096 + i]) == 0x77);
+    }
+    assert(std::memcmp(span.data() + 8192, expected.data() + 12288, 4096) == 0);
+
+    // 4. A layer 0 that returns half of what was asked. Reported as a full
+    //    read, the caller would serve the unwritten half of its buffer as
+    //    data -- so both the direct path and the run loop must refuse it.
+    class ShortReadBlockDevice : public BlockDevice {
+    public:
+        ShortReadBlockDevice(uint64_t size_bytes, size_t divisor)
+            : size_(size_bytes), divisor_(divisor) {}
+
+        [[nodiscard]] Result<size_t> read(uint64_t offset,
+                                          std::span<std::byte> destination) override {
+            if (offset >= size_) return size_t{0};
+            return destination.size() / divisor_;
+        }
+        [[nodiscard]] Result<size_t> write(uint64_t,
+                                           std::span<const std::byte>) override {
+            return Error(ErrorCode::StorageFailure, "short-read device is read-only");
+        }
+        [[nodiscard]] uint64_t size() const noexcept override { return size_; }
+
+    private:
+        uint64_t size_;
+        size_t divisor_;
+    };
+
+    auto short_dev = std::make_shared<ShortReadBlockDevice>(kSize, 2);
+
+    TieredBlockDevice tiered_fast(short_dev, nullptr, nullptr);
+    std::vector<std::byte> s1(4096, std::byte{0});
+    auto r4 = tiered_fast.read(0, s1);
+    assert(!r4.is_ok());
+
+    auto clean_cow_res = UnifiedCowDevice::create(short_dev, test_dir / "clean.cow", 4096);
+    assert(clean_cow_res.is_ok());
+    TieredBlockDevice tiered_loop(short_dev, nullptr, clean_cow_res.value());
+    std::vector<std::byte> s2(4096, std::byte{0});
+    auto r5 = tiered_loop.read(65536, s2);
+    assert(!r5.is_ok());
+
+    cow->close();
+    clean_cow_res.value()->close();
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_two_tier_read_miss_passes_through_and_short_read_fails\n";
+}
+
+// Every buffer that replaces a SYSTEM hive goes through this gate before it
+// touches the destination, so each refusal has to actually refuse: a dirty
+// sequence pair, a stale checksum, a lost signature, a mismatched hbins size.
+void test_regf_base_block_validation_refuses_corrupt_hives() {
+    std::cout << "[RUN] test_regf_base_block_validation_refuses_corrupt_hives\n";
+
+    std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+        1, {{"rt640x64", 3}, {"msiscsi", 3}});
+    assert(!hive.empty());
+    assert(hive.size() >= 0x1000);
+    assert(RegBootStart::validate_regf_buffer(hive).is_ok());
+
+    // Primary != Secondary: the hive is dirty and winload sends Phase 0 back
+    // through the companion logs instead of using it.
+    {
+        std::vector<uint8_t> dirty = hive;
+        write_le32(&dirty[0x08], 2);
+        assert(!RegBootStart::validate_regf_buffer(dirty).is_ok());
+    }
+
+    // A checksum that no longer matches the bytes being written.
+    {
+        std::vector<uint8_t> bad_csum = hive;
+        write_le32(&bad_csum[0x1FC], 0xDEADBEEFu);
+        assert(!RegBootStart::validate_regf_buffer(bad_csum).is_ok());
+    }
+
+    // Not a hive at all.
+    {
+        std::vector<uint8_t> no_sig = hive;
+        no_sig[0] = 'x';
+        assert(!RegBootStart::validate_regf_buffer(no_sig).is_ok());
+    }
+
+    // HbinsDataSize disagreeing with the bytes actually present.
+    {
+        std::vector<uint8_t> wrong_size = hive;
+        write_le32(&wrong_size[0x28], 0xFFFF0000u);
+        assert(!RegBootStart::validate_regf_buffer(wrong_size).is_ok());
+    }
+
+    // Smaller than a base block plus one hbin header.
+    {
+        std::vector<uint8_t> tiny(512, 0);
+        assert(!RegBootStart::validate_regf_buffer(tiny).is_ok());
+    }
+
+    std::cout << "  PASS: test_regf_base_block_validation_refuses_corrupt_hives\n";
+}
+
+// A NIC the manifest already records must not open the master image: the
+// shortcut has to return success against a path that does not exist, and only
+// an id nothing has recorded may reach the mount path.
+// Both halves of the rule that says an arm pass writes into adapter instances
+// only when PnP already created them: a hive with no instance gains no 0000,
+// and a hive that carries one gets the power-saving values on it.
+void test_enrollment_touches_only_existing_adapter_instance() {
+    std::cout << "[RUN] test_enrollment_touches_only_existing_adapter_instance\n";
+
+    // 1. No adapter instance in the image: CDDB row and service row land, and
+    //    the Control\Class tree is left exactly as it was found.
+    {
+        std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+            1, {{"rt640x64", 3}});
+        auto res = RegBootStart::arm_pci_hardware_buffer(hive, 0x10EC, 0x8168);
+        assert(res.is_ok());
+        assert(res.value());
+
+        const std::string raw(hive.begin(), hive.end());
+        assert(raw.find("pci#ven_10ec&dev_8168") != std::string::npos);
+
+        // The offload names still exist in this hive -- they now live on the
+        // driver's own Parameters, which enrollment writes whether or not PnP
+        // ever created an instance. What must not exist is an instance under
+        // Control\Class that PnP did not create; that is the copy the boot
+        // loader reads back as a device record nothing else agrees with (0x74).
+        assert(hive_open_path(hive,
+                              "ControlSet001\\Control\\Class\\"
+                              "{4d36e972-e325-11ce-bfc1-08002be10318}\\0000") == 0xFFFFFFFF);
+        assert(hive_open_path(hive,
+                              "ControlSet001\\Control\\Class\\"
+                              "{4d36e972-e325-11ce-bfc1-08002be10318}\\0001") == 0xFFFFFFFF);
+
+        const uint32_t params =
+            hive_open_path(hive, "ControlSet001\\Services\\rt640x64\\Parameters");
+        assert(params != 0xFFFFFFFF);
+        assert(hive_get_sz(hive, params, "*EEE") == "0");
+        assert(hive_get_sz(hive, params, "*LsoV2IPv4") == "0");
+        assert(hive_get_sz(hive, params, "*RSS") == "0");
+        assert(hive_get_sz(hive, params, "AutoPowerSaveModeEnabled") == "0");
+
+        assert(RegBootStart::validate_regf_buffer(hive).is_ok());
+    }
+
+    // 2. The same image with one instance PnP wrote: now there is somewhere to
+    //    write, and the power-saving and offload values land on it.
+    {
+        std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+            1, {{"rt640x64", 3}}, true);
+        auto res = RegBootStart::arm_pci_hardware_buffer(hive, 0x10EC, 0x8168);
+        assert(res.is_ok());
+        assert(res.value());
+
+        const std::string raw(hive.begin(), hive.end());
+        assert(raw.find("pci#ven_10ec&dev_8168") != std::string::npos);
+        // Verify Dumb-Pipe Mode offload stripping:
+        assert(raw.find("*LsoV2IPv4") != std::string::npos);
+        assert(raw.find("*LsoV2IPv6") != std::string::npos);
+        assert(raw.find("*IPChecksumOffloadIPv4") != std::string::npos);
+        assert(raw.find("*TCPChecksumOffloadIPv4") != std::string::npos);
+        assert(raw.find("*UDPChecksumOffloadIPv4") != std::string::npos);
+        assert(raw.find("*TCPChecksumOffloadIPv6") != std::string::npos);
+        assert(raw.find("*UDPChecksumOffloadIPv6") != std::string::npos);
+        assert(raw.find("*RSS") != std::string::npos);
+        assert(raw.find("*FlowControl") != std::string::npos);
+        assert(raw.find("*PriorityVLANTag") != std::string::npos);
+        // Verify Power-Saving stripping:
+        assert(raw.find("*EEE") != std::string::npos);
+        assert(raw.find("*GreenEthernet") != std::string::npos);
+        assert(raw.find("GigaLite") != std::string::npos);
+        assert(raw.find("PowerSavingMode") != std::string::npos);
+        assert(raw.find("AutoPowerSaveModeEnabled") != std::string::npos);
+        assert(raw.find("EnablePME") != std::string::npos);
+        // Verify Global TCP/IP Early-Boot Stability:
+        assert(raw.find("DisableTaskOffload") != std::string::npos);
+        assert(raw.find("DisableDHCPMediaSense") != std::string::npos);
+
+        assert(RegBootStart::validate_regf_buffer(hive).is_ok());
+    }
+
+    std::cout << "  PASS: test_enrollment_touches_only_existing_adapter_instance\n";
+}
+
+void test_ndis_sanitization_dumb_pipe_mode() {
+    std::cout << "[RUN] test_ndis_sanitization_dumb_pipe_mode\n";
+
+    // 1. Buffer-level verification of NDIS dumb-pipe mode
+    std::vector<uint8_t> hive = RegBootStart::create_minimal_system_hive(
+        1, {{"rt640x64", 3}}, true);
+    auto arm_res = RegBootStart::arm_pci_hardware_buffer(hive, 0x10EC, 0x8125);
+    assert(arm_res.is_ok());
+    assert(arm_res.value());
+
+    const std::string raw(hive.begin(), hive.end());
+    // CDDB entry for the 2.5G NIC
+    assert(raw.find("pci#ven_10ec&dev_8125") != std::string::npos);
+
+    // Verify all LSO and Checksum offload disables
+    assert(raw.find("*LsoV2IPv4") != std::string::npos);
+    assert(raw.find("*LsoV2IPv6") != std::string::npos);
+    assert(raw.find("*IPChecksumOffloadIPv4") != std::string::npos);
+    assert(raw.find("*TCPChecksumOffloadIPv4") != std::string::npos);
+    assert(raw.find("*UDPChecksumOffloadIPv4") != std::string::npos);
+    assert(raw.find("*TCPChecksumOffloadIPv6") != std::string::npos);
+    assert(raw.find("*UDPChecksumOffloadIPv6") != std::string::npos);
+
+    // Verify RSS, Flow Control and VLAN tag delays
+    assert(raw.find("*RSS") != std::string::npos);
+    assert(raw.find("*FlowControl") != std::string::npos);
+    assert(raw.find("*PriorityVLANTag") != std::string::npos);
+
+    // Verify Link Sleeping and Power Saving disables
+    assert(raw.find("*EEE") != std::string::npos);
+    assert(raw.find("*GreenEthernet") != std::string::npos);
+    assert(raw.find("GigaLite") != std::string::npos);
+    assert(raw.find("PowerSavingMode") != std::string::npos);
+    assert(raw.find("AutoPowerSaveModeEnabled") != std::string::npos);
+    assert(raw.find("EnablePME") != std::string::npos);
+
+    // Verify Global TCP/IP Early-Boot Stability parameters
+    assert(raw.find("DisableTaskOffload") != std::string::npos);
+    assert(raw.find("DisableDHCPMediaSense") != std::string::npos);
+
+    assert(RegBootStart::validate_regf_buffer(hive).is_ok());
+
+#if defined(_WIN32)
+    // 2. Win32 Registry API verification
+    HKEY h_test_root = nullptr;
+    const wchar_t* test_base = L"Software\\CobDiskless_Test_NDIS";
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, test_base, 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &h_test_root, nullptr) == ERROR_SUCCESS) {
+        // Create mock ControlSet001\Services\Tcpip\Parameters
+        HKEY h_tcpip_mock = nullptr;
+        RegCreateKeyExW(h_test_root, L"ControlSet001\\Services\\Tcpip\\Parameters", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &h_tcpip_mock, nullptr);
+        if (h_tcpip_mock) RegCloseKey(h_tcpip_mock);
+
+        // Create mock ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000
+        HKEY h_adapter_0000 = nullptr;
+        RegCreateKeyExW(h_test_root, L"ControlSet001\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}\\0000", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &h_adapter_0000, nullptr);
+        if (h_adapter_0000) RegCloseKey(h_adapter_0000);
+
+        // Run the sanitization routines against the test root
+        HKEY h_tcpip = nullptr;
+        if (RegOpenKeyExW(h_test_root, L"ControlSet001\\Services\\Tcpip\\Parameters", 0, KEY_SET_VALUE, &h_tcpip) == ERROR_SUCCESS) {
+            DWORD dword_one = 1;
+            RegSetValueExW(h_tcpip, L"DisableTaskOffload", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&dword_one), sizeof(dword_one));
+            RegSetValueExW(h_tcpip, L"DisableDHCPMediaSense", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&dword_one), sizeof(dword_one));
+            RegCloseKey(h_tcpip);
+        }
+
+        // Verify values written to mock Tcpip
+        if (RegOpenKeyExW(h_test_root, L"ControlSet001\\Services\\Tcpip\\Parameters", 0, KEY_QUERY_VALUE, &h_tcpip) == ERROR_SUCCESS) {
+            DWORD val = 0, size = sizeof(val), type = 0;
+            assert(RegQueryValueExW(h_tcpip, L"DisableTaskOffload", nullptr, &type, reinterpret_cast<LPBYTE>(&val), &size) == ERROR_SUCCESS);
+            assert(type == REG_DWORD && val == 1);
+            assert(RegQueryValueExW(h_tcpip, L"DisableDHCPMediaSense", nullptr, &type, reinterpret_cast<LPBYTE>(&val), &size) == ERROR_SUCCESS);
+            assert(type == REG_DWORD && val == 1);
+            RegCloseKey(h_tcpip);
+        }
+
+        // Cleanup test keys
+        RegDeleteKeyW(h_test_root, L"ControlSet001\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}\\0000");
+        RegDeleteKeyW(h_test_root, L"ControlSet001\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}");
+        RegDeleteKeyW(h_test_root, L"ControlSet001\\Control\\Class");
+        RegDeleteKeyW(h_test_root, L"ControlSet001\\Control");
+        RegDeleteKeyW(h_test_root, L"ControlSet001\\Services\\Tcpip\\Parameters");
+        RegDeleteKeyW(h_test_root, L"ControlSet001\\Services\\Tcpip");
+        RegDeleteKeyW(h_test_root, L"ControlSet001\\Services");
+        RegDeleteKeyW(h_test_root, L"ControlSet001");
+        RegCloseKey(h_test_root);
+        RegDeleteKeyW(HKEY_CURRENT_USER, test_base);
+    }
+#endif
+
+    std::cout << "  PASS: test_ndis_sanitization_dumb_pipe_mode\n";
+}
+
+void test_ndis_driver_service_groups_and_auto_purge_stale_cow() {
+    std::cout << "[RUN] test_ndis_driver_service_groups_and_auto_purge_stale_cow\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_driver_groups_purge";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir / "writeback", ec);
+
+    // 1. Verify on-disk auto-purge via ClientSessionManager::reset_client
+    auto registry = std::make_shared<GoldenImageRegistry>();
+    auto img_mgr = std::make_shared<ImageManager>(registry);
+    Configuration cfg;
+    img_mgr->configure(cfg);
+    auto base_vhd = test_dir / "images" / "base_img.raw";
+    std::filesystem::create_directories(base_vhd.parent_path(), ec);
+    {
+        std::ofstream ofs(base_vhd, std::ios::binary);
+        std::vector<char> zero(1024 * 1024, 0);
+        ofs.write(zero.data(), zero.size());
+    }
+    auto import_res = img_mgr->import_image(base_vhd, ImageRole::OsImage, ImageId("base_img"));
+    assert(import_res.is_ok());
+
+    auto sess_mgr = std::make_shared<ClientSessionManager>(img_mgr, test_dir / "writeback");
+
+    // Pre-create an IP writeback overlay (simulating previous crash)
+    auto ip_wb = test_dir / "writeback" / "wb_ip_192.168.1.5.cow";
+    {
+        std::ofstream ofs(ip_wb, std::ios::binary);
+        ofs.write("COWB_STALE_OVERLAY_DATA", 23);
+    }
+    assert(std::filesystem::exists(ip_wb));
+
+    // Calling reset_client for the IP must unconditionally delete the stale overlay
+    assert(sess_mgr->reset_client(ClientId("ip_192.168.1.5")).is_ok());
+    assert(!std::filesystem::exists(ip_wb));
+
+    // Pre-create a MAC writeback overlay
+    auto mac_wb = test_dir / "writeback" / "wb_001122334455.cow";
+    {
+        std::ofstream ofs(mac_wb, std::ios::binary);
+        ofs.write("COWB_STALE_MAC_DATA", 19);
+    }
+    assert(std::filesystem::exists(mac_wb));
+
+    assert(sess_mgr->reset_client(ClientId("00:11:22:33:44:55")).is_ok());
+    assert(!std::filesystem::exists(mac_wb));
+
+    // 2. Verify get_or_create_session with anonymous IP purges stale overlay before create
+    auto ip_wb2 = test_dir / "writeback" / "wb_ip_192.168.1.99.cow";
+    {
+        std::ofstream ofs(ip_wb2, std::ios::binary);
+        ofs.write("CORRUPT_OR_DIRTY_DATA", 21);
+    }
+    assert(std::filesystem::exists(ip_wb2));
+
+    ClientId cid_ip("ip_192.168.1.99");
+    NetworkAddress client_ip(192, 168, 1, 99);
+    ImageId os_id("base_img");
+    auto sess_res = sess_mgr->get_or_create_session(cid_ip, client_ip, os_id);
+    assert(sess_res.is_ok());
+    assert(sess_res.value()->cow_device()->allocated_chunks() == 0);
+    assert(sess_mgr->terminate_session(cid_ip).is_ok());
+
+#if defined(_WIN32)
+    // 3. Verify driver group hierarchy Windows registry logic
+    const wchar_t* test_base = L"Software\\CobDiskless_DriverGroupTest";
+    HKEY h_test_root = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, test_base, 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &h_test_root, nullptr) == ERROR_SUCCESS) {
+        // Pre-create mock ControlSet001\Services\ndis, msiscsi, Tcpip with incorrect groups
+        HKEY h_ndis = nullptr;
+        if (RegCreateKeyExW(h_test_root, L"ControlSet001\\Services\\ndis", 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &h_ndis, nullptr) == ERROR_SUCCESS) {
+            DWORD d3 = 3;
+            RegSetValueExW(h_ndis, L"Start", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&d3), sizeof(d3));
+            const wchar_t* bad_grp = L"NDIS";
+            RegSetValueExW(h_ndis, L"Group", 0, REG_SZ, reinterpret_cast<const BYTE*>(bad_grp), (wcslen(bad_grp) + 1) * sizeof(wchar_t));
+            HKEY h_override = nullptr;
+            RegCreateKeyExW(h_ndis, L"StartOverride", 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &h_override, nullptr);
+            if (h_override) RegCloseKey(h_override);
+            RegCloseKey(h_ndis);
+        }
+
+        HKEY h_msiscsi = nullptr;
+        if (RegCreateKeyExW(h_test_root, L"ControlSet001\\Services\\msiscsi", 0, nullptr, 0, KEY_READ | KEY_WRITE, nullptr, &h_msiscsi, nullptr) == ERROR_SUCCESS) {
+            const wchar_t* bad_grp = L"SCSI Miniport";
+            RegSetValueExW(h_msiscsi, L"Group", 0, REG_SZ, reinterpret_cast<const BYTE*>(bad_grp), (wcslen(bad_grp) + 1) * sizeof(wchar_t));
+            RegCloseKey(h_msiscsi);
+        }
+
+        // Apply hierarchy
+        cobdiskless::apply_driver_group_hierarchy(h_test_root, L"ControlSet001");
+
+        // Verify ndis is NDIS Wrapper, Start=0, StartOverride deleted
+        if (RegOpenKeyExW(h_test_root, L"ControlSet001\\Services\\ndis", 0, KEY_READ, &h_ndis) == ERROR_SUCCESS) {
+            DWORD start = 99;
+            DWORD sz = sizeof(start);
+            RegQueryValueExW(h_ndis, L"Start", nullptr, nullptr, reinterpret_cast<LPBYTE>(&start), &sz);
+            assert(start == 0);
+
+            wchar_t grp[64] = {0};
+            sz = sizeof(grp);
+            RegQueryValueExW(h_ndis, L"Group", nullptr, nullptr, reinterpret_cast<LPBYTE>(grp), &sz);
+            assert(std::wstring(grp) == L"NDIS Wrapper");
+
+            HKEY h_override = nullptr;
+            assert(RegOpenKeyExW(h_ndis, L"StartOverride", 0, KEY_READ, &h_override) != ERROR_SUCCESS);
+            RegCloseKey(h_ndis);
+        }
+
+        // Verify msiscsi is iSCSI
+        if (RegOpenKeyExW(h_test_root, L"ControlSet001\\Services\\msiscsi", 0, KEY_READ, &h_msiscsi) == ERROR_SUCCESS) {
+            wchar_t grp[64] = {0};
+            DWORD sz = sizeof(grp);
+            RegQueryValueExW(h_msiscsi, L"Group", nullptr, nullptr, reinterpret_cast<LPBYTE>(grp), &sz);
+            assert(std::wstring(grp) == L"iSCSI");
+            RegCloseKey(h_msiscsi);
+        }
+
+        RegCloseKey(h_test_root);
+        RegDeleteKeyW(HKEY_CURRENT_USER, test_base);
+    }
+#endif
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_ndis_driver_service_groups_and_auto_purge_stale_cow\n";
+}
+
+// A SYSTEM hive that already sits on a mounted volume is armed through
+// RegLoadKeyW / reg.exe load and through nothing else. Without the privilege
+// the call is refused and the file is left exactly as it was found: no
+// half-applied cells, no partial device record for the boot loader to reject.
+void test_mounted_volume_hive_never_uses_the_raw_writer() {
+    std::cout << "[RUN] test_mounted_volume_hive_never_uses_the_raw_writer\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_mounted_volume_arm";
+    std::filesystem::remove_all(test_dir, ec);
+    const auto win_cfg = test_dir / "Windows" / "System32" / "config";
+    std::filesystem::create_directories(win_cfg, ec);
+    const auto hive_path = win_cfg / "SYSTEM";
+
+    auto hive = RegBootStart::create_minimal_system_hive(1, {{"msiscsi", 3}});
+    {
+        std::ofstream out(hive_path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(hive.data()),
+                  static_cast<std::streamsize>(hive.size()));
+    }
+
+    const auto bytes_of = [](const std::filesystem::path& p) {
+        std::ifstream in(p, std::ios::binary);
+        return std::vector<char>((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+    };
+    const std::vector<char> before = bytes_of(hive_path);
+
+    auto res = RegBootStart::arm_mounted_volume_hive(hive_path);
+    const std::vector<char> after = bytes_of(hive_path);
+
+    if (res.is_ok()) {
+        // An elevated run: the hive loaded, armed and unloaded, so the bytes
+        // moved -- because Windows wrote them.
+        assert(res.value().success);
+        assert(before != after);
+    } else {
+        // The one error that legitimately arrives after the bytes moved is a
+        // failed unload: there the OS had already written the hive and could
+        // not let go of it. Every other refusal means nothing was written, and
+        // that is the property this test exists for.
+        const std::string msg(res.error().message());
+        if (msg.find("RegUnLoadKeyW") == std::string::npos) {
+            assert(before == after);
+        }
+        assert(msg.find("Refusing to arm") != std::string::npos ||
+               msg.find("RegUnLoadKeyW") != std::string::npos);
+    }
+
+    // Not a regf file: refused before any privilege work is attempted.
+    const auto not_hive = test_dir / "not_a_hive.bin";
+    {
+        std::ofstream out(not_hive, std::ios::binary | std::ios::trunc);
+        out << "not a hive at all";
+    }
+    assert(RegBootStart::arm_mounted_volume_hive(not_hive).is_err());
+
+    // Missing hive: refused by name, not by attempting a mount.
+    assert(RegBootStart::arm_mounted_volume_hive(test_dir / "nope" / "SYSTEM").is_err());
+
+    // The layout test that keeps the raw writers off an image, and the raw
+    // enrollment pass declining the same file -- both independent of whether
+    // this run happens to hold the privilege.
+    assert(RegBootStart::hive_sits_on_an_image(hive_path));
+    assert(!RegBootStart::hive_sits_on_an_image(test_dir / "loose" / "SYSTEM"));
+    assert(!RegBootStart::hive_sits_on_an_image(test_dir / "SYSTEM"));
+    assert(RegBootStart::enroll_pci_hardware_offline_hive(hive_path, 0x10EC, 0x8168).is_err());
+    assert(bytes_of(hive_path) == after);
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_mounted_volume_hive_never_uses_the_raw_writer\n";
+}
+
+void test_enrollment_short_circuits_on_recorded_manifest() {
+    std::cout << "[RUN] test_enrollment_short_circuits_on_recorded_manifest\n";
+    std::error_code ec;
+    const std::filesystem::path test_dir = "test_scratch_enrollment_short_circuit";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    const std::filesystem::path manifest_path = test_dir / "hardware_manifest.json";
+    HardwareManifest manifest(manifest_path);
+    assert(manifest.load().is_ok());
+    assert(manifest.enroll(HardwareManifest::hardware_id(0x10EC, 0x8168)));
+    RegBootStart::set_hardware_manifest_path(manifest_path);
+
+    // No file to mount. Reaching the mount path at all would fail here, so a
+    // success proves the image was never opened.
+    const std::filesystem::path missing = test_dir / "definitely_not_here.vhd";
+    assert(!std::filesystem::exists(missing, ec));
+
+    auto recorded = RegBootStart::arm_vhd_pci_hardware(missing, 0x10EC, 0x8168);
+    assert(recorded.is_ok());
+    assert(recorded.value().success);
+    assert(recorded.value().message.find("not opened") != std::string::npos);
+    assert(!std::filesystem::exists(missing, ec));
+
+    // An id the manifest does not carry is not short-circuited: it reaches the
+    // pipeline, which cannot mount a file that is not there.
+    auto unknown = RegBootStart::arm_vhd_pci_hardware(missing, 0x8086, 0x15F3);
+    assert(!unknown.is_ok());
+    assert(!std::filesystem::exists(missing, ec));
+
+    // Hand the global back so nothing after this test inherits the scratch
+    // manifest.
+    RegBootStart::set_hardware_manifest_path({});
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_enrollment_short_circuits_on_recorded_manifest\n";
+}
+
+void test_l1l2_qcow2_style_sparse_cow_and_minivhd_read() {
+    std::cout << "[RUN] test_l1l2_qcow2_style_sparse_cow_and_minivhd_read\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "./test_scratch_l1l2_qcow";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Create a mock base block device (10MB) filled with 0xAA
+    const uint64_t base_size = 10 * 1024 * 1024;
+    auto base_dev = std::make_shared<MemoryBlockDevice>(base_size);
+    std::vector<std::byte> base_pattern(64 * 1024, std::byte{0xAA});
+
+    for (uint64_t off = 0; off < base_size; off += base_pattern.size()) {
+        assert(base_dev->write(off, base_pattern).is_ok());
+    }
+
+    // 2. Create L1L2CowDevice on top of base
+    std::filesystem::path hw_cow_path = test_dir / "hw_profile.cow";
+    auto hw_cow_res = L1L2CowDevice::open_or_create(base_dev, hw_cow_path, base_size);
+    assert(hw_cow_res.is_ok());
+    auto hw_cow = hw_cow_res.value();
+    assert(hw_cow->size() == base_size);
+
+    // 3. Initially, no clusters allocated; reading returns base data
+    std::vector<std::byte> read_buf(4096, std::byte{0});
+    assert(hw_cow->read(0, read_buf).is_ok());
+    assert(std::to_integer<int>(read_buf[0]) == 0xAA);
+    assert(!hw_cow->is_sector_dirty(0));
+
+    // 4. Test Partial-Cluster Read-Modify-Write (RMW):
+    // Write 4KB at offset 4KB (Cluster 0, bytes 4096..8191) with 0xBB.
+    // Unmodified bytes in Cluster 0 (0..4095 and 8192..65535) must be preserved from base (0xAA).
+    std::vector<std::byte> write_buf(4096, std::byte{0xBB});
+    assert(hw_cow->write(4096, write_buf).is_ok());
+    assert(hw_cow->is_sector_dirty(4096 / 512));
+    assert(hw_cow->is_sector_dirty(0)); // Cluster 0 is now committed
+
+    // Verify first 4KB is still 0xAA
+    std::vector<std::byte> check_buf(4096, std::byte{0});
+    assert(hw_cow->read(0, check_buf).is_ok());
+    assert(std::to_integer<int>(check_buf[0]) == 0xAA);
+
+    // Verify 4KB..8KB is 0xBB
+    assert(hw_cow->read(4096, check_buf).is_ok());
+    assert(std::to_integer<int>(check_buf[0]) == 0xBB);
+
+    // Verify 8KB..12KB is 0xAA
+    assert(hw_cow->read(8192, check_buf).is_ok());
+    assert(std::to_integer<int>(check_buf[0]) == 0xAA);
+
+    // 5. Test L1L2 persistence: flush and reopen
+    assert(hw_cow->flush().is_ok());
+    hw_cow.reset();
+
+    auto reopened_res = L1L2CowDevice::open_or_create(base_dev, hw_cow_path, base_size);
+    assert(reopened_res.is_ok());
+
+
+    auto reopened_hw = reopened_res.value();
+    assert(reopened_hw->read(4096, check_buf).is_ok());
+    assert(std::to_integer<int>(check_buf[0]) == 0xBB);
+
+    // 6. Test 3-Tier Hierarchy: Base (L3) -> Hardware COW (L2) -> Volatile Session COW (L1)
+    std::filesystem::path sess_cow_path = test_dir / "session.cow";
+    auto sess_cow_res = L1L2CowDevice::open_or_create(reopened_hw, sess_cow_path, base_size);
+    assert(sess_cow_res.is_ok());
+    auto sess_cow = sess_cow_res.value();
+
+    TieredBlockDevice tiered(base_dev, reopened_hw, sess_cow);
+
+    // Write 4KB at offset 4096 in Session COW with 0xCC (overrides Hardware COW's 0xBB)
+    std::vector<std::byte> sess_buf(4096, std::byte{0xCC});
+    assert(tiered.write(4096, sess_buf).is_ok());
+
+    // Reading from tiered at 4096 gives Session COW's 0xCC (L1 Hit)
+    assert(tiered.read(4096, check_buf).is_ok());
+    assert(std::to_integer<int>(check_buf[0]) == 0xCC);
+
+    // Reading at 0 gives Base's 0xAA (L3 fallback)
+    assert(tiered.read(0, check_buf).is_ok());
+    assert(std::to_integer<int>(check_buf[0]) == 0xAA);
+
+    // 7. Reset Volatile Session COW to 0 bytes
+    assert(sess_cow->reset().is_ok());
+    // Now reading at 4096 misses L1, falls through to Hardware COW (L2 Hit -> 0xBB)
+    assert(tiered.read(4096, check_buf).is_ok());
+    assert(std::to_integer<int>(check_buf[0]) == 0xBB);
+
+    // Teardown
+    tiered.close();
+    sess_cow.reset();
+    reopened_hw.reset();
+    base_dev.reset();
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_l1l2_qcow2_style_sparse_cow_and_minivhd_read\n";
+}
+
+void test_ipxe_sanhook_sanboot_flags_and_recovery_shell() {
+    std::cout << "[RUN] test_ipxe_sanhook_sanboot_flags_and_recovery_shell\n";
+    std::error_code ec;
+    std::filesystem::path test_dir = "test_scratch_sanhook_flags";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Verify native_iscsi_boot_script matches the exact required sequence
+    std::string script = ipxe::native_iscsi_boot_script("192.168.1.100", "${net0/mac}", "iqn.2026-09.com.cobdiskless:storage");
+    const std::string expected =
+        "#!ipxe\n"
+        "set net0/gateway 0.0.0.0\n"
+        "set keep-san 1\n"
+        "echo [CobDiskless] Attaching SAN volume for ${net0/mac}...\n"
+        "sanhook --drive 0x80 --keep iscsi:192.168.1.100::::iqn.2026-09.com.cobdiskless:storage || goto san_fail\n"
+        "sanboot --drive 0x80 || goto san_fail\n\n"
+        ":san_fail\n"
+        "echo [ERROR] Failed to attach or boot from SAN target!\n"
+        "echo Dropping to iPXE recovery shell in 5s...\n"
+        "sleep 5\n"
+        "shell\n";
+    assert(script == expected);
+
+    // 2. Verify the /boot handler's two answers under the cumulative model.
+    HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
+    daemon.set_server_ip(NetworkAddress(192, 168, 1, 200));
+    daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:storage");
+
+    // Own manifest + injected enrollment: this suite must not mount a real
+    // image, and must not enrol PCI ids another suite already recorded.
+    daemon.set_hardware_manifest_path(test_dir / "hardware_manifest.json");
+    int enroll_calls = 0;
+    daemon.set_hardware_enrollment_function(
+        [&](const std::filesystem::path&, const PciHardwareId&) -> Result<void> {
+            ++enroll_calls;
+            return {};
+        });
+
+    // Pass 1: the NIC is not in the manifest yet -> holding screen, no SAN.
+    HttpResponse enroll_resp = daemon.handle_request(
+        "GET",
+        "/boot?mac=00:11:22:33:44:55&ven=8086&dev=15f3&rev=02",
+        "",
+        "192.168.1.50"
+    );
+    assert(enroll_resp.status == 200);
+    assert(enroll_resp.body.find("#!ipxe") == 0);
+    assert(enroll_resp.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(enroll_resp.body.find(
+        "Enrolling new hardware PCI\\VEN_8086&DEV_15f3 to Master VHD...") != std::string::npos);
+    assert(enroll_resp.body.find("sleep 5\n") != std::string::npos);
+    assert(enroll_resp.body.find("reboot\n") != std::string::npos);
+    assert(enroll_resp.body.find("sanboot") == std::string::npos);
+    assert(enroll_calls == 1);
+
+    // Pass 2: the id is baked now -> the standard SAN boot script,
+    // matching the exact required sequence with --keep and error recovery shell.
+    HttpResponse boot_resp = daemon.handle_request(
+        "GET",
+        "/boot?mac=00:11:22:33:44:55&ven=8086&dev=15f3&rev=02",
+        "",
+        "192.168.1.50"
+    );
+    assert(boot_resp.status == 200);
+    const std::string expected_boot =
+        "#!ipxe\n"
+        "set net0/gateway 0.0.0.0\n"
+        "set keep-san 1\n"
+        "echo [CobDiskless] Attaching SAN volume for ${net0/mac}...\n"
+        "sanhook --drive 0x80 --keep iscsi:192.168.1.200::::iqn.2026-09.com.cobdiskless:storage || goto san_fail\n"
+        "sanboot --drive 0x80 || goto san_fail\n\n"
+        ":san_fail\n"
+        "echo [ERROR] Failed to attach or boot from SAN target!\n"
+        "echo Dropping to iPXE recovery shell in 5s...\n"
+        "sleep 5\n"
+        "shell\n";
+    assert(boot_resp.body == expected_boot);
+    assert(enroll_calls == 1); // enrolled once, never re-armed
+
+    // Verification: confirm --keep is on sanhook, sanboot has --drive 0x80, and recovery shell present.
+    assert(boot_resp.body.find("sanhook --drive 0x80 --keep iscsi:") != std::string::npos);
+    assert(boot_resp.body.find("sanboot --drive 0x80") != std::string::npos);
+    assert(boot_resp.body.find("shell") != std::string::npos);
+
+    // 3. A second, different NIC id is enrolled on its own account -- the
+    // manifest is keyed by hardware, not by station. Exact SUBSYS telemetry
+    // is required: a subsys-less Realtek request detours into sniffing
+    // instead of enrolling the generic template (see 3b).
+    HttpResponse boot_board_resp = daemon.handle_request(
+        "GET",
+        "/boot?mac=00:11:22:33:44:55&ven=10ec&dev=8168&rev=06&subsys=11001AF4&board=B550M%20PRO-VDH&uuid=12345678-1234-1234-1234-123456789abc",
+        "",
+        "192.168.1.50"
+    );
+    assert(boot_board_resp.status == 200);
+    assert(boot_board_resp.body.find("#!ipxe") == 0);
+    assert(boot_board_resp.body.find(
+        "Enrolling new hardware PCI\\VEN_10ec&DEV_8168 to Master VHD...") != std::string::npos);
+    assert(enroll_calls == 2);
+
+    // 3b. The same NIC without exact SUBSYS telemetry never enrolls: the
+    // server answers the cobsniffer detour (collect + re-chain with
+    // sniffed=1) and the enrollment function is not entered.
+    HttpResponse boot_nosubsys_resp = daemon.handle_request(
+        "GET",
+        "/boot?mac=00:11:22:33:44:55&ven=10ec&dev=8168&rev=06&board=B550M%20PRO-VDH&uuid=12345678-1234-1234-1234-123456789abc",
+        "",
+        "192.168.1.50"
+    );
+    assert(boot_nosubsys_resp.status == 200);
+    assert(boot_nosubsys_resp.body.find("#!ipxe") == 0);
+    assert(boot_nosubsys_resp.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(boot_nosubsys_resp.body.find("&sniffed=1") != std::string::npos);
+    assert(boot_nosubsys_resp.body.find("sanboot") == std::string::npos);
+    assert(enroll_calls == 2);
+
+    // 4. Hardware this project stages no driver for is refused outright: the
+    //    id is on the screen and the enrollment function is never entered.
+    //    It used to fall through to "everything unknown is a Realtek", which
+    //    hands a Broadcom card a service whose .sys is not in the image.
+    HttpResponse unknown_resp = daemon.handle_request(
+        "GET",
+        "/boot?mac=00:11:22:33:44:55&ven=14e4&dev=1657&rev=01",
+        "",
+        "192.168.1.50"
+    );
+    assert(unknown_resp.status == 200);
+    assert(unknown_resp.body.find("#!ipxe") == 0);
+    assert(unknown_resp.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(unknown_resp.body.find(
+        "Enrollment failed: no staged boot driver for PCI\\VEN_14e4&DEV_1657") != std::string::npos);
+    assert(unknown_resp.body.find("sanboot") == std::string::npos);
+    assert(enroll_calls == 2);
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_ipxe_sanhook_sanboot_flags_and_recovery_shell\n";
+}
+
+static void test_cobpxe_holding_screen_and_cdd_registry_injection() {
+    std::cout << "Running test_cobpxe_holding_screen_and_cdd_registry_injection...\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_cobpxe_gui";
+    // Clear before building: the manifest this test reads is cumulative, so a
+    // run that aborts halfway through otherwise leaves the NIC already
+    // enrolled and the next run sees a holding screen that never appears.
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. /boot for hardware the master does not carry yet answers with the
+    // holding screen. It names the PCI id being enrolled and schedules the
+    // retry; it makes no claim about registry contents and offers no SAN boot.
+    HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
+    daemon.set_server_ip(NetworkAddress(192, 168, 1, 100));
+    daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:storage");
+    daemon.set_hardware_manifest_path(test_dir / "hardware_manifest.json");
+    daemon.set_hardware_enrollment_function(
+        [](const std::filesystem::path&, const PciHardwareId&) -> Result<void> { return {}; });
+
+    HttpResponse resp = daemon.handle_request(
+        "GET",
+        "/boot?mac=00:11:22:33:44:55&ven=10ec&dev=8168&rev=06&subsys=816810EC&board=B550M%20PRO-VDH&uuid=12345678-1234-1234-1234-123456789abc",
+        "",
+        "192.168.1.50"
+    );
+    assert(resp.status == 200);
+    assert(resp.body.find("#!ipxe") == 0);
+    assert(resp.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(resp.body.find("Enrolling new hardware PCI\\VEN_10ec&DEV_8168 to Master VHD...") != std::string::npos);
+    assert(resp.body.find("sleep 5\n") != std::string::npos);
+    assert(resp.body.find("reboot\n") != std::string::npos);
+    // No SAN yet, and nothing that dresses the screen up as a registry state.
+    assert(resp.body.find("sanhook") == std::string::npos);
+    assert(resp.body.find("sanboot") == std::string::npos);
+    assert(resp.body.find("STATUS") == std::string::npos);
+    assert(resp.body.find(".cow") == std::string::npos);
+
+    // The generators directly: success screen, failure screen, SAN script.
+    std::string direct = generate_enrollment_holding_screen("8086", "15f3", "");
+    assert(direct.find("PCI\\VEN_8086&DEV_15f3") != std::string::npos);
+    assert(direct.find("sleep 5\n") != std::string::npos);
+    assert(direct.find("reboot\n") != std::string::npos);
+    assert(direct.find("sanboot") == std::string::npos);
+
+    // A failure detail is shown but must never break out of its echo line.
+    std::string failed = generate_enrollment_holding_screen("8086", "15f3", "mount refused\nby admin");
+    assert(failed.find("Enrollment failed: mount refused by admin") != std::string::npos);
+    assert(failed.find("reboot\n") != std::string::npos);
+
+    std::string san = generate_standard_san_boot_script("192.168.1.1", "iqn.test:tgt");
+    assert(san.find("sanhook --drive 0x80 --keep iscsi:192.168.1.1::::iqn.test:tgt || goto san_fail") != std::string::npos);
+    assert(san.find("sanboot --drive 0x80 || goto san_fail") != std::string::npos);
+    std::string san_defaults = generate_standard_san_boot_script("", "");
+    assert(san_defaults.find("sanhook --drive 0x80 --keep iscsi:${next-server}::::"
+                             "iqn.2026-09.com.cobdiskless:storage || goto san_fail") != std::string::npos);
+    assert(san_defaults.find("sanboot --drive 0x80 || goto san_fail") != std::string::npos);
+
+    std::string clean_san = generate_clean_sanboot_script("192.168.1.1", "iqn.test:tgt");
+    assert(clean_san.find("set keep-san 1\n") != std::string::npos);
+    assert(clean_san.find("sanboot iscsi:192.168.1.1::::iqn.test:tgt\n") != std::string::npos);
+    assert(clean_san.find("--no-describe") == std::string::npos);
+
+    // 2. Verify CobArmer::arm_station_pci_hardware successfully injects pci#ven_<ven>&dev_<dev> into a minimal SYSTEM hive
+    // Create a minimal SYSTEM hive with rt640x64 initial Start = 3
+    auto hive_bytes = RegBootStart::create_minimal_system_hive(1, {{"rt640x64", 3}});
+    assert(!hive_bytes.empty());
+
+    // Write to a test hive file
+    std::filesystem::path test_hive_path = test_dir / "hw_station.hive";
+    {
+        std::ofstream ofs(test_hive_path, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(hive_bytes.data()), static_cast<std::streamsize>(hive_bytes.size()));
+    }
+    assert(std::filesystem::exists(test_hive_path));
+
+    // Call arm_station_pci_hardware for Realtek 8168
+    auto arm_res = CobArmer::arm_station_pci_hardware(test_hive_path.string(), 0x10EC, 0x8168);
+    assert(arm_res.is_ok() && arm_res.value() == true);
+
+    // Inspect the modified hive using RegBootStart::inspect_offline_hive
+    auto inspect_res = RegBootStart::inspect_offline_hive(test_hive_path);
+    assert(inspect_res.is_ok());
+    const auto& report = inspect_res.value();
+    assert(report.valid_header);
+    assert(report.cddb_entries >= 1);
+
+    // Verify driver Start is 0, BootFlags is 1, Group is NDIS
+    bool found_rt = false;
+    for (const auto& svc : report.services) {
+        if (svc.service == "rt640x64") {
+            found_rt = true;
+            assert(svc.present);
+            assert(svc.has_start && svc.start == 0);
+            assert(svc.has_boot_flags && svc.boot_flags == 1);
+            assert(svc.group == "NDIS");
+            break;
+        }
+    }
+    assert(found_rt);
+
+    // Read raw hive bytes to verify CDDB entry and power management keys
+    {
+        std::ifstream ifs(test_hive_path, std::ios::binary);
+        std::vector<char> raw_bytes((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        std::string raw_str(raw_bytes.begin(), raw_bytes.end());
+
+        // Path 2: CDDB binding: pci#ven_10ec&dev_8168
+        assert(raw_str.find("pci#ven_10ec&dev_8168") != std::string::npos);
+        // No net class key: this hive has no adapter instance and none was
+        // invented. The ClassGUID does exist -- as the CDDB value, stored wide.
+        assert(raw_str.find("{4d36e972-e325-11ce-bfc1-08002be10318}") == std::string::npos);
+        assert(raw_str.find(wide_bytes("{4d36e972-e325-11ce-bfc1-08002be10318}")) !=
+               std::string::npos);
+
+        // Path 3: the instance-scoped overrides. This hive carries no net
+        // adapter instance (proved above -- the class key itself is absent),
+        // so an arm pass has nowhere to write them and invents no 0000: an
+        // instance PnP did not create is the second, partial copy of a device
+        // record the boot loader refuses to reconcile (0x74).
+        const std::vector<uint8_t> armed(raw_bytes.begin(), raw_bytes.end());
+        assert(hive_open_path(armed,
+                              "ControlSet001\\Control\\Class\\"
+                              "{4d36e972-e325-11ce-bfc1-08002be10318}\\0000") == 0xFFFFFFFF);
+
+        // The same overrides do land on the driver's own Parameters: that is
+        // where NDIS reads them for a NIC with no instance yet, and it is
+        // written on enrollment regardless of PnP.
+        const uint32_t params_off =
+            hive_open_path(armed, "ControlSet001\\Services\\rt640x64\\Parameters");
+        assert(params_off != 0xFFFFFFFF);
+        assert(hive_get_sz(armed, params_off, "*EEE") == "0");
+        assert(hive_get_sz(armed, params_off, "*LsoV2IPv4") == "0");
+        assert(hive_get_sz(armed, params_off, "*TCPChecksumOffloadIPv4") == "0");
+        assert(hive_get_sz(armed, params_off, "EnablePME") == "0");
+
+        // Verify StartOverride does not exist
+        assert(raw_str.find("StartOverride") == std::string::npos);
+    }
+
+    // 3. The driver map: table driven from the INFs the master image carries
+    //    (nete1g3e / net1ic64 / rt640x64 / oem0 / netrtl64), every name it
+    //    hands out is a .sys the image actually carries, and an unlisted
+    //    vendor gets nothing at all rather than a Realtek it cannot drive.
+    assert(CobArmer::resolve_driver_name(0x8086, 0x15F3) == "e2f68");
+    // 15B8 (I219-V) is in net1ic64.inf, whose binary is e1i63x64.sys --
+    // not e1d68x64, a key this image stages no binary for.
+    assert(CobArmer::resolve_driver_name(0x8086, 0x15B8) == "e1i63x64");
+    // oem0.inf (installed under the rt640x64 service on this image) carries
+    // the 2.5GbE parts, so they enroll against the staged rt640x64.sys
+    // instead of the binary-less rt68cx64.
+    assert(CobArmer::resolve_driver_name(0x10EC, 0x8125) == "rt640x64");
+    assert(CobArmer::resolve_driver_name(0x10EC, 0x8126) == "rt640x64");
+    assert(CobArmer::resolve_driver_name(0x10EC, 0x8168) == "rt640x64");
+    // QEMU's own NICs bind exactly, ahead of the Intel family fallback whose
+    // binary (e1d68x64.sys) this image never stages.
+    assert(CobArmer::resolve_driver_name(0x8086, 0x100E) == "E1G6032E");
+    assert(CobArmer::resolve_driver_name(0x8086, 0x10D3) == "e1i63x64");
+    // QEMU's rtl8139 presents 10EC:8139. netrtl64.inf is the INF that lists
+    // it (binary Rtnic64.sys); rt640x64.inf lists no 8139 device, so the old
+    // family-default answer pointed the CDDB binding at a driver that could
+    // never claim the NIC.
+    assert(CobArmer::resolve_driver_name(0x10EC, 0x8139) == "Rtnic64");
+    // Unlisted device of a staged vendor -> that vendor's family driver, never
+    // another vendor's. 15BC (I219-V) is in neither staged Intel INF, so it
+    // resolves to the named refusal e1d68x64.
+    assert(CobArmer::resolve_driver_name(0x10EC, 0x10E0) == "rt640x64");
+    assert(CobArmer::resolve_driver_name(0x8086, 0x15BC) == "e1d68x64");
+    // A vendor this project stages no driver for -> empty. 0x14E4 is Broadcom,
+    // 0x1AF4 is VirtIO: neither used to escape the "everything unknown is a
+    // Realtek" fallback.
+    assert(CobArmer::resolve_driver_name(0x14E4, 0x1657).empty());
+    assert(CobArmer::resolve_driver_name(0x1AF4, 0x1000).empty());
+    assert(CobArmer::resolve_driver_name(0x0000, 0x0000).empty());
+
+    // The service name (registry key / CDDB Service value) differs from the
+    // .sys stem exactly where the image's own INF installs them differently:
+    // netrtl64.inf installs Rtnic64.sys as service RTL8023x64 -- a key the
+    // image already carries at Start = 0 -- while the other staged miniports
+    // arm under their .sys-named keys. Unlisted vendors stay empty.
+    assert(CobArmer::resolve_driver_service(0x10EC, 0x8139) == "RTL8023x64");
+    assert(CobArmer::resolve_driver_service(0x10EC, 0x8138) == "RTL8023x64");
+    assert(CobArmer::resolve_driver_service(0x8086, 0x100E) == "E1G60");
+    assert(CobArmer::resolve_driver_service(0x8086, 0x10D3) == "e1iexpress");
+    assert(CobArmer::resolve_driver_service(0x10EC, 0x8168) == "rt640x64");
+    assert(CobArmer::resolve_driver_service(0x14E4, 0x1657).empty());
+
+    // Unknown hardware is refused rather than armed: no CDDB row, no service
+    // key, an error naming the id.
+    const auto arm_unknown = CobArmer::arm_station_pci_hardware(test_hive_path.string(), 0x14E4, 0x1657);
+    assert(!arm_unknown.is_ok());
+    assert(std::string(arm_unknown.error().message()).find("ven_14e4&dev_1657") != std::string::npos);
+
+    auto arm_intel_res = CobArmer::arm_station_pci_hardware(test_hive_path.string(), 0x8086, 0x15F3);
+    assert(arm_intel_res.is_ok() && arm_intel_res.value() == true);
+
+    auto inspect_intel = RegBootStart::inspect_offline_hive(test_hive_path);
+    assert(inspect_intel.is_ok());
+    assert(inspect_intel.value().cddb_entries >= 2);
+
+    {
+        std::ifstream ifs(test_hive_path, std::ios::binary);
+        std::vector<char> raw_bytes((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        std::string raw_str(raw_bytes.begin(), raw_bytes.end());
+        assert(raw_str.find("pci#ven_8086&dev_15f3") != std::string::npos);
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_cobpxe_holding_screen_and_cdd_registry_injection\n";
+}
+
+static void test_http_boot_uri_decoupling_and_auto_provisioning() {
+    std::cout << "Running test_http_boot_uri_decoupling_and_auto_provisioning...\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_boot_decouple";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Test split_target decoupling
+    auto [p1, q1] = HttpDaemon::split_target("http://192.168.1.1:8080/boot?mac=00:aa:bb:cc:dd:ee&ven=10ec");
+    assert(p1 == "/boot");
+    assert(q1 == "mac=00:aa:bb:cc:dd:ee&ven=10ec");
+
+    auto [p2, q2] = HttpDaemon::split_target("https://example.com/boot/?ven=8086#frag");
+    assert(p2 == "/boot/");
+    assert(q2 == "ven=8086");
+
+    auto [p3, q3] = HttpDaemon::split_target("/boot?mac=00:aa:bb:cc:dd:ee");
+    assert(p3 == "/boot");
+    assert(q3 == "mac=00:aa:bb:cc:dd:ee");
+
+    auto [p4, q4] = HttpDaemon::split_target("/boot");
+    assert(p4 == "/boot");
+    assert(q4.empty());
+
+    // 2. Test parse_query trims leading ?
+    auto params = HttpDaemon::parse_query("?mac=00:aa:bb:cc:dd:ee&ven=10ec&dev=8168");
+    assert(params.count("mac") == 1);
+    assert(params.count("?mac") == 0);
+    assert(params["mac"] == "00:aa:bb:cc:dd:ee");
+    assert(params["ven"] == "10ec");
+    assert(params["dev"] == "8168");
+
+    // 3. Test HttpDaemon handle_request with ClientDatabase auto-provisioning
+    auto store_path = test_dir / "machines_boot_test.json";
+    if (std::filesystem::exists(store_path, ec)) {
+        std::filesystem::remove(store_path, ec);
+    }
+    auto store = std::make_shared<MachineStore>(store_path);
+    auto db = std::make_shared<ClientDatabase>(store);
+    db->configure_pool(NetworkAddress(192, 168, 1, 150), NetworkAddress(192, 168, 1, 200));
+
+    HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
+    daemon.set_server_ip(NetworkAddress(192, 168, 1, 100));
+    daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:storage");
+    daemon.set_client_database(db);
+    daemon.set_hardware_manifest_path(test_dir / "hardware_manifest.json");
+    int enroll_calls = 0;
+    daemon.set_hardware_enrollment_function(
+        [&](const std::filesystem::path&, const PciHardwareId&) -> Result<void> {
+            ++enroll_calls;
+            return {};
+        });
+
+    const std::string unreg_mac = "00:AA:BB:CC:DD:EE";
+    assert(!db->find_client_by_mac(unreg_mac).has_value());
+
+    // Request with absolute URI (exact SUBSYS telemetry -> specific enroll)
+    HttpResponse resp1 = daemon.handle_request(
+        "GET",
+        "http://192.168.1.100:8080/boot?mac=00:aa:bb:cc:dd:ee&ven=10ec&dev=8168&rev=06&subsys=816810EC&board=B550M",
+        "",
+        "192.168.1.150"
+    );
+    assert(resp1.status == 200);
+    assert(resp1.body.find("#!ipxe") == 0);
+    // First sighting of this NIC -> enrollment screen, keyed by PCI id (the
+    // MAC is not part of the key: two stations with the same NIC share it).
+    assert(resp1.body.find(
+        "Enrolling new hardware PCI\\VEN_10ec&DEV_8168 to Master VHD...") != std::string::npos);
+    assert(enroll_calls == 1);
+
+    // Verify auto-provisioning succeeded
+    auto provisioned = db->find_client_by_mac(unreg_mac);
+    assert(provisioned.has_value());
+    assert(provisioned->hostname.rfind("PC-", 0) == 0);
+
+    // Request with trailing slash: /boot/?mac=... -- without exact SUBSYS
+    // telemetry the strict gate detours into sniffing instead of enrolling
+    // the generic template (that bypass is what stranded bare metal at 0x7B).
+    HttpResponse resp2 = daemon.handle_request(
+        "GET",
+        "/boot/?mac=00:aa:bb:cc:dd:ee&ven=10ec&dev=8168",
+        "",
+        "192.168.1.150"
+    );
+    assert(resp2.status == 200);
+    assert(resp2.body.find("#!ipxe") == 0);
+    assert(resp2.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(resp2.body.find("&sniffed=1") != std::string::npos);
+    assert(resp2.body.find("sanboot --drive 0x80 || goto san_fail") == std::string::npos);
+    assert(enroll_calls == 1);
+
+    // Request /boot.ipxe alias with ven/dev but no SUBSYS: same detour, and
+    // in particular no silent SAN and no reboot loop (sniffed second hops
+    // answer holding, never re-detour).
+    HttpResponse resp3 = daemon.handle_request(
+        "GET",
+        "/boot.ipxe?mac=00:aa:bb:cc:dd:ee&ven=10ec&dev=8168",
+        "",
+        "192.168.1.150"
+    );
+    assert(resp3.status == 200);
+    assert(resp3.body.find("#!ipxe") == 0);
+    assert(resp3.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(resp3.body.find("&sniffed=1") != std::string::npos);
+    assert(resp3.body.find("sanboot --drive 0x80 || goto san_fail") == std::string::npos);
+    assert(enroll_calls == 1);
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_http_boot_uri_decoupling_and_auto_provisioning\n";
+}
+
+static void test_two_pass_hardware_enrollment_workflow() {
+    std::cout << "[RUN] test_two_pass_hardware_enrollment_workflow\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_two_pass";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
+    daemon.set_server_ip(NetworkAddress(192, 168, 1, 200));
+    daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:storage");
+    daemon.set_hardware_manifest_path(test_dir / "hardware_manifest.json");
+
+    // Stand-in for the mount-and-inject pass, which needs admin rights. It
+    // records what it was asked to bake so the test can prove pass 1 called it
+    // once and pass 2 never called it again.
+    std::vector<std::pair<uint16_t, uint16_t>> enrolled_ids;
+    daemon.set_hardware_enrollment_function(
+        [&](const std::filesystem::path& image, const PciHardwareId& pci) -> Result<void> {
+            assert(!image.empty());
+            enrolled_ids.emplace_back(pci.ven, pci.dev);
+            return {};
+        });
+
+    const std::string fresh_mac = "02:11:22:33:44:99";
+
+    // Pass 1: this NIC has never been baked into the master -> holding screen.
+    // Exact SUBSYS telemetry is required: without it the strict gate detours
+    // instead of enrolling the generic template.
+    HttpResponse pass1 = daemon.handle_request(
+        "GET",
+        "/boot?mac=" + fresh_mac + "&ven=10ec&dev=8168&rev=06&subsys=816810EC&board=B550M%20GAMING",
+        "",
+        "192.168.1.80"
+    );
+    assert(pass1.status == 200);
+    assert(pass1.body.find("#!ipxe") == 0);
+    assert(pass1.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(pass1.body.find(
+        "Enrolling new hardware PCI\\VEN_10ec&DEV_8168 to Master VHD...") != std::string::npos);
+    assert(pass1.body.find("sleep 5\n") != std::string::npos);
+    assert(pass1.body.find("reboot\n") != std::string::npos);
+    assert(pass1.body.find("sanboot") == std::string::npos);
+    assert(enrolled_ids.size() == 1);
+    assert(enrolled_ids[0].first == 0x10EC);
+    assert(enrolled_ids[0].second == 0x8168);
+
+    // The manifest is the record of what the master carries, and it survives
+    // the reboot the holding screen schedules. Strict 8168: specific id only,
+    // never the generic fallback (that row is the 0x7B bypass).
+    HardwareManifest manifest(test_dir / "hardware_manifest.json");
+    assert(manifest.load().is_ok());
+    assert(manifest.size() == 1);
+    assert(manifest.is_enrolled("pci#ven_10ec&dev_8168&subsys_816810ec&rev_06"));
+
+    // Pass 2: same NIC after the reboot -> the standard SAN boot script.
+    HttpResponse pass2 = daemon.handle_request(
+        "GET",
+        "/boot?mac=" + fresh_mac + "&ven=10ec&dev=8168&rev=06&subsys=816810EC&board=B550M%20GAMING",
+        "",
+        "192.168.1.80"
+    );
+    assert(pass2.status == 200);
+    const std::string expected_pass2 =
+        "#!ipxe\n"
+        "set net0/gateway 0.0.0.0\n"
+        "set keep-san 1\n"
+        "echo [CobDiskless] Attaching SAN volume for ${net0/mac}...\n"
+        "sanhook --drive 0x80 --keep iscsi:192.168.1.200::::iqn.2026-09.com.cobdiskless:storage || goto san_fail\n"
+        "sanboot --drive 0x80 || goto san_fail\n\n"
+        ":san_fail\n"
+        "echo [ERROR] Failed to attach or boot from SAN target!\n"
+        "echo Dropping to iPXE recovery shell in 5s...\n"
+        "sleep 5\n"
+        "shell\n";
+    assert(pass2.body == expected_pass2);
+    assert(enrolled_ids.size() == 1); // enrollment happened exactly once
+
+    // The per-MAC hardware COW is gone: no hw_<mac>.cow, no hardware_profiles
+    // layer is ever created for this station.
+    const std::string clean_mac = "02_11_22_33_44_99";
+    assert(!std::filesystem::exists("E:\\writeback\\hw_" + clean_mac + ".cow", ec));
+    assert(!std::filesystem::exists("./writeback/hw_" + clean_mac + ".cow", ec));
+    assert(!std::filesystem::exists("./hardware_profiles", ec));
+
+    // A different machine with the same NIC goes straight through: the master
+    // image was enrolled, not this station.
+    HttpResponse other_mac = daemon.handle_request(
+        "GET",
+        "/boot?mac=02:11:22:33:44:AA&ven=10ec&dev=8168&rev=06&subsys=816810EC",
+        "",
+        "192.168.1.81"
+    );
+    assert(other_mac.status == 200);
+    assert(other_mac.body.find("sanhook --drive 0x80 --keep iscsi:") != std::string::npos);
+    assert(other_mac.body.find("sanboot --drive 0x80 || goto san_fail") != std::string::npos);
+    assert(other_mac.body.find("reboot") == std::string::npos);
+    assert(enrolled_ids.size() == 1);
+
+    std::filesystem::remove_all(test_dir, ec);
+
+    std::cout << "  PASS: test_two_pass_hardware_enrollment_workflow\n";
+}
+
+// -----------------------------------------------------------------------------
+// cobsniffer telemetry ingestion: SUBSYS/REV from the /boot query (or the
+// SUBSYS_/REV_ spellings) must reach the enrollment function intact and land
+// in the manifest as the specific id ONLY (no generic fallback for 8168) --
+// never truncated to ven/dev, never lowercased into the Enum key.
+// -----------------------------------------------------------------------------
+static void test_subsys_rev_telemetry_enrollment_flow() {
+    std::cout << "[RUN] test_subsys_rev_telemetry_enrollment_flow\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_subsys_flow";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
+    daemon.set_server_ip(NetworkAddress(192, 168, 1, 200));
+    daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:storage");
+    daemon.set_hardware_manifest_path(test_dir / "hardware_manifest.json");
+
+    std::vector<PciHardwareId> seen;
+    daemon.set_hardware_enrollment_function(
+        [&](const std::filesystem::path&, const PciHardwareId& pci) -> Result<void> {
+            seen.push_back(pci);
+            return {};
+        });
+
+    // Pass 1: full board telemetry -> holding screen, details intact.
+    HttpResponse pass1 = daemon.handle_request(
+        "GET",
+        "/boot?mac=6c:4b:90:2f:61:eb&ven=10ec&dev=8168&subven=17aa&subdev=307c&rev=06",
+        "",
+        "192.168.1.105"
+    );
+    assert(pass1.status == 200);
+    assert(pass1.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(seen.size() == 1);
+    assert(seen[0].ven == 0x10EC && seen[0].dev == 0x8168);
+    assert(seen[0].has_subsys);
+    assert(seen[0].subsys_vendor == 0x17AA && seen[0].subsys_device == 0x307C);
+    assert(seen[0].has_revision && seen[0].revision == 0x06);
+
+    // Manifest carries the specific id only -- never the generic fallback
+    // (that row is the 0x7B bypass for 8168).
+    HardwareManifest manifest(test_dir / "hardware_manifest.json");
+    assert(manifest.load().is_ok());
+    assert(manifest.is_enrolled("pci#ven_10ec&dev_8168&subsys_307c17aa&rev_06"));
+    assert(!manifest.is_enrolled("pci#ven_10ec&dev_8168"));
+
+    // Pass 2: same telemetry -> SAN, exactly one enrollment.
+    HttpResponse pass2 = daemon.handle_request(
+        "GET",
+        "/boot?mac=6c:4b:90:2f:61:eb&ven=10ec&dev=8168&subven=17aa&subdev=307c&rev=06",
+        "",
+        "192.168.1.105"
+    );
+    assert(pass2.status == 200);
+    assert(pass2.body.find("sanboot --drive 0x80 || goto san_fail") != std::string::npos);
+    assert(seen.size() == 1);
+
+    // A telemetry-less boot for the same NIC must NOT take SAN via any
+    // generic fallback (removed for 8168): the strict gate detours into
+    // sniffing instead. No re-enrollment, no SAN.
+    HttpResponse pass3 = daemon.handle_request(
+        "GET",
+        "/boot?mac=6c:4b:90:2f:61:eb&ven=10ec&dev=8168",
+        "",
+        "192.168.1.105"
+    );
+    assert(pass3.status == 200);
+    assert(pass3.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(pass3.body.find("&sniffed=1") != std::string::npos);
+    assert(pass3.body.find("sanboot --drive 0x80 || goto san_fail") == std::string::npos);
+    assert(seen.size() == 1);
+
+    // Single-subsys spelling is accepted too.
+    HttpResponse pass4 = daemon.handle_request(
+        "GET",
+        "/boot?mac=6c:4b:90:2f:61:ec&ven=10ec&dev=8168&subsys=816810EC&rev=06",
+        "",
+        "192.168.1.106"
+    );
+    assert(pass4.status == 200);
+    assert(pass4.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(seen.size() == 2);
+    assert(seen[1].subsys_vendor == 0x10EC && seen[1].subsys_device == 0x8168);
+
+    // The platform-probe second hop (/boot.ipxe with PCI telemetry, exactly
+    // as the probe script chains it) routes into the same enrollment pass --
+    // this is the hop stock-iPXE bare-metal stations actually take.
+    HttpResponse pass5 = daemon.handle_request(
+        "GET",
+        "/boot.ipxe?mac=6c:4b:90:2f:61:ed&platform=pcbios&ven=10ec&dev=8168&subven=17aa&subdev=1234&rev=06",
+        "",
+        "192.168.1.107"
+    );
+    assert(pass5.status == 200);
+    assert(pass5.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(seen.size() == 3);
+    assert(seen[2].ven == 0x10EC && seen[2].dev == 0x8168);
+    assert(seen[2].has_subsys && seen[2].subsys_vendor == 0x17AA && seen[2].subsys_device == 0x1234);
+    assert(seen[2].has_revision && seen[2].revision == 0x06);
+    HardwareManifest manifest2(test_dir / "hardware_manifest.json");
+    assert(manifest2.load().is_ok());
+    assert(manifest2.is_enrolled("pci#ven_10ec&dev_8168&subsys_123417aa&rev_06"));
+
+    // No SUBSYS telemetry (and no force pin): the strict gate answers the
+    // cobsniffer detour -- sniff + re-chain with sniffed=1 -- and the
+    // enrollment function is never entered. No generic enrollment, no SAN.
+    HttpResponse detour = daemon.handle_request(
+        "GET",
+        "/boot?mac=6c:4b:90:2f:61:ee&ven=10ec&dev=8168&rev=06",
+        "",
+        "192.168.1.108"
+    );
+    assert(detour.status == 200);
+    assert(detour.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(detour.body.find("&sniffed=1") != std::string::npos);
+    assert(detour.body.find("sanboot --drive 0x80 || goto san_fail") == std::string::npos);
+    assert(detour.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") == std::string::npos);
+    assert(seen.size() == 3);
+
+    // Second consecutive sniff without exact telemetry: with master pre-armed,
+    // immediately dispatches SAN boot instead of trapping client in holding screen.
+    HttpResponse held = daemon.handle_request(
+        "GET",
+        "/boot?mac=6c:4b:90:2f:61:ee&ven=10ec&dev=8168&rev=06&sniffed=1",
+        "",
+        "192.168.1.108"
+    );
+    assert(held.status == 200);
+    assert(held.body.find("sanboot --drive 0x80") != std::string::npos);
+    assert(held.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") == std::string::npos);
+    assert(seen.size() == 3);
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_subsys_rev_telemetry_enrollment_flow\n";
+}
+
+// -----------------------------------------------------------------------------
+// Station-flow hardware gate: a platform-less bare request serves the PCI
+// probe until the station's NIC is enrolled, then the silent SAN. This is
+// the hop stock-iPXE bare-metal stations need; without it they boot straight
+// into 0x7B with no enrollment attempt in the log.
+// -----------------------------------------------------------------------------
+static void test_station_probe_gated_on_enrollment() {
+    std::cout << "[RUN] test_station_probe_gated_on_enrollment\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_station_probe";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    HttpDaemon daemon(NetworkAddress(127, 0, 0, 1, 0));
+    daemon.set_server_ip(NetworkAddress(192, 168, 1, 200));
+    daemon.set_target_iqn("iqn.2026-09.com.cobdiskless:storage");
+    daemon.set_hardware_manifest_path(test_dir / "hardware_manifest.json");
+    daemon.set_image_boot_mode_resolver(
+        [](const std::string&) -> std::optional<ImageBootFacts> {
+            ImageBootFacts facts;
+            facts.boot_mode = BootMode::Bios;
+            facts.scheme = PartitionScheme::Mbr;
+            return facts;
+        });
+    int enroll_calls = 0;
+    daemon.set_hardware_enrollment_function(
+        [&](const std::filesystem::path&, const PciHardwareId&) -> Result<void> {
+            ++enroll_calls;
+            return {};
+        });
+
+    auto smgr = std::make_shared<StationManager>(test_dir / "stations.json");
+    StationEntry st;
+    st.mac = "6c:4b:90:2f:61:e1";
+    st.name = "PC-PROBE";
+    st.ip = NetworkAddress(192, 168, 1, 105);
+    st.image = "csmw10";
+    st.boot_mode = "bios";
+    st.status = "active";
+    st.last_arch = "bios"; // as the DHCP layer records on every DISCOVER
+    assert(smgr->add_or_update_station(st).is_ok());
+    daemon.set_station_manager(smgr);
+
+    auto db_path = test_dir / "clients.json";
+    auto db = std::make_shared<ClientDatabase>(db_path);
+    db->configure_pool(NetworkAddress(192, 168, 1, 150), NetworkAddress(192, 168, 1, 200));
+    daemon.set_client_database(db);
+
+    // Boot 1, bare hop: no enrolled hardware on record -> PCI probe, and the
+    // probe's chain already carries the telemetry parameters.
+    HttpResponse hop1 = daemon.handle_request(
+        "GET", "/boot.ipxe?mac=6c:4b:90:2f:61:e1", "", "192.168.1.105");
+    assert(hop1.status == 200);
+    assert(hop1.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(hop1.body.find("&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}") != std::string::npos);
+    assert(hop1.body.find("sanboot --drive 0x80") == std::string::npos);
+    assert(enroll_calls == 0);
+
+    // The probe's second hop reports telemetry -> enrollment + holding.
+    HttpResponse hop2 = daemon.handle_request(
+        "GET", "/boot.ipxe?mac=6c:4b:90:2f:61:e1&platform=pcbios&ven=10ec&dev=8168&subven=17aa&subdev=307c&rev=06",
+        "", "192.168.1.105");
+    assert(hop2.status == 200);
+    assert(hop2.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(enroll_calls == 1);
+
+    // Boot 2, bare hop: hardware now enrolled -> straight silent SAN, no probe.
+    HttpResponse hop3 = daemon.handle_request(
+        "GET", "/boot.ipxe?mac=6c:4b:90:2f:61:e1", "", "192.168.1.105");
+    assert(hop3.status == 200);
+    assert(hop3.body.find("sanhook --drive 0x80") != std::string::npos);
+    assert(hop3.body.find("platform=${platform}&ven=") == std::string::npos);
+    assert(enroll_calls == 1);
+
+    // A recorded-but-unenrolled board replays its known identity straight
+    // into enrollment: no sniff round trip is spent re-learning it.
+    {
+        MachineRecord seed;
+        seed.mac = "6c:4b:90:2f:61:e2";
+        seed.name = "PC-REPLAY";
+        seed.hardware_id = "PCI\\VEN_10EC&DEV_8168&SUBSYS_99998888&REV_06";
+        seed.subsystem_id = "99998888";
+        seed.revision = "06";
+        db->store()->put(seed);
+        StationEntry rst;
+        rst.mac = "6c:4b:90:2f:61:e2";
+        rst.name = "PC-REPLAY";
+        rst.ip = NetworkAddress(192, 168, 1, 106);
+        rst.image = "csmw10";
+        rst.boot_mode = "bios";
+        rst.status = "active";
+        rst.last_arch = "bios";
+        assert(smgr->add_or_update_station(rst).is_ok());
+    }
+    HttpResponse replay_hop = daemon.handle_request(
+        "GET", "/boot.ipxe?mac=6c:4b:90:2f:61:e2", "", "192.168.1.106");
+    assert(replay_hop.status == 200);
+    assert(replay_hop.body.find("/boot?mac=6C:4B:90:2F:61:E2&ven=10ec&dev=8168&rev=06&subsys=99998888") != std::string::npos);
+    assert(replay_hop.body.find("sanboot --drive 0x80") == std::string::npos);
+    assert(replay_hop.body.find("platform=${platform}&ven=") == std::string::npos);
+    assert(enroll_calls == 1);
+
+    // Operator pin wins over everything: force_sniff on the enrolled board
+    // serves the probe again instead of the silent SAN.
+    HttpResponse pin_resp = daemon.handle_request(
+        "PUT", "/api/v1/station?mac=6c:4b:90:2f:61:e1", "{\"force_sniff\":true}", "");
+    assert(pin_resp.status == 200);
+    HttpResponse hop4 = daemon.handle_request(
+        "GET", "/boot.ipxe?mac=6c:4b:90:2f:61:e1", "", "192.168.1.105");
+    assert(hop4.status == 200);
+    assert(hop4.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(hop4.body.find("sanboot --drive 0x80") == std::string::npos);
+    assert(enroll_calls == 1);
+
+    // UNDI stage-1 with no PCI busloc: /boot without ven/dev for a known
+    // 8168 station (generic record, PC-04's shape) must detour into
+    // sniffing -- never the legacy silent SAN that 0x7Bs the box.
+    {
+        MachineRecord seed;
+        seed.mac = "6C:4B:90:2F:61:E3";
+        seed.name = "PC-UNDI";
+        seed.hardware_id = "PCI\\VEN_10EC&DEV_8168";
+        seed.revision = "06";
+        db->store()->put(seed);
+        StationEntry ust;
+        ust.mac = "6c:4b:90:2f:61:e3";
+        ust.name = "PC-UNDI";
+        ust.ip = NetworkAddress(192, 168, 1, 107);
+        ust.image = "csmw10";
+        ust.boot_mode = "bios";
+        ust.status = "active";
+        ust.last_arch = "bios";
+        assert(smgr->add_or_update_station(ust).is_ok());
+    }
+    HttpResponse undi_hop = daemon.handle_request(
+        "GET", "/boot?mac=6c:4b:90:2f:61:e3", "", "192.168.1.107");
+    assert(undi_hop.status == 200);
+    assert(undi_hop.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(undi_hop.body.find("&sniffed=1") != std::string::npos);
+    assert(undi_hop.body.find("sanboot --drive 0x80") == std::string::npos);
+    assert(undi_hop.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") == std::string::npos);
+    assert(enroll_calls == 1);
+    // Second consecutive telemetry-less hop: immediate SAN boot dispatch.
+    HttpResponse undi_held = daemon.handle_request(
+        "GET", "/boot?mac=6c:4b:90:2f:61:e3&sniffed=1", "", "192.168.1.107");
+    assert(undi_held.status == 200);
+    assert(undi_held.body.find("sanboot --drive 0x80") != std::string::npos);
+    assert(undi_held.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") == std::string::npos);
+    assert(enroll_calls == 1);
+    // Unknown stations with zero telemetry get the explicit refusal screen
+    // (ven_0000 has no staged driver) -- never a blind SAN.
+    HttpResponse stranger = daemon.handle_request(
+        "GET", "/boot?mac=02:00:00:00:00:99", "", "192.168.1.120");
+    assert(stranger.status == 200);
+    assert(stranger.body.find("COBDISKLESS HARDWARE ENROLLMENT ENGINE") != std::string::npos);
+    assert(stranger.body.find("sanboot --drive 0x80") == std::string::npos);
+    // Force-pinned station with zero telemetry anywhere: the empty-id branch
+    // detours too (never silent SAN).
+    {
+        StationEntry fst;
+        fst.mac = "02:00:00:00:00:9a";
+        fst.name = "PC-PINNED";
+        fst.ip = NetworkAddress(192, 168, 1, 121);
+        fst.image = "csmw10";
+        fst.boot_mode = "bios";
+        fst.status = "active";
+        fst.last_arch = "bios";
+        assert(smgr->add_or_update_station(fst).is_ok());
+    }
+    HttpResponse pin2 = daemon.handle_request(
+        "PUT", "/api/v1/station?mac=02:00:00:00:00:9a", "{\"force_sniff\":true}", "");
+    assert(pin2.status == 200);
+    HttpResponse pinned_empty = daemon.handle_request(
+        "GET", "/boot?mac=02:00:00:00:00:9a", "", "192.168.1.121");
+    assert(pinned_empty.status == 200);
+    assert(pinned_empty.body.find("set ven ${pci/${busloc}.0.2:hex}") != std::string::npos);
+    assert(pinned_empty.body.find("&sniffed=1") != std::string::npos);
+    assert(pinned_empty.body.find("sanboot --drive 0x80") == std::string::npos);
+    assert(enroll_calls == 1);
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_station_probe_gated_on_enrollment\n";
+}
+
+// -----------------------------------------------------------------------------
+// Cumulative Master VHD hardware enrollment, tested at its two seams:
+//
+//   1. hardware_manifest.json -- the record of what the master already carries,
+//      its id normalization, and the fact that it only ever grows.
+//   2. RegBootStart::enroll_pci_hardware_offline_hive() -- the pass that writes
+//      one NIC's CriticalDeviceDatabase binding into a SYSTEM hive.
+//
+// Neither needs a mounted image, so neither needs admin rights; the VHD-level
+// wrapper is the only elevated part and is exercised by scripts/ instead.
+// -----------------------------------------------------------------------------
+static void test_hardware_manifest_and_offline_pci_enrollment() {
+    std::cout << "[RUN] test_hardware_manifest_and_offline_pci_enrollment\n";
+    std::error_code ec;
+    auto test_dir = std::filesystem::current_path() / "test_scratch_hw_manifest";
+    std::filesystem::remove_all(test_dir, ec);
+    std::filesystem::create_directories(test_dir, ec);
+
+    // 1. Id construction matches arm_pci_hardware_buffer() byte for byte, and
+    //    every spelling a station might send collapses onto that one form.
+    assert(HardwareManifest::hardware_id(0x10EC, 0x8168) == "pci#ven_10ec&dev_8168");
+    assert(HardwareManifest::hardware_id(0x8086, 0x15F3) == "pci#ven_8086&dev_15f3");
+    assert(HardwareManifest::hardware_id("10EC", "8168") == "pci#ven_10ec&dev_8168");
+    assert(HardwareManifest::hardware_id("10:ec", "0x8168") == "pci#ven_10ec&dev_8168");
+    assert(HardwareManifest::hardware_id("", "8168").empty());
+
+    // 1b. Full board identity: SUBSYS specializes the id (board identity),
+    // REV rides along when known; a REV without a SUBSYS cannot name a
+    // board, so it collapses back onto the generic entry.
+    {
+        PciHardwareId bare{0x10EC, 0x8168};
+        assert(HardwareManifest::hardware_id(bare) == "pci#ven_10ec&dev_8168");
+        PciHardwareId rev_only{0x10EC, 0x8168, 0, 0, 0x06, false, true};
+        assert(HardwareManifest::hardware_id(rev_only) == "pci#ven_10ec&dev_8168");
+        PciHardwareId board{0x10EC, 0x8168, 0x17AA, 0x307C, 0x06, true, true};
+        assert(HardwareManifest::hardware_id(board) ==
+               "pci#ven_10ec&dev_8168&subsys_307c17aa&rev_06");
+        PciHardwareId board_no_rev{0x10EC, 0x8168, 0x17AA, 0x307C, 0, true, false};
+        assert(HardwareManifest::hardware_id(board_no_rev) ==
+               "pci#ven_10ec&dev_8168&subsys_307c17aa");
+        assert(board.specific());
+        assert(!bare.specific());
+        assert(!rev_only.specific());
+    }
+
+    // 2. A missing file is a fresh deployment, not a failure.
+    const auto manifest_path = test_dir / "hardware_manifest.json";
+    HardwareManifest manifest(manifest_path);
+    assert(manifest.load().is_ok());
+    assert(manifest.entries().empty());
+    assert(!manifest.is_enrolled("pci#ven_10ec&dev_8168"));
+
+    assert(manifest.enroll("pci#ven_10ec&dev_8168"));
+    assert(manifest.size() == 1);
+    // Cumulative: re-enrolling the same id is a no-op, never a duplicate row.
+    assert(!manifest.enroll("pci#ven_10ec&dev_8168"));
+    assert(manifest.size() == 1);
+    assert(manifest.enroll("pci#ven_8086&dev_15f3"));
+    assert(manifest.size() == 2);
+
+    // 3. It is the file, not the process, that remembers: a fresh reader sees
+    //    exactly what was written.
+    HardwareManifest reloaded(manifest_path);
+    assert(reloaded.load().is_ok());
+    assert(reloaded.size() == 2);
+    assert(reloaded.is_enrolled("pci#ven_10ec&dev_8168"));
+    assert(reloaded.is_enrolled("pci#ven_8086&dev_15f3"));
+    assert(!reloaded.is_enrolled("pci#ven_1234&dev_5678"));
+
+    {
+        std::ifstream ifs(manifest_path, std::ios::binary);
+        std::string raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        assert(raw.find("\"baked_hardware\"") != std::string::npos);
+        assert(raw.find("pci#ven_10ec&dev_8168") != std::string::npos);
+        assert(raw.find("pci#ven_8086&dev_15f3") != std::string::npos);
+        // No temp file left behind by the atomic write.
+        assert(!std::filesystem::exists(manifest_path.string() + ".tmp", ec));
+    }
+
+    // 4. The offline enrollment pass writes the binding into a real hive.
+    auto hive_bytes = RegBootStart::create_minimal_system_hive(1, {{"rt640x64", 3}});
+    assert(!hive_bytes.empty());
+    const auto hive_path = test_dir / "enroll.hive";
+    {
+        std::ofstream ofs(hive_path, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(hive_bytes.data()),
+                  static_cast<std::streamsize>(hive_bytes.size()));
+    }
+
+    auto before = RegBootStart::inspect_offline_hive(hive_path);
+    assert(before.is_ok());
+    const std::size_t cddb_before = before.value().cddb_entries;
+
+    auto enroll_res = RegBootStart::enroll_pci_hardware_offline_hive(hive_path, 0x10EC, 0x8168);
+    assert(enroll_res.is_ok());
+    assert(enroll_res.value().success);
+    assert(enroll_res.value().message.find("pci#ven_10ec&dev_8168") != std::string::npos);
+
+    auto after = RegBootStart::inspect_offline_hive(hive_path);
+    assert(after.is_ok());
+    assert(after.value().valid_header);
+    assert(after.value().cddb_entries == cddb_before + 1);
+
+    // The driver row comes up boot-start for the machine that will read it.
+    bool found_rt = false;
+    for (const auto& svc : after.value().services) {
+        if (svc.service == "rt640x64") {
+            found_rt = true;
+            assert(svc.present);
+            assert(svc.has_start && svc.start == 0);
+            assert(svc.group == "NDIS");
+            break;
+        }
+    }
+    assert(found_rt);
+
+    {
+        std::ifstream ifs(hive_path, std::ios::binary);
+        std::string raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        assert(raw.find("pci#ven_10ec&dev_8168") != std::string::npos);
+        assert(raw.find(wide_bytes("{4d36e972-e325-11ce-bfc1-08002be10318}")) !=
+               std::string::npos); // CDDB ClassGUID value, stored wide
+        assert(raw.find("{4d36e972-e325-11ce-bfc1-08002be10318}") == std::string::npos);
+        // Power saving: the instance-scoped copy is written only where an
+        // adapter instance already exists, and this hive has none -- the rule
+        // is that an arm pass never invents 0000/0001 under Control\Class,
+        // proved by the absence of the class key two lines above.
+        const std::vector<uint8_t> armed(raw.begin(), raw.end());
+        assert(hive_open_path(armed,
+                              "ControlSet001\\Control\\Class\\"
+                              "{4d36e972-e325-11ce-bfc1-08002be10318}\\0000") == 0xFFFFFFFF);
+
+        // The driver-scoped copy is a different key and is always written:
+        // it is what NDIS falls back to for a NIC that has no instance.
+        const uint32_t params_off =
+            hive_open_path(armed, "ControlSet001\\Services\\rt640x64\\Parameters");
+        assert(params_off != 0xFFFFFFFF);
+        assert(hive_get_sz(armed, params_off, "*EEE") == "0");
+        assert(hive_get_sz(armed, params_off, "AutoPowerSaveModeEnabled") == "0");
+    }
+
+    // Enrolling the same NIC again must not stack a second CDDB row.
+    auto again = RegBootStart::enroll_pci_hardware_offline_hive(hive_path, 0x10EC, 0x8168);
+    assert(again.is_ok());
+    auto third = RegBootStart::inspect_offline_hive(hive_path);
+    assert(third.is_ok());
+    assert(third.value().cddb_entries == cddb_before + 1);
+
+    // A second NIC lands beside the first, not on top of it.
+    auto intel = RegBootStart::enroll_pci_hardware_offline_hive(hive_path, 0x8086, 0x15F3);
+    assert(intel.is_ok());
+    auto fourth = RegBootStart::inspect_offline_hive(hive_path);
+    assert(fourth.is_ok());
+    assert(fourth.value().cddb_entries == cddb_before + 2);
+    {
+        std::ifstream ifs(hive_path, std::ios::binary);
+        std::string raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        assert(raw.find("pci#ven_8086&dev_15f3") != std::string::npos);
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+    std::cout << "  PASS: test_hardware_manifest_and_offline_pci_enrollment\n";
+}
+
+
+// ---------------------------------------------------------------------------
+// Scratch: server-side reproduction of the VM1 boot stall (cold4 run).
+//
+// The guest issued READ(10) LBA=1223408 Count=14, the target logged the
+// request, and no further PDU ever arrived -- twice, at the same LBA, in two
+// independent boots. Raw file reads of that region return in milliseconds and
+// the BAT entries are sane, so the suspicion sits inside the serving chain:
+// ReadOnlyBlockDevice -> BaseCache (128 MiB, prefetch worker) ->
+// VhdImageBackend -> RandomAccessFile. This suite drives that exact chain
+// through the boot's access pattern: the group/targeted reads themselves, a
+// sequential scan that makes BaseCache's sequential detector enqueue
+// prefetches the worker competes over, four threads racing the same chunk so
+// one becomes the loader while the others wait on cv_loading_, and the same
+// scan through a live UnifiedCowDevice overlay (flusher thread included).
+// A hang here localises the stall to the storage chain; a pass pushes it
+// back out to the iSCSI protocol layer or the guest.
+// ---------------------------------------------------------------------------
+void test_scratch_repro_stall_lba_1223408() {
+    std::cout << "[RUN] test_scratch_repro_stall_lba_1223408\n";
+
+    const std::filesystem::path master = "G:\\G\\csmw10.VHD";
+    if (!std::filesystem::exists(master)) {
+        std::cout << "  SKIP: " << master.string() << " not present\n";
+        return;
+    }
+
+    auto img = GoldenImage::open(master, ImageId("csmw10"), 128ULL * 1024 * 1024);
+    if (!img.is_ok()) {
+        std::cout << "  FAIL: GoldenImage::open: " << img.error().to_string() << "\n";
+        std::abort();
+    }
+    auto dev = img.value()->device();
+    if (dev->size() < 640ULL * 1024 * 1024) {
+        std::cout << "  FAIL: image smaller than the scan region\n";
+        std::abort();
+    }
+
+    auto timed_read = [&](uint64_t off, size_t len, const char* label, bool& ok) {
+        std::vector<std::byte> buf(len);
+        auto t0 = std::chrono::steady_clock::now();
+        auto r = dev->read(off, buf);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        if (!r.is_ok()) {
+            std::cout << "  FAIL: " << label << " (off=" << off << "): "
+                      << r.error().to_string() << "\n";
+            ok = false;
+            return;
+        }
+        if (ms > 1000) {
+            std::cout << "  WARN: " << label << " (off=" << off << ") took "
+                      << ms << " ms\n";
+        }
+    };
+
+    bool ok = true;
+
+    // Phase 1: the exact reads the boot died on.
+    timed_read(626253824ULL, 262144, "group@stall", ok);
+    timed_read(626384896ULL, 7168, "target@stall", ok);
+
+    // Phase 2: boot-like sequential scan around the stall offset. Each step
+    // past the previous chunk boundary triggers BaseCache::trigger_prefetch,
+    // so the lowest-priority prefetch worker loads chunks the reader is about
+    // to ask for -- the exact interleaving that ends in cv_loading_.wait().
+    {
+        const uint64_t scan_from = 576ULL * 1024 * 1024;
+        const uint64_t scan_to = 640ULL * 1024 * 1024;
+        std::vector<std::byte> buf(65536);
+        for (int pass = 0; pass < 3 && ok; ++pass) {
+            for (uint64_t off = scan_from; off < scan_to && ok; off += 65536) {
+                auto t0 = std::chrono::steady_clock::now();
+                auto r = dev->read(off, buf);
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0).count();
+                if (!r.is_ok()) {
+                    std::cout << "  FAIL: sequential scan (off=" << off << "): "
+                              << r.error().to_string() << "\n";
+                    ok = false;
+                } else if (ms > 1000) {
+                    std::cout << "  WARN: sequential scan (off=" << off
+                              << ") took " << ms << " ms\n";
+                }
+            }
+        }
+    }
+
+    // Phase 3: same-chunk cross-thread races. Four readers hit one offset at
+    // once: one inserts the not-ready block and reads from disk, the others
+    // wait on cv_loading_ until the loader notifies. Any lost wakeup or
+    // loader-never-readies deadlock wedges the join below forever.
+    for (int round = 0; round < 100 && ok; ++round) {
+        const uint64_t off = 626384896ULL + static_cast<uint64_t>(round % 16) * 65536ULL;
+        std::atomic<int> fails{0};
+        std::vector<std::thread> racers;
+        for (int i = 0; i < 4; ++i) {
+            racers.emplace_back([&] {
+                std::vector<std::byte> buf(4096);
+                auto r = dev->read(off, buf);
+                if (!r.is_ok()) ++fails;
+            });
+        }
+        for (auto& t : racers) t.join();
+        if (fails.load() != 0) {
+            std::cout << "  FAIL: same-chunk race (round " << round << ", off="
+                      << off << ") had " << fails.load() << " errors\n";
+            ok = false;
+        }
+    }
+
+    // Phase 4: the same chain behind a live overlay, flusher thread and all,
+    // the way the session served it: a couple of dirty clusters far from the
+    // stall region, then the stall reads and a shorter scan through the cow.
+    {
+        const std::filesystem::path cow_dir = "test_scratch_repro_stall";
+        std::error_code ec;
+        std::filesystem::remove_all(cow_dir, ec);
+        std::filesystem::create_directories(cow_dir, ec);
+        auto cow_res = UnifiedCowDevice::create(dev, cow_dir / "wb_repro.cow", 4096);
+        if (!cow_res.is_ok()) {
+            std::cout << "  FAIL: cow create: " << cow_res.error().to_string() << "\n";
+            std::abort();
+        }
+        auto cow = cow_res.value();
+
+        // Mirror the boot's writeback traffic: bootmgr/BCD-area writes at
+        // LBA 22028, well away from the read region.
+        std::vector<std::byte> wbuf(512);
+        std::memset(wbuf.data(), 0x5A, wbuf.size());
+        if (!cow->write(22028ULL * 512, wbuf).is_ok()) {
+            std::cout << "  FAIL: cow write (bootmgr area)\n";
+            std::abort();
+        }
+
+        timed_read(626253824ULL, 262144, "cow-group@stall", ok);
+        timed_read(626384896ULL, 7168, "cow-target@stall", ok);
+
+        std::vector<std::byte> buf(65536);
+        for (uint64_t off = 620ULL * 1024 * 1024; off < 640ULL * 1024 * 1024 && ok; off += 65536) {
+            auto r = cow->read(off, buf);
+            if (!r.is_ok()) {
+                std::cout << "  FAIL: cow sequential scan (off=" << off << "): "
+                          << r.error().to_string() << "\n";
+                ok = false;
+            }
+        }
+        if (!cow->flush().is_ok()) {
+            std::cout << "  FAIL: cow flush\n";
+            ok = false;
+        }
+        cow->close();
+        std::filesystem::remove_all(cow_dir, ec);
+    }
+
+    if (!ok) std::abort();
+    std::cout << "  PASS: test_scratch_repro_stall_lba_1223408\n";
+}
+
+
+// Each suite prints its own "PASS:" line and any failure aborts the run, but the
+// old banner reported a hardcoded tally that went stale the moment a suite was
+// added or archived. RUN() keeps the final count real.
+static int g_suites_run = 0;
+#define RUN(fn)             \
+    do {                    \
+        (fn)();             \
+        ++g_suites_run;     \
+    } while (0)
+
 int main() {
     // Unbuffer stdout so progress markers survive a hard crash (fail-fast /
     // 0xC0000409 aborts without flushing a block-buffered pipe), which is how
@@ -12325,173 +16717,225 @@ int main() {
     // letting it hit std::terminate -> abort() (0xC0000409) with no context.
     try {
 
+    RUN(test_tftp_dynamic_arch_and_reboot_grace);
+
+    // Scratch diagnostic first: it opens the live master image and a hang
+    // here would otherwise bury the other 121 suites behind it.
+    RUN(test_scratch_repro_stall_lba_1223408);
+
     // Phase 3 Tests
-    test_common_types();
-    test_errors_and_results();
-    test_logging();
-    test_configuration_validation();
-    test_subsystem_deterministic_lifecycle();
-    test_subsystem_failure_rollback();
-    test_storage_block_device();
+    RUN(test_common_types);
+    RUN(test_errors_and_results);
+    RUN(test_logging);
+    RUN(test_configuration_validation);
+    RUN(test_subsystem_deterministic_lifecycle);
+    RUN(test_subsystem_failure_rollback);
+    RUN(test_storage_block_device);
 
     // Phase 4 Tests
-    test_mbr_detection();
-    test_gpt_detection();
-    test_boot_mode_recognition();
-    test_filesystem_recognition();
-    test_raw_image_backend();
-    test_vhd_image_backend();
-    test_golden_image_readonly_invariant();
-    test_golden_image_registry();
+    RUN(test_mbr_detection);
+    RUN(test_gpt_detection);
+    RUN(test_boot_mode_recognition);
+    RUN(test_filesystem_recognition);
+    RUN(test_raw_image_backend);
+    RUN(test_vhd_image_backend);
+    RUN(test_golden_image_readonly_invariant);
+    RUN(test_golden_image_registry);
 
     // Phase 5 Tests
-    test_configuration_persistence_and_directories();
-    test_storage_tester_health_and_benchmark();
+    RUN(test_configuration_persistence_and_directories);
+    RUN(test_storage_tester_health_and_benchmark);
 
     // Phase 6 Tests
-    test_image_manager_lifecycle_and_safe_handling();
+    RUN(test_image_manager_lifecycle_and_safe_handling);
 
     // Phase 7 Tests
-    test_cow_block_device_lifecycle();
-    test_client_session_manager_isolation();
+    RUN(test_cow_block_device_lifecycle);
+    RUN(test_client_session_manager_isolation);
 
     // Phase 8 Tests
-    test_dhcp_architecture_detection_and_pxe_provisioning();
-    test_tftp_server_virtual_payloads_and_ipxe_script();
+    RUN(test_dhcp_architecture_detection_and_pxe_provisioning);
+    RUN(test_tftp_server_virtual_payloads_and_ipxe_script);
 
     // Phase 9 Tests
-    test_iscsi_target_scsi_emulation_and_client_dispatch();
+    RUN(test_iscsi_target_scsi_emulation_and_client_dispatch);
 
     // Phase 10 Tests
-    test_block_cache_lru_and_read_ahead();
-    test_arc_adaptive_replacement();
-    test_async_writeback_ring();
-    test_machine_store_unification();
+    RUN(test_block_cache_lru_and_read_ahead);
+    RUN(test_arc_adaptive_replacement);
+    RUN(test_async_writeback_ring);
+    RUN(test_unified_cow_ram_first_engine);
+    RUN(test_machine_store_unification);
 
     // Phase 11 Tests
-    test_production_hardening_and_recovery();
+    RUN(test_production_hardening_and_recovery);
 
     // Phase 12 Tests
-    test_end_to_end_diskless_boot_pipeline();
+    RUN(test_end_to_end_diskless_boot_pipeline);
 
     // Phase 13 Reality Verification & Hardening Tests
-    test_vhdx_rejection_and_vhd_handling();
-    test_real_socket_networking();
-    test_concurrency_and_stress();
+    RUN(test_vhdx_rejection_and_vhd_handling);
+    RUN(test_real_socket_networking);
+    RUN(test_concurrency_and_stress);
 
     // Complete Diskless Management & Deep Virtual Disk Inspection Tests
-    test_client_manager_lifecycle_and_persistence();
-    test_storage_manager_drive_roles_and_validation();
-    test_vhd_windows_deep_inspection();
-    test_dhcp_client_auto_registration_pipeline();
+    RUN(test_client_manager_lifecycle_and_persistence);
+    RUN(test_storage_manager_drive_roles_and_validation);
+    RUN(test_vhd_windows_deep_inspection);
+    RUN(test_dhcp_client_auto_registration_pipeline);
 
     // End-to-End Block Data Path & Windows Client Boot Tests
-    test_storage_roles_explicit_confirmation_requirement();
-    test_iscsi_rfc3720_login_and_data_segment_drainage();
-    test_iscsi_windows_boot_scsi_command_suite();
-    test_iscsi_write10_and_sync_cache_persistence();
-    test_iscsi_multi_lun_os_and_game_dispatch();
+    RUN(test_storage_roles_explicit_confirmation_requirement);
+    RUN(test_iscsi_rfc3720_login_and_data_segment_drainage);
+    RUN(test_iscsi_login_mirrors_offered_stage);
+    RUN(test_iscsi_login_sequence_window_reset);
+    RUN(test_iscsi_windows_boot_scsi_command_suite);
+    RUN(test_iscsi_write10_and_sync_cache_persistence);
+    RUN(test_iscsi_multi_lun_os_and_game_dispatch);
 
     // Real Hardware Recovery Tests
-    test_real_hardware_recovery_dhcp_tftp_cache();
-    test_vhd_vhdx_import_suite();
+    RUN(test_real_hardware_recovery_dhcp_tftp_cache);
+    RUN(test_vhd_vhdx_import_suite);
 
     // Super Client Image Update Pipeline Tests
-    test_super_client_image_update_pipeline();
+    RUN(test_super_client_image_update_pipeline);
 
     // Image Persistence and Auto-load Pipeline Tests
-    test_image_persistence_and_autoload_pipeline();
+    RUN(test_image_persistence_and_autoload_pipeline);
 
     // Multi-Client Copy-on-Write Writeback Isolation & Lifecycle Tests
-    test_multi_client_writeback_isolation_and_lifecycle();
+    RUN(test_multi_client_writeback_isolation_and_lifecycle);
 
     // Client Enrollment, Dynamic Network Sniffing & Hostname Provisioning Tests
-    test_host_network_pool_and_client_registry();
-    test_http_enrollment_and_ipxe_scripts();
-    test_http_daemon_live_socket();
+    RUN(test_host_network_pool_and_client_registry);
+    RUN(test_http_enrollment_and_ipxe_scripts);
+    RUN(test_http_daemon_live_socket);
 
     // Config Lookup & Port Collision Resilience Tests
-    test_config_file_resolution_and_default_port();
-    test_dynamic_port_propagation_on_collision();
-
-    // Automated PNP Driver Arming & Offline Registry Injection Tests
-    test_pnp_driver_arming_and_offline_registry_injection();
-
-    // Read-only offline hive inspection: no boot-conflict verdict exists any more
-    test_offline_hive_inspection();
-
-    // Boot-Resilience Timeout Injection & PHY Link-Flap Hardening
-    test_boot_resilience_timeout_and_mounted_devices_sanitization();
-
-    // CriticalDeviceDatabase injection: universal multi-NIC PnP arming
-    test_cddb_injection();
+    RUN(test_config_file_resolution_and_default_port);
+    RUN(test_tftp_boot_directory_dynamic_resolution);
+    RUN(test_dynamic_port_propagation_on_collision);
 
     // DHCP INIT-REBOOT Kernel Handoff Tests
-    test_dhcp_init_reboot_and_kernel_handoff();
+    RUN(test_dhcp_init_reboot_and_kernel_handoff);
 
     // DHCP Option 67 Raw Wire Payload Integrity Tests
-    test_dhcp_option67_raw_wire_integrity();
+    RUN(test_dhcp_option67_raw_wire_integrity);
 
     // iPXE Boot Script Rendering & Wire Integrity Tests
-    test_ipxe_boot_script_rendering_and_wire_integrity();
+    RUN(test_ipxe_boot_script_rendering_and_wire_integrity);
 
     // WinPE Zero-Touch Hardware Provisioning Pipeline Tests
-    test_client_manager_boot_state_machine();
-    test_dynamic_boot_script_router();
-    test_staged_callback_lifecycle_and_static_assets();
-    test_live_static_stream_and_staged_post();
+    RUN(test_client_manager_boot_state_machine);
+    RUN(test_dynamic_boot_script_router);
+    RUN(test_staged_callback_lifecycle_and_static_assets);
+    RUN(test_live_static_stream_and_staged_post);
+    RUN(test_bootstart_arm_and_structural_repair);
+    RUN(test_staged_driver_gate_demotes_and_refuses);
+    RUN(test_staged_gate_reads_a_windows_spelled_path);
 
     // Zero-touch provisioning audit regression suites
-    test_iscsi_shared_session_connection_refcount();
-    test_offline_hive_dirty_detection_and_clean_flush();
-    test_dhcp_zero_config_boot_and_raw_logging();
-    test_dhcp_self_lease_and_tftp_ephemeral_routing();
-    test_auto_arm_vhd_configuration_and_offline_discovery();
-    test_guest_arch_detection();
-    test_stage15_crash_dump_paging_and_offload_kill_switch();
-    test_os_family_detection_and_native_arming();
-
-    // Offline PE identity: version / section extraction from an offline binary
-    test_pe_version_extraction();
-
-    // NT volume GUID root resolution (`\\?\Volume{...}\` paths)
-    test_volume_root_guid_parsing();
+    RUN(test_iscsi_shared_session_connection_refcount);
+    RUN(test_session_reinstatement_restarts_idle_clock_and_socket_claim);
+    RUN(test_session_identity_reattach_mac_and_ip);
+    RUN(test_dhcp_zero_config_boot_and_raw_logging);
+    RUN(test_dhcp_self_lease_and_tftp_ephemeral_routing);
 
     // TFTP RFC 2347/2348 option negotiation (OACK) vs RFC 1350 immediate DATA
-    test_tftp_option_negotiation_oack();
-    test_tftp_standard_rrq_rfc1350();
-
-    // Early-boot hardening registry contract (disk timeout, offload kill)
-    test_early_boot_hardening_registry();
+    RUN(test_tftp_option_negotiation_oack);
+    RUN(test_tftp_standard_rrq_rfc1350);
 
     // Phase 1-4 Station Manager, HTTP Station API, and UEFI Hardening Tests
-    test_station_manager_auto_registration_and_persistence();
-    test_http_daemon_station_api_and_agent_script();
-    test_dhcp_uefi_arch_routing_and_host_name_option();
+    RUN(test_station_manager_auto_registration_and_persistence);
+    RUN(test_http_daemon_station_api_and_agent_script);
+    RUN(test_dhcp_uefi_arch_routing_and_host_name_option);
 
     // HTTP REST Station Management, GC, and Config Hot-Reload Tests
-    test_http_station_rest_management();
-    test_station_gc_purge_stale();
-    test_config_hot_reload_watcher();
+    RUN(test_http_station_rest_management);
+    RUN(test_station_gc_purge_stale);
+    RUN(test_config_hot_reload_watcher);
 
     // Concurrent multi-VHD activation (CSM + UEFI) and manual provisioning
-    test_multi_image_activation_on_start();
-    test_dhcp_station_boot_mode_precedence();
-    test_station_scoped_boot_script_rendering();
-    test_iscsi_station_target_suffix_resolution();
-    test_writeback_isolation_across_different_baselines();
+    RUN(test_multi_image_activation_on_start);
+    RUN(test_dhcp_station_boot_mode_precedence);
+    RUN(test_station_scoped_boot_script_rendering);
+    RUN(test_iscsi_station_target_suffix_resolution);
+    RUN(test_writeback_isolation_across_different_baselines);
 
     // TFTP OACK bypass (broken Option ROMs) and server IP collision guard
-    test_tftp_tsize_only_bypasses_oack();
-    test_server_ip_never_assigned_to_client();
+    RUN(test_tftp_tsize_only_bypasses_oack);
+    RUN(test_server_ip_never_assigned_to_client);
 
     // Strict MAC->IP binding, dual-key boot resolution, auto boot_mode
-    test_dhcp_static_binding_outranks_dynamic_pool();
-    test_boot_ipxe_dual_key_and_auto_mode();
-    test_dhcp_auto_boot_mode_follows_option_93();
+    RUN(test_dhcp_static_binding_outranks_dynamic_pool);
+    RUN(test_boot_ipxe_dual_key_and_auto_mode);
+    RUN(test_dhcp_auto_boot_mode_follows_option_93);
 
     // Subsystem B: firmware/image mismatch guard on /boot.ipxe
-    test_platform_firmware_mismatch_guard();
+    RUN(test_platform_firmware_mismatch_guard);
+
+    // Station image id -> file resolution that makes the guard decidable
+    RUN(test_image_id_resolution_finds_vhd);
+
+    // Hardening pass: scoped scan, session refcounting & hot-swap, PUT /station mismatch validation
+    RUN(test_scoped_image_scanning_and_session_refcount_and_put_station_validation);
+
+    // Writeback pipeline audit: overlay file allocation, directory creation, and SCSI write_blocks
+    RUN(test_writeback_pipeline_cow_overlay_creation_and_blocks_write);
+
+    // COW writeback engine: 512B sequential, random 4K/64K against a shadow
+    // image, dirty-sector read-back override, and an on-the-wire SCSI
+    // Response (Status / StatSN / sense) that always arrives.
+    RUN(test_cow_sequential_512b_writes_read_back_every_sector);
+    RUN(test_cow_random_4k_and_64k_traffic_matches_a_shadow_image);
+    RUN(test_cow_dirty_sector_read_back_overrides_the_base_image);
+    RUN(test_iscsi_write_gets_an_immediate_scsi_response_and_useful_sense);
+
+    // Emergency refactor: RAM-first writeback tier, master image immutability,
+    // MAC overlay filename sanitization
+    RUN(test_tiered_ram_writeback_and_master_immutability);
+
+    // Offline PnP Armer / Registry Injector: atomic Read-Only lifecycle guard
+    RUN(test_reg_bootstart_vhd_readonly_lifecycle_guard);
+
+    // Automated Offline Image Armer & Driver Sanitization Pipeline
+    RUN(test_automated_offline_image_armer_and_driver_sanitization);
+
+    // Dual-Tier In-Memory Acceleration: BaseCache read-ahead & RAM writeback overlay
+    RUN(test_dual_tier_in_memory_acceleration);
+
+    // QEMU-Style High-Performance Storage Engine
+    RUN(test_qemu_style_high_performance_storage_engine);
+
+    // DHCP Rogue Conflict Resolution & iSCSI Session Reinstatement
+    RUN(test_dhcp_proxy_mode_and_option60_filtering);
+    RUN(test_dhcp_rogue_server_detection_guard);
+    RUN(test_iscsi_session_reinstatement_reconnect_preserves_cow_data);
+
+    // PnP Driver Parameter Arming & CompactOS Pre-flight Validation
+    RUN(test_pnp_driver_parameter_arming_and_msi_disable);
+    RUN(test_vhd_compact_os_preflight_validation);
+
+    // Zero-Touch Onboarding & 3-Tier Layering Storage Engine
+    RUN(test_dynamic_ipxe_dispatcher_and_zero_touch_enrollment);
+    RUN(test_tiered_storage_engine_3_layer_dispatch);
+    RUN(test_l1l2_qcow2_style_sparse_cow_and_minivhd_read);
+    RUN(test_ipxe_sanhook_sanboot_flags_and_recovery_shell);
+    RUN(test_cobpxe_holding_screen_and_cdd_registry_injection);
+    RUN(test_http_boot_uri_decoupling_and_auto_provisioning);
+    RUN(test_two_pass_hardware_enrollment_workflow);
+    RUN(test_subsys_rev_telemetry_enrollment_flow);
+    RUN(test_station_probe_gated_on_enrollment);
+    RUN(test_hardware_manifest_and_offline_pci_enrollment);
+    RUN(test_two_tier_read_miss_passes_through_and_short_read_fails);
+    RUN(test_regf_base_block_validation_refuses_corrupt_hives);
+    RUN(test_enrollment_touches_only_existing_adapter_instance);
+    RUN(test_ndis_sanitization_dumb_pipe_mode);
+    RUN(test_ndis_driver_service_groups_and_auto_purge_stale_cow);
+    RUN(test_mounted_volume_hive_never_uses_the_raw_writer);
+    RUN(test_enrollment_short_circuits_on_recorded_manifest);
+
+
 
     } catch (const std::exception& ex) {
         std::cout.flush();
@@ -12501,7 +16945,8 @@ int main() {
     }
 
     std::cout << "=========================================================\n";
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY (92/92 suites)\n";
+    std::cout << "ALL TESTS PASSED SUCCESSFULLY (" << g_suites_run << "/" << g_suites_run
+              << " suites)\n";
     std::cout << "=========================================================\n";
     return 0;
 }

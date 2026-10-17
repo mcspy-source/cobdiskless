@@ -41,6 +41,21 @@ enum class ClientArch : uint16_t {
     }
 }
 
+enum class DhcpServerMode {
+    Standard,     // Full DHCP server (allocates IP addresses on port 67)
+    ProxyDhcp,    // RFC 4578 ProxyDHCP (port 4011/67): yiaddr=0.0.0.0, Option 60="PXEClient", boot options only
+    AutoSnooping  // Startup rogue DHCP probe: auto-downgrades to ProxyDhcp if external router detected; else Standard
+};
+
+[[nodiscard]] constexpr std::string_view to_string(DhcpServerMode mode) noexcept {
+    switch (mode) {
+        case DhcpServerMode::Standard:     return "Standard";
+        case DhcpServerMode::ProxyDhcp:    return "ProxyDHCP";
+        case DhcpServerMode::AutoSnooping: return "AutoSnooping";
+    }
+    return "Unknown";
+}
+
 #pragma pack(push, 1)
 struct DhcpHeader {
     uint8_t op{1};               // 1 = BOOTREQUEST, 2 = BOOTREPLY
@@ -91,6 +106,8 @@ struct DhcpLease {
     std::string lease_status{"Active"}; // "Active", "Reserved", "Expired"
     std::string first_seen;
     std::string last_seen;
+    ClientArch client_arch{ClientArch::Unknown};
+    std::string bootfile_name;
 };
 
 /**
@@ -238,6 +255,38 @@ public:
      */
     [[nodiscard]] std::optional<std::string> find_mac_by_ip(const NetworkAddress& ip) const noexcept;
 
+    /**
+     * @brief Find the client architecture associated with a leased IP address (RFC 4578 Option 93).
+     */
+    [[nodiscard]] std::optional<ClientArch> find_client_arch_by_ip(const NetworkAddress& ip) const noexcept;
+
+    /**
+     * @brief Find the negotiated or provisioned bootfile for a leased IP address.
+     */
+    [[nodiscard]] std::optional<std::string> find_bootfile_by_ip(const NetworkAddress& ip) const noexcept;
+
+    void set_mode(DhcpServerMode mode) noexcept { mode_ = mode; }
+    [[nodiscard]] DhcpServerMode mode() const noexcept { return mode_; }
+
+    [[nodiscard]] bool rogue_dhcp_detected() const noexcept { return rogue_dhcp_detected_; }
+    [[nodiscard]] NetworkAddress detected_dhcp_server_ip() const noexcept { return detected_dhcp_server_ip_; }
+
+    void set_proxy_port(uint16_t port) noexcept { proxy_port_ = port; }
+    [[nodiscard]] uint16_t proxy_port() const noexcept { return proxy_port_; }
+
+    /**
+     * @brief Sends a broadcast DHCP discover on the LAN adapter to detect if another
+     *        DHCP server (gateway router) exists. If found, logs a warning and
+     *        downgrades mode to ProxyDhcp.
+     * @return true if an external/rogue DHCP server was detected.
+     */
+    bool probe_rogue_dhcp_server(uint32_t timeout_ms = 1000);
+
+    /**
+     * @brief Releases any active or offered DHCP lease for the specified MAC.
+     */
+    void release_lease(const std::string& mac);
+
 private:
     SubsystemState state_{SubsystemState::Stopped};
     NetworkAddress server_ip_;
@@ -249,6 +298,10 @@ private:
     uint32_t lease_duration_sec_{86400};
     bool enabled_{true};
     uint16_t port_{67};
+    uint16_t proxy_port_{4011};
+    DhcpServerMode mode_{DhcpServerMode::AutoSnooping};
+    bool rogue_dhcp_detected_{false};
+    NetworkAddress detected_dhcp_server_ip_{0, 0, 0, 0};
 
     std::shared_ptr<ClientManager> client_manager_;
     std::shared_ptr<ImageManager> image_manager_;
@@ -263,9 +316,12 @@ private:
 
     std::atomic<bool> running_{false};
     uintptr_t server_socket_{~static_cast<uintptr_t>(0)};
+    uintptr_t proxy_socket_{~static_cast<uintptr_t>(0)};
     std::unique_ptr<std::jthread> worker_thread_;
+    std::unique_ptr<std::jthread> proxy_thread_;
 
     void run_packet_loop();
+    void run_proxy_packet_loop();
 };
 
 } // namespace cobdiskless

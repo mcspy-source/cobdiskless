@@ -19,7 +19,7 @@
 #include "CobDisklessCore/client/client_database.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/image/image_format.hpp"
-#include "CobDisklessCore/image/pnp_driver_armer.hpp"
+#include "CobDisklessCore/image/reg_bootstart.hpp"
 #include "CobDisklessCore/network/network_service.hpp"
 #include "CobDisklessCore/subsystem/subsystem.hpp"
 #include "CobDisklessCore/types/network_address.hpp"
@@ -28,6 +28,7 @@
 namespace cobdiskless {
 
 class StationManager;
+class ClientSessionManager;
 
 /**
  * @brief Boot facts about an assigned image, as needed by the mismatch guard.
@@ -104,11 +105,11 @@ public:
     /**
      * @brief Arms one client's offline SYSTEM hive after WinPE reports success.
      *
-     * Defaults to PnpDriverArmer::arm_offline_system_hive(); tests swap it out to
+     * Defaults to RegBootStart::arm_offline_system_hive(); tests swap it out to
      * count invocations and to simulate a failing arming pass.
      */
     using HiveArmingFunction =
-        std::function<Result<PnpDriverArmReport>(const std::filesystem::path& hive_path)>;
+        std::function<Result<BootStartArmReport>(const std::filesystem::path& hive_path)>;
 
     /**
      * @brief Resolves an assigned image name to the boot facts the guard needs.
@@ -123,6 +124,25 @@ public:
      */
     using ImageBootModeResolver =
         std::function<std::optional<ImageBootFacts>(const std::string& image_name)>;
+
+    /**
+     * @brief Bakes one NIC's binding into the master VHD.
+     *
+     * Defaults to RegBootStart::arm_vhd_pci_hardware() -- mount csmw10.vhd,
+     * inject ControlSet001\Control\CriticalDeviceDatabase\pci#ven_<ven>&dev_<dev>,
+     * write it back and detach. Tests swap it out to exercise the cumulative
+     * manifest without touching a real image, and to count invocations.
+     *
+     * The master image path is passed in so the default implementation has to
+     * resolve nothing itself; an empty path is an error, never a silent
+     * success, because "enrolled" must mean the bytes are in the image.
+     *
+     * The full cobsniffer identity (SUBSYS/REV) rides in `pci`; a ven/dev-only
+     * caller gets the legacy generic binding.
+     */
+    using HardwareEnrollmentFunction =
+        std::function<Result<void>(const std::filesystem::path& master_image,
+                                   const PciHardwareId& pci)>;
 
     explicit HttpDaemon(NetworkAddress listen_address = NetworkAddress(0, 0, 0, 0, 18080));
     ~HttpDaemon() override;
@@ -149,6 +169,7 @@ public:
     // --- configuration ----------------------------------------------------
     void set_client_database(std::shared_ptr<ClientDatabase> db);
     void set_station_manager(std::shared_ptr<StationManager> manager);
+    void set_session_manager(std::shared_ptr<ClientSessionManager> manager);
     /**
      * @brief Shares the WinPE staging state machine with the request router.
      *
@@ -160,6 +181,21 @@ public:
     void set_static_root(std::filesystem::path root);
     /** @brief Overrides the default arm_offline_system_hive() implementation. */
     void set_hive_arming_function(HiveArmingFunction fn);
+    /**
+     * @brief Overrides the default cumulative-enrollment implementation.
+     *
+     * Passing an empty function restores RegBootStart::arm_vhd_pci_hardware().
+     */
+    void set_hardware_enrollment_function(HardwareEnrollmentFunction fn);
+    /**
+     * @brief Where hardware_manifest.json lives.
+     *
+     * Defaults to "hardware_manifest.json" in the server's working directory;
+     * tests point it inside their scratch directory so suites cannot enrol each
+     * other's PCI ids.
+     */
+    void set_hardware_manifest_path(std::filesystem::path path);
+    [[nodiscard]] std::filesystem::path hardware_manifest_path() const;
     void set_server_ip(NetworkAddress ip);
     void set_gateway(NetworkAddress gateway);
     void set_target_iqn(std::string iqn);
@@ -179,6 +215,17 @@ public:
      * a name that resolves for the iSCSI pipeline resolves identically here.
      */
     void set_image_search_dirs(std::vector<std::filesystem::path> dirs);
+    /**
+     * @brief Explicit `image id -> file` pairs, as recorded in config.json.
+     *
+     * A station stores the assigned image *id* (`csmw10`), never the file name
+     * (`csmw10.VHD`), so name probing alone can never resolve it. Handing the
+     * registered paths over lets the guard reach the real file instead of
+     * falling open -- which is how a UEFI client used to be served a
+     * Legacy-BIOS sanboot and die inside iPXE's EFI block driver.
+     */
+    void set_image_path_aliases(
+        std::vector<std::pair<std::string, std::filesystem::path>> aliases);
 
     void set_http_port(uint16_t port) noexcept;
     [[nodiscard]] uint16_t http_port() const noexcept { return http_port_.load(); }
@@ -215,6 +262,22 @@ public:
     [[nodiscard]] static std::map<std::string, std::string> parse_query(std::string_view query);
     [[nodiscard]] static std::string url_decode(std::string_view encoded);
 
+    /**
+     * @brief Resolves an assigned image id or file name to a real file.
+     *
+     * Order: the name exactly as given, then any registered `id -> path`
+     * alias, then `dir/name`, and finally a stem match against the image
+     * containers in each search directory. The last step is what makes an id
+     * such as `csmw10` find `csmw10.VHD`.
+     *
+     * @return std::nullopt when nothing matches; the caller then leaves the
+     *         firmware guard open rather than blocking a boot on a probe.
+     */
+    [[nodiscard]] static std::optional<std::filesystem::path> resolve_image_path(
+        const std::string& image_name,
+        const std::vector<std::filesystem::path>& search_dirs,
+        const std::vector<std::pair<std::string, std::filesystem::path>>& aliases = {});
+
 private:
     void run_server_loop();
 
@@ -230,8 +293,8 @@ private:
      *
      * The rendered script is bound to that station's own target IQN
      * (iqn.2026-09.com.cobdiskless:<name>) and firmware type: a `bios` station
-     * gets `sanboot --no-describe`, a `uefi` station gets `sanhook --drive 0x80`
-     * followed by a standard `sanboot`, and an `auto` station gets a script that
+     * gets `sanboot --drive 0x80`, a `uefi` station gets `sanhook --drive 0x80`
+     * followed by `sanboot --drive 0x80`, and an `auto` station gets a script that
      * branches on iPXE's own `${platform}` so the decision is made by the
      * firmware that is actually booting.
      *
@@ -265,9 +328,7 @@ private:
      */
     [[nodiscard]] std::optional<ImageBootFacts> resolve_image_boot_facts(
         const std::string& image_name) const;
-    [[nodiscard]] static std::optional<std::filesystem::path> resolve_image_path(
-        const std::string& image_name,
-        const std::vector<std::filesystem::path>& search_dirs);
+
     [[nodiscard]] std::string rename_script_body() const;
     [[nodiscard]] std::string station_agent_script_body() const;
 
@@ -276,9 +337,11 @@ private:
                                                     const std::string& vendor,
                                                     const std::string& device) const;
     [[nodiscard]] HttpResponse staged_response(std::string_view body) const;
+    [[nodiscard]] HttpResponse enroll_client_response(std::string_view body) const;
     [[nodiscard]] HttpResponse static_file_response(const std::string& relative_path) const;
     [[nodiscard]] std::shared_ptr<ClientManager> client_manager_copy() const;
     [[nodiscard]] std::shared_ptr<StationManager> station_manager_copy() const;
+    [[nodiscard]] std::shared_ptr<ClientSessionManager> session_manager_copy() const;
 
     std::atomic<SubsystemState> state_{SubsystemState::Uninitialized};
     std::atomic<bool> running_{false};
@@ -296,8 +359,11 @@ private:
     std::shared_ptr<ClientDatabase> client_db_;
     std::shared_ptr<ClientManager> client_mgr_;
     std::shared_ptr<StationManager> station_mgr_;
+    std::shared_ptr<ClientSessionManager> session_mgr_;
     std::filesystem::path static_root_;
     HiveArmingFunction hive_arming_fn_;
+    HardwareEnrollmentFunction hardware_enrollment_fn_;
+    std::filesystem::path hardware_manifest_path_{"hardware_manifest.json"};
     std::string target_iqn_;
     std::string initiator_prefix_;
 
@@ -305,6 +371,8 @@ private:
     ImageBootModeResolver image_boot_mode_fn_;
     /// Directories the default resolver probes; guarded by config_mutex_.
     std::vector<std::filesystem::path> image_search_dirs_;
+    /// Explicit `image id -> file` pairs; guarded by config_mutex_.
+    std::vector<std::pair<std::string, std::filesystem::path>> image_path_aliases_;
 
     /// One probe per (path, size, mtime): the red screen must not reopen a
     /// multi-GB VHD on every boot request, and an edited image must invalidate.
@@ -318,5 +386,39 @@ private:
 
     mutable std::mutex config_mutex_;
 };
+
+/**
+ * @brief Clean SAN boot script emitting strictly the target with keep-san 1.
+ *
+ * Windows kernel msiscsi requires the ACPI iBFT table in memory to locate \Device\Harddisk0.
+ * NEVER include --no-describe on sanboot or sanhook.
+ */
+std::string generate_clean_sanboot_script(const std::string& server_ip,
+                                          const std::string& target_iqn);
+
+/**
+ * @brief The standard SAN boot script an already-enrolled station receives.
+ *
+ * Deliberately the minimal iPXE sequence -- keep the SAN attachment across the
+ * hand-off and boot it -- with no pretence on screen about registry state that
+ * this server did not just verify.
+ */
+std::string generate_standard_san_boot_script(const std::string& server_ip,
+                                              const std::string& target_iqn);
+
+/**
+ * @brief Pass 1 of the cumulative enrollment flow.
+ *
+ * A five-second holding screen naming the PCI id being baked into the master
+ * VHD, then a reboot back through /boot, which will find the id in
+ * hardware_manifest.json and dispatch generate_standard_san_boot_script().
+ *
+ * @param failure_detail empty on the success path; otherwise the reason the
+ *      enrollment task failed, shown to the operator before the station
+ *      retries. A silent reboot loop would be undiagnosable.
+ */
+std::string generate_enrollment_holding_screen(const std::string& ven,
+                                               const std::string& dev,
+                                               const std::string& failure_detail);
 
 } // namespace cobdiskless

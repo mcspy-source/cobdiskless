@@ -86,6 +86,8 @@ public:
         return path_;
     }
 
+    [[nodiscard]] bool has_block(uint64_t offset) const noexcept;
+
 private:
     mutable std::mutex mutex_;
     std::filesystem::path path_;

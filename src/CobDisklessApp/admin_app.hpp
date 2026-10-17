@@ -16,6 +16,7 @@
 #include "CobDisklessCore/storage/storage_tester.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/storage/storage_manager.hpp"
+#include "CobDisklessCore/network/http_daemon.hpp"
 
 namespace cobdiskless {
 
@@ -46,20 +47,24 @@ public:
     int cli_wizard();
     int cli_test_storage(const std::filesystem::path& target_dir);
     int cli_inspect_image(const std::filesystem::path& image_path);
+    int cli_arm_image(const std::filesystem::path& vhd_path, uint16_t ven = 0, uint16_t dev = 0,
+                      const std::string& subsys_hex = {}, const std::string& rev_hex = {});
     int cli_list_images();
     int cli_add_image(const std::filesystem::path& image_path, const std::string& image_id);
     int cli_list_clients();
     int cli_list_drives();
     int cli_start_server(bool run_in_background = false);
+    int cli_superclient(bool enable, const std::string& mac_or_station);
+    int cli_commit(const std::string& mac_or_station, bool backup);
 
     // Server lifecycle controls
     Result<void> start_server_services();
     void stop_server_services();
-    void auto_arm_vhd_images();
     void warm_assigned_images();
     [[nodiscard]] bool is_server_running() const noexcept { return server_running_.load(); }
 
     [[nodiscard]] const Configuration& config() const noexcept { return config_; }
+    [[nodiscard]] Configuration& mutable_config() noexcept { return config_; }
     void set_config(Configuration cfg) { config_ = std::move(cfg); }
 
     [[nodiscard]] std::shared_ptr<GoldenImageRegistry> registry() const noexcept { return registry_; }
@@ -82,11 +87,38 @@ public:
     [[nodiscard]] const std::filesystem::path& images_config_path() const noexcept { return images_config_path_; }
 
     Result<void> commit_super_client(const std::string& mac);
+    /**
+     * @brief Merge a Super Client's writeback delta into its base VHD.
+     *
+     * Accepts either a MAC (any common spelling) or a station/PC name.
+     * Refuses while the station's iSCSI session is live (state must be
+     * Offline/Disconnected with zero TCP connections, and the overlay file
+     * must not be open by another process). With `backup == true`, copies
+     * the base image to `<base>.bak` first. The block walk itself reuses
+     * UnifiedCowDevice::merge_into (device-offset writes, so dynamic VHD
+     * BAT layouts merge correctly and the 512-byte footer stays intact).
+     * On success the overlay is reset to a clean state, the super-client
+     * flag is cleared, and a summary is returned and printed.
+     */
+    struct CommitSummary {
+        size_t chunks_merged{0};
+        uint64_t bytes_written{0};
+        double seconds{0.0};
+        std::string base_path;
+        std::string backup_path;
+    };
+    Result<CommitSummary> CommitWritebackToBase(const std::string& mac_or_station,
+                                                bool backup = false);
     void auto_save();
+
+    HttpResponse update_station_via_api(const std::string& mac, const std::string& json_body);
 
     // Config hot-reload
     void start_config_watcher();
     void stop_config_watcher();
+
+    [[nodiscard]] uint32_t clients_generation() const noexcept { return clients_generation_.load(); }
+    void notify_clients_changed() noexcept { clients_generation_.fetch_add(1); }
 
 private:
     Configuration config_;
@@ -115,6 +147,8 @@ private:
     std::atomic<bool> config_watcher_stop_{false};
     void config_watcher_loop();
     void apply_hot_config(const Configuration& new_cfg);
+
+    std::atomic<uint32_t> clients_generation_{1};
 };
 
 } // namespace cobdiskless

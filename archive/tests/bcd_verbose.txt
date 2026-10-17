@@ -1,0 +1,91 @@
+﻿
+Windows Boot Manager
+--------------------
+identifier              {9dea862c-5cdd-4e70-acc1-f32b344d4795}
+device                  partition=H:
+description             Windows Boot Manager
+locale                  en-US
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+default                 {8ef8a6b1-b875-11f1-826b-c774f3307f8b}
+resumeobject            {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+displayorder            {8ef8a6b1-b875-11f1-826b-c774f3307f8b}
+toolsdisplayorder       {b2721d73-1db4-4c62-bf78-c548a880142d}
+timeout                 30
+
+Windows Boot Loader
+-------------------
+identifier              {8ef8a6b1-b875-11f1-826b-c774f3307f8b}
+device                  partition=I:
+path                    \Windows\system32\winload.exe
+description             Windows 10
+locale                  en-US
+inherit                 {6efb52bf-1766-41db-a6b3-0ee5eff72bd7}
+allowedinmemorysettings 0x15000075
+osdevice                partition=I:
+systemroot              \Windows
+resumeobject            {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+nx                      OptIn
+bootmenupolicy          Standard
+
+Resume from Hibernate
+---------------------
+identifier              {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+device                  partition=I:
+path                    \Windows\system32\winresume.exe
+description             Windows Resume Application
+locale                  en-US
+inherit                 {1afa9c49-16ab-4a5c-901b-212802da9460}
+allowedinmemorysettings 0x15000075
+filedevice              partition=I:
+filepath                \hiberfil.sys
+bootmenupolicy          Standard
+debugoptionenabled      No
+
+Windows Memory Tester
+---------------------
+identifier              {b2721d73-1db4-4c62-bf78-c548a880142d}
+device                  partition=H:
+path                    \boot\memtest.exe
+description             Windows Memory Diagnostic
+locale                  en-US
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+badmemoryaccess         Yes
+
+EMS Settings
+------------
+identifier              {0ce4991b-e6b3-4b16-b23c-5e0d9250e5d9}
+bootems                 No
+
+Debugger Settings
+-----------------
+identifier              {4636856e-540f-4170-a130-a84776f4c654}
+debugtype               Local
+
+RAM Defects
+-----------
+identifier              {5189b25c-5558-4bf2-bca4-289b11bd29e2}
+
+Global Settings
+---------------
+identifier              {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+inherit                 {4636856e-540f-4170-a130-a84776f4c654}
+                        {0ce4991b-e6b3-4b16-b23c-5e0d9250e5d9}
+                        {5189b25c-5558-4bf2-bca4-289b11bd29e2}
+
+Boot Loader Settings
+--------------------
+identifier              {6efb52bf-1766-41db-a6b3-0ee5eff72bd7}
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+                        {7ff607e0-4395-11db-b0de-0800200c9a66}
+
+Hypervisor Settings
+-------------------
+identifier              {7ff607e0-4395-11db-b0de-0800200c9a66}
+hypervisordebugtype     Serial
+hypervisordebugport     1
+hypervisorbaudrate      115200
+
+Resume Loader Settings
+----------------------
+identifier              {1afa9c49-16ab-4a5c-901b-212802da9460}
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}

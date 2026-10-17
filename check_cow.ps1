@@ -1,0 +1,1 @@
+ = [IO.File]::ReadAllBytes('E:\wb_6c4b902f61eb.cow');  = 0; foreach ( in ) { if ( -ne 0) { ++ } }; Write-Host " Nonzero: \

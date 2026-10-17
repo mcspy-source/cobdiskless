@@ -131,6 +131,16 @@ public:
     }
 
     /**
+     * @brief Explicitly assigns the active OS images directory and purges stale OS images.
+     */
+    void set_os_images_dir(const std::filesystem::path& dir);
+
+    /**
+     * @brief Removes and unregisters all managed images matching a role.
+     */
+    void clear_role_images(ImageRole role);
+
+    /**
      * @brief Scans OS images and games directories, registering discovered images.
      */
     Result<size_t> scan_directories();
@@ -188,6 +198,12 @@ public:
     Result<void> release_image(const std::string& key);
 
     /**
+     * @brief Checks if an image is registered (by ID, filename, stem, or path).
+     */
+    [[nodiscard]] bool has_image(const ImageId& id) const;
+    [[nodiscard]] bool has_image(const std::string& key) const;
+
+    /**
      * @brief Queries detailed info for an image.
      */
     Result<ManagedImageInfo> get_image_info(const ImageId& id) const;
@@ -222,6 +238,7 @@ private:
     std::filesystem::path config_path_{};
 
     size_t scan_folder_locked(const std::filesystem::path& folder, ImageRole role);
+    void clear_role_images_locked(ImageRole role);
     Result<void> save_images_to_config_locked(const std::filesystem::path& config_path = "") const;
 
     /**

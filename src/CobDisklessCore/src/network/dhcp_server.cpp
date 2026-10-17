@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "CobDisklessCore/network/dhcp_server.hpp"
+#include "CobDisklessCore/config/configuration.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
@@ -18,11 +19,54 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #endif
 
 namespace cobdiskless {
 
 namespace {
+
+#if defined(_WIN32)
+void broadcast_packet_all_adapters(const uint8_t* data, size_t size, uint16_t port) {
+    ULONG buf_len = 16384;
+    std::vector<uint8_t> buf(buf_len);
+    auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    ULONG rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr, adapters, &buf_len);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(buf_len);
+        adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr, adapters, &buf_len);
+    }
+    if (rc != NO_ERROR) return;
+
+    for (const IP_ADAPTER_ADDRESSES* a = adapters; a != nullptr; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (const IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
+            if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            const auto* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
+            if (sin->sin_addr.s_addr == 0 || sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) continue;
+
+            SOCKET ts = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (ts != INVALID_SOCKET) {
+                int bcast = 1;
+                setsockopt(ts, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
+                sockaddr_in bind_a{};
+                bind_a.sin_family = AF_INET;
+                bind_a.sin_addr = sin->sin_addr;
+                bind_a.sin_port = 0;
+                if (bind(ts, (sockaddr*)&bind_a, sizeof(bind_a)) == 0) {
+                    sockaddr_in dst{};
+                    dst.sin_family = AF_INET;
+                    dst.sin_port = htons(port);
+                    dst.sin_addr.s_addr = INADDR_BROADCAST;
+                    sendto(ts, reinterpret_cast<const char*>(data), static_cast<int>(size), 0, (sockaddr*)&dst, sizeof(dst));
+                }
+                closesocket(ts);
+            }
+        }
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Wire telemetry.
@@ -146,6 +190,13 @@ std::string describe_option(uint8_t code, const uint8_t* v, uint8_t len) {
 // how an adopted ACK is called out of the stream.
 void log_dhcp_wire_inspect(const uint8_t* data, size_t len, bool incoming,
                            const char* note = nullptr) {
+    // A field-by-field hex dump of every frame in both directions. It is the
+    // single loudest thing this server prints, so it exists only for someone
+    // actively debugging a client that will not boot -- and the dump is not
+    // even assembled unless that tracing is switched on.
+    if (!Logger::default_logger().would_log(LogLevel::Trace)) {
+        return;
+    }
     if (data == nullptr || len < sizeof(DhcpHeader)) return;
     const auto* h = reinterpret_cast<const DhcpHeader*>(data);
 
@@ -367,14 +418,31 @@ Result<void> DhcpServer::initialize() {
 
     validate_and_sanitize_pool();
 
+    // DHCP Rogue Conflict Resolution: Probe LAN on startup only on standard DHCP port 67
+    if (mode_ == DhcpServerMode::AutoSnooping && port_ == 67) {
+        Logger::default_logger().info("DHCP", "[DHCP GUARD] Probing LAN for existing DHCP servers (rogue conflict guard)...");
+        probe_rogue_dhcp_server(1000);
+        if (!rogue_dhcp_detected_) {
+            Logger::default_logger().info("DHCP", "[DHCP GUARD] No external DHCP server responded. Operating in Standard DHCP mode.");
+        }
+    }
+
     running_ = true;
     state_ = SubsystemState::Running;
 
-    // Launch worker thread
+    // Launch worker thread (Port 67)
     worker_thread_ = std::make_unique<std::jthread>([this](std::stop_token st) {
         run_packet_loop();
         (void)st;
     });
+
+    // Launch ProxyDHCP worker thread (Port 4011) only on port 67 or when in ProxyDhcp mode
+    if (port_ == 67 || mode_ == DhcpServerMode::ProxyDhcp) {
+        proxy_thread_ = std::make_unique<std::jthread>([this](std::stop_token st) {
+            run_proxy_packet_loop();
+            (void)st;
+        });
+    }
 
     return {};
 }
@@ -392,12 +460,22 @@ void DhcpServer::shutdown() noexcept {
         closesocket(static_cast<SOCKET>(server_socket_));
         server_socket_ = ~static_cast<uintptr_t>(0);
     }
+    if (proxy_socket_ != ~static_cast<uintptr_t>(0)) {
+        closesocket(static_cast<SOCKET>(proxy_socket_));
+        proxy_socket_ = ~static_cast<uintptr_t>(0);
+    }
 #endif
 
     if (worker_thread_ && worker_thread_->joinable()) {
         worker_thread_->request_stop();
         worker_thread_->join();
         worker_thread_.reset();
+    }
+
+    if (proxy_thread_ && proxy_thread_->joinable()) {
+        proxy_thread_->request_stop();
+        proxy_thread_->join();
+        proxy_thread_.reset();
     }
 
     state_ = SubsystemState::Stopped;
@@ -610,17 +688,24 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
         return packet;
     }
 
-    // Safety guard against building OFFER or ACK for server IP or loopback/unspecified
-    if (assigned_ip == effective_server_ip || assigned_ip == server_ip_ ||
-        assigned_ip.is_any() || assigned_ip.is_loopback()) {
-        return Error(ErrorCode::NetworkFailure, "Refusing to build DHCP OFFER/ACK for server IP or invalid address: " + assigned_ip.ip_string());
-    }
-    assert(assigned_ip != effective_server_ip);
-    assert(assigned_ip != server_ip_);
+    const bool is_proxy_mode = (mode_ == DhcpServerMode::ProxyDhcp);
 
-    // Assigned Client IP (yiaddr)
-    uint8_t yi_bytes[4] = {assigned_ip.octet(0), assigned_ip.octet(1), assigned_ip.octet(2), assigned_ip.octet(3)};
-    std::memcpy(&reply->yiaddr, yi_bytes, 4);
+    if (!is_proxy_mode) {
+        // Safety guard against building OFFER or ACK for server IP or loopback/unspecified
+        if (assigned_ip == effective_server_ip || assigned_ip == server_ip_ ||
+            assigned_ip.is_any() || assigned_ip.is_loopback()) {
+            return Error(ErrorCode::NetworkFailure, "Refusing to build DHCP OFFER/ACK for server IP or invalid address: " + assigned_ip.ip_string());
+        }
+        assert(assigned_ip != effective_server_ip);
+        assert(assigned_ip != server_ip_);
+
+        // Assigned Client IP (yiaddr)
+        uint8_t yi_bytes[4] = {assigned_ip.octet(0), assigned_ip.octet(1), assigned_ip.octet(2), assigned_ip.octet(3)};
+        std::memcpy(&reply->yiaddr, yi_bytes, 4);
+    } else {
+        // RFC 4578 ProxyDHCP: yiaddr MUST be 0.0.0.0 to prevent lease collisions with gateway router
+        reply->yiaddr = 0;
+    }
 
     // Next Server IP (siaddr - TFTP Server IP for PXE stage 1)
     uint8_t si_bytes[4] = {effective_server_ip.octet(0), effective_server_ip.octet(1), effective_server_ip.octet(2), effective_server_ip.octet(3)};
@@ -658,13 +743,13 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
         // client does not report a recognized architecture (ClientArch::Unknown).
         //
         // Mapping:
-        //   Arch 0  (Bios_x86)     -> undionly.kpxe
-        //   Arch 6  (Efi_x86)      -> ipxe32.efi (or ipxe.efi fallback)
-        //   Arch 7  (Efi_x64)      -> ipxe.efi
-        //   Arch 9  (Efi_Ebc)      -> ipxe.efi
-        //   Arch 10 (Efi_Arm32)    -> ipxe.efi (no ARM32 build typically available)
-        //   Arch 11 (Efi_Arm64)    -> ipxe-arm64.efi (or ipxe.efi fallback)
-        //   Unknown                 -> station config or UEFI default (ipxe.efi)
+        //   Arch 0  (Bios_x86)     -> cobpxe.kpxe
+        //   Arch 6  (Efi_x86)      -> ipxe32.efi (or cobpxe.efi fallback)
+        //   Arch 7  (Efi_x64)      -> cobpxe.efi
+        //   Arch 9  (Efi_Ebc)      -> cobpxe.efi
+        //   Arch 10 (Efi_Arm32)    -> cobpxe.efi (no ARM32 build typically available)
+        //   Arch 11 (Efi_Arm64)    -> ipxe-arm64.efi (or cobpxe.efi fallback)
+        //   Unknown                -> station config or UEFI default (cobpxe.efi)
 
         std::string station_mode;
         std::string uefi_override;
@@ -679,36 +764,38 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
 
         auto file_exists = [](const std::string& fname) -> bool {
             std::error_code ec;
-            return (std::filesystem::exists(fname, ec) ||
-                    std::filesystem::exists(std::filesystem::path("tftp_boot") / fname, ec) ||
-                    std::filesystem::exists(std::filesystem::path("tftp") / fname, ec));
+            if (std::filesystem::exists(fname, ec)) return true;
+            for (const auto& dir : Configuration::candidate_tftp_boot_paths()) {
+                if (std::filesystem::exists(dir / fname, ec)) return true;
+            }
+            return false;
         };
 
         // Primary decision: DHCP Option 93 client architecture (wire value)
         // For UEFI architectures, allow station uefi_bootloader override if configured.
         switch (options.client_arch) {
             case ClientArch::Bios_x86: { // ARCH 0 - BIOS x86 / CSM
-                bootfile = "undionly.kpxe";
+                bootfile = file_exists("cobpxe.kpxe") ? "cobpxe.kpxe" : (file_exists("undionly.kpxe") ? "undionly.kpxe" : "cobpxe.kpxe");
                 break;
             }
             case ClientArch::Efi_x86: { // ARCH 6 - IA32 UEFI
-                bootfile = file_exists("ipxe32.efi") ? "ipxe32.efi" : "ipxe.efi";
+                bootfile = file_exists("ipxe32.efi") ? "ipxe32.efi" : "cobpxe.efi";
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
             case ClientArch::Efi_x64: // ARCH 7 - x64 UEFI
             case ClientArch::Efi_Ebc: { // ARCH 9 - EBC UEFI
-                bootfile = "ipxe.efi";
+                bootfile = file_exists("cobpxe.efi") ? "cobpxe.efi" : (file_exists("ipxe.efi") ? "ipxe.efi" : "cobpxe.efi");
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
             case ClientArch::Efi_Arm32: { // ARCH 10 - ARM32 UEFI
-                bootfile = "ipxe.efi"; // No standard ARM32 iPXE build; fallback to x64 EFI
+                bootfile = "cobpxe.efi"; // No standard ARM32 iPXE build; fallback to x64 EFI
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
             case ClientArch::Efi_Arm64: { // ARCH 11 - ARM64 UEFI
-                bootfile = file_exists("ipxe-arm64.efi") ? "ipxe-arm64.efi" : "ipxe.efi";
+                bootfile = file_exists("ipxe-arm64.efi") ? "ipxe-arm64.efi" : "cobpxe.efi";
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
@@ -729,11 +816,11 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
                                                                 : arch_is_uefi;
 
                 if (!is_uefi) {
-                    bootfile = "undionly.kpxe";
+                    bootfile = file_exists("cobpxe.kpxe") ? "cobpxe.kpxe" : (file_exists("undionly.kpxe") ? "undionly.kpxe" : "cobpxe.kpxe");
                 } else if (!uefi_override.empty()) {
                     bootfile = uefi_override;
                 } else {
-                    bootfile = "ipxe.efi";
+                    bootfile = file_exists("cobpxe.efi") ? "cobpxe.efi" : (file_exists("ipxe.efi") ? "ipxe.efi" : "cobpxe.efi");
                 }
                 break;
             }
@@ -809,35 +896,37 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
         append_option(54, si_bytes, 4);
     }
 
-    // Option 51: Lease Time (never below kMinLeaseSeconds -- see the setter).
-    const uint32_t advertised_lease = lease_duration();
-    uint8_t lease_time[4] = {
-        static_cast<uint8_t>((advertised_lease >> 24) & 0xFF),
-        static_cast<uint8_t>((advertised_lease >> 16) & 0xFF),
-        static_cast<uint8_t>((advertised_lease >> 8) & 0xFF),
-        static_cast<uint8_t>(advertised_lease & 0xFF)
-    };
-    append_option(51, lease_time, 4);
+    if (!is_proxy_mode) {
+        // Option 51: Lease Time (never below kMinLeaseSeconds -- see the setter).
+        const uint32_t advertised_lease = lease_duration();
+        uint8_t lease_time[4] = {
+            static_cast<uint8_t>((advertised_lease >> 24) & 0xFF),
+            static_cast<uint8_t>((advertised_lease >> 16) & 0xFF),
+            static_cast<uint8_t>((advertised_lease >> 8) & 0xFF),
+            static_cast<uint8_t>(advertised_lease & 0xFF)
+        };
+        append_option(51, lease_time, 4);
 
-    // Option 1: Subnet Mask
-    uint8_t mask[4] = {subnet_mask_.octet(0), subnet_mask_.octet(1), subnet_mask_.octet(2), subnet_mask_.octet(3)};
-    append_option(1, mask, 4);
+        // Option 1: Subnet Mask
+        uint8_t mask[4] = {subnet_mask_.octet(0), subnet_mask_.octet(1), subnet_mask_.octet(2), subnet_mask_.octet(3)};
+        append_option(1, mask, 4);
 
-    // Option 3: Router / Gateway
-    NetworkAddress eff_gateway = gateway_;
-    if (eff_gateway.octet(0) == 0 && eff_gateway.octet(3) == 0) {
-        eff_gateway = effective_server_ip;
+        // Option 3: Router / Gateway
+        NetworkAddress eff_gateway = gateway_;
+        if (eff_gateway.octet(0) == 0 && eff_gateway.octet(3) == 0) {
+            eff_gateway = effective_server_ip;
+        }
+        uint8_t gw[4] = {eff_gateway.octet(0), eff_gateway.octet(1), eff_gateway.octet(2), eff_gateway.octet(3)};
+        append_option(3, gw, 4);
+
+        // Option 6: DNS
+        NetworkAddress eff_dns = dns_;
+        if (eff_dns.octet(0) == 0 && eff_dns.octet(3) == 0) {
+            eff_dns = eff_gateway;
+        }
+        uint8_t dns_bytes[4] = {eff_dns.octet(0), eff_dns.octet(1), eff_dns.octet(2), eff_dns.octet(3)};
+        append_option(6, dns_bytes, 4);
     }
-    uint8_t gw[4] = {eff_gateway.octet(0), eff_gateway.octet(1), eff_gateway.octet(2), eff_gateway.octet(3)};
-    append_option(3, gw, 4);
-
-    // Option 6: DNS
-    NetworkAddress eff_dns = dns_;
-    if (eff_dns.octet(0) == 0 && eff_dns.octet(3) == 0) {
-        eff_dns = eff_gateway;
-    }
-    uint8_t dns_bytes[4] = {eff_dns.octet(0), eff_dns.octet(1), eff_dns.octet(2), eff_dns.octet(3)};
-    append_option(6, dns_bytes, 4);
 
     // Option 12: Host Name (RFC 2132 Section 3.14)
     std::string assigned_hostname;
@@ -859,11 +948,14 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
     if (assigned_hostname.empty()) {
         assigned_hostname = "PC";
     }
-    append_str_option(12, assigned_hostname);
 
-    // Only send TFTP & PXE options if this is a firmware boot stage (PXE ROM / iPXE)
+    if (!is_proxy_mode) {
+        append_str_option(12, assigned_hostname);
+    }
+
+    // Only send TFTP & PXE options if this is a firmware boot stage (PXE ROM / iPXE) or in ProxyDHCP mode
     // Standard OS DHCP clients (e.g. Windows kernel dhcpcsvc) requesting ACK should NOT receive TFTP/PXE options.
-    if (is_firmware_boot_stage) {
+    if (is_firmware_boot_stage || is_proxy_mode) {
         // Option 66: TFTP Server Name
         std::string srv_str = effective_server_ip.ip_string();
         append_str_option(66, srv_str);
@@ -873,27 +965,10 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
             append_str_option(67, bootfile);
         }
 
-        // Option 60 ("PXEClient") is intentionally NOT emitted.
-        //
-        // Wireshark root cause: AMI Aptio V UEFI firmware (and similar
-        // implementations) interprets Option 60 as a ProxyDHCP signal.  When a
-        // DHCPOFFER carries Option 60 but does NOT also carry Option 43
-        // (PXE Vendor Specific Info) and does NOT listen on UDP 4011, the
-        // firmware classifies the OFFER as an *incomplete* ProxyDHCP response
-        // and treats the competing plain-DHCP OFFER (the home router, which
-        // correctly omits Option 60) as the authoritative one.  The Acer was
-        // choosing the router during DISCOVER for exactly this reason.
-        //
-        // Sending standard siaddr + BOOTP file + Options 66/67 without Option 60
-        // causes UEFI UNDI to treat our OFFER as an authoritative boot server
-        // rather than as a broken ProxyDHCP probe, which is the correct
-        // behaviour for an integrated single-process PXE server.
-        //
-        // Options 43, 93, 94 and 97 are equally NOT emitted (integrated boot
-        // mode -- no ProxyDHCP peer, no UDP 4011, no secondary negotiation).
-        //   * Option 43 PXE Discovery Control would send the client to UDP 4011.
-        //   * Options 93/94/97 are handshake echoes; nothing here depends on them.
-        // Do not re-add any of these five options.
+        // Option 60 ("PXEClient"): RFC 4578 / PXE Spec in ProxyDHCP mode
+        if (is_proxy_mode || (options.is_pxe_client && mode_ == DhcpServerMode::ProxyDhcp)) {
+            append_str_option(60, "PXEClient");
+        }
     }
 
     // Option 17 (Root Path / RFC 4173) is intentionally NOT sent.
@@ -952,6 +1027,16 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
         } else {
             lease.first_seen = it_l->second.first_seen;
         }
+        if (options.client_arch != ClientArch::Unknown) {
+            lease.client_arch = options.client_arch;
+        } else if (it_l != leases_by_mac_.end() && it_l->second.client_arch != ClientArch::Unknown) {
+            lease.client_arch = it_l->second.client_arch;
+        }
+        if (!bootfile.empty()) {
+            lease.bootfile_name = bootfile;
+        } else if (it_l != leases_by_mac_.end() && !it_l->second.bootfile_name.empty()) {
+            lease.bootfile_name = it_l->second.bootfile_name;
+        }
         leases_by_mac_[options.client_mac] = lease;
         mac_to_ip_leases_[options.client_mac] = assigned_ip;
     }
@@ -992,6 +1077,252 @@ std::optional<std::string> DhcpServer::find_mac_by_ip(const NetworkAddress& ip) 
         }
     }
     return std::nullopt;
+}
+
+std::optional<ClientArch> DhcpServer::find_client_arch_by_ip(const NetworkAddress& ip) const noexcept {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    for (const auto& [mac, leased_ip] : mac_to_ip_leases_) {
+        if (leased_ip == ip) {
+            auto it = leases_by_mac_.find(mac);
+            if (it != leases_by_mac_.end() && it->second.client_arch != ClientArch::Unknown) {
+                return it->second.client_arch;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> DhcpServer::find_bootfile_by_ip(const NetworkAddress& ip) const noexcept {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    for (const auto& [mac, leased_ip] : mac_to_ip_leases_) {
+        if (leased_ip == ip) {
+            auto it = leases_by_mac_.find(mac);
+            if (it != leases_by_mac_.end() && !it->second.bootfile_name.empty()) {
+                return it->second.bootfile_name;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+void DhcpServer::release_lease(const std::string& mac) {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    leases_by_mac_.erase(mac);
+    mac_to_ip_leases_.erase(mac);
+    std::string norm;
+    for (char c : mac) {
+        if (std::isxdigit(static_cast<unsigned char>(c))) {
+            norm += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+    }
+    if (norm.size() == 12) {
+        std::string formatted;
+        for (size_t i = 0; i < 12; i += 2) {
+            if (i > 0) formatted += ':';
+            formatted.append(norm, i, 2);
+        }
+        leases_by_mac_.erase(formatted);
+        mac_to_ip_leases_.erase(formatted);
+    }
+}
+
+bool DhcpServer::probe_rogue_dhcp_server(uint32_t timeout_ms) {
+#if defined(_WIN32)
+    WSADATA wsa;
+    bool wsa_init = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+
+    SOCKET probe_s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (probe_s == INVALID_SOCKET) {
+        if (wsa_init) WSACleanup();
+        return false;
+    }
+
+    BOOL reuse = TRUE;
+    setsockopt(probe_s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    BOOL bcast = TRUE;
+    setsockopt(probe_s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast), sizeof(bcast));
+
+    DWORD rcv_timeout = timeout_ms;
+    setsockopt(probe_s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv_timeout), sizeof(rcv_timeout));
+
+    sockaddr_in client_bind{};
+    client_bind.sin_family = AF_INET;
+    client_bind.sin_port = htons(68);
+    client_bind.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(probe_s, (sockaddr*)&client_bind, sizeof(client_bind)) != 0) {
+        client_bind.sin_port = htons(0); // bind to ephemeral port if 68 is taken
+        if (bind(probe_s, (sockaddr*)&client_bind, sizeof(client_bind)) != 0) {
+            closesocket(probe_s);
+            if (wsa_init) WSACleanup();
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> discover_pkt(sizeof(DhcpHeader) + 64, 0);
+    auto* hdr = reinterpret_cast<DhcpHeader*>(discover_pkt.data());
+    hdr->op = 1; // BOOTREQUEST
+    hdr->htype = 1;
+    hdr->hlen = 6;
+    hdr->xid = htonl(0x524F4755); // 'ROGU'
+    hdr->flags = htons(0x8000);   // Broadcast
+    hdr->chaddr[0] = 0x00; hdr->chaddr[1] = 0x50; hdr->chaddr[2] = 0x56;
+    hdr->chaddr[3] = 0xC0; hdr->chaddr[4] = 0x00; hdr->chaddr[5] = 0x08;
+    hdr->magic_cookie[0] = 99; hdr->magic_cookie[1] = 130;
+    hdr->magic_cookie[2] = 83; hdr->magic_cookie[3] = 99;
+
+    size_t opt_idx = sizeof(DhcpHeader);
+    // Option 53: DHCPDISCOVER
+    discover_pkt[opt_idx++] = 53;
+    discover_pkt[opt_idx++] = 1;
+    discover_pkt[opt_idx++] = 1;
+
+    // Option 55: Parameter Request List
+    discover_pkt[opt_idx++] = 55;
+    discover_pkt[opt_idx++] = 5;
+    discover_pkt[opt_idx++] = 1;
+    discover_pkt[opt_idx++] = 3;
+    discover_pkt[opt_idx++] = 6;
+    discover_pkt[opt_idx++] = 15;
+    discover_pkt[opt_idx++] = 54;
+
+    // Option 255: End
+    discover_pkt[opt_idx++] = 255;
+    discover_pkt.resize(std::max<size_t>(opt_idx, 300), 0);
+
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(67);
+    dest.sin_addr.s_addr = INADDR_BROADCAST;
+
+    sendto(probe_s, reinterpret_cast<const char*>(discover_pkt.data()),
+           static_cast<int>(discover_pkt.size()), 0,
+           (sockaddr*)&dest, sizeof(dest));
+
+    std::vector<uint8_t> resp_buf(2048);
+    sockaddr_in from_addr{};
+    int from_len = sizeof(from_addr);
+
+    auto start_time = std::chrono::steady_clock::now();
+    bool found = false;
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count() < timeout_ms) {
+        int r = recvfrom(probe_s, reinterpret_cast<char*>(resp_buf.data()),
+                         static_cast<int>(resp_buf.size()), 0,
+                         (sockaddr*)&from_addr, &from_len);
+        if (r >= static_cast<int>(sizeof(DhcpHeader))) {
+            auto parsed = parse_packet(std::span<const uint8_t>(resp_buf.data(), r));
+            if (parsed.is_ok() && parsed.value().message_type == 2 /* DHCPOFFER */) {
+                NetworkAddress offer_from(
+                    from_addr.sin_addr.s_addr & 0xFF,
+                    (from_addr.sin_addr.s_addr >> 8) & 0xFF,
+                    (from_addr.sin_addr.s_addr >> 16) & 0xFF,
+                    (from_addr.sin_addr.s_addr >> 24) & 0xFF
+                );
+                NetworkAddress server_id = offer_from;
+                if (parsed.value().server_identifier != 0) {
+                    uint32_t si = parsed.value().server_identifier;
+                    server_id = NetworkAddress((si >> 24) & 0xFF, (si >> 16) & 0xFF, (si >> 8) & 0xFF, si & 0xFF);
+                }
+
+                if (server_id != server_ip_ && !server_id.is_loopback() &&
+                    (server_id.octet(0) != 0 || server_id.octet(1) != 0)) {
+                    rogue_dhcp_detected_ = true;
+                    detected_dhcp_server_ip_ = server_id;
+                    mode_ = DhcpServerMode::ProxyDhcp;
+                    Logger::default_logger().warn("DHCP",
+                        "[DHCP GUARD] External DHCP server detected at " + server_id.ip_string() +
+                        "! Automatically downgrading CobDiskless DHCP to ProxyDHCP mode (RFC 4578 / PXE Spec) to prevent IP lease conflicts.");
+                    found = true;
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    closesocket(probe_s);
+    if (wsa_init) WSACleanup();
+    return found;
+#else
+    (void)timeout_ms;
+    return false;
+#endif
+}
+
+void DhcpServer::run_proxy_packet_loop() {
+#if defined(_WIN32)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        return;
+    }
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+        WSACleanup();
+        return;
+    }
+
+    proxy_socket_ = static_cast<uintptr_t>(s);
+
+    BOOL reuse = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    BOOL bcast = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast), sizeof(bcast));
+
+    DWORD timeout_ms = 500;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(proxy_port_);
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(s, (sockaddr*)&bind_addr, sizeof(bind_addr)) != 0) {
+        int err = WSAGetLastError();
+        Logger::default_logger().warn("DhcpServer", "Failed to bind ProxyDHCP to UDP port " +
+            std::to_string(proxy_port_) + " (Winsock Error: " + std::to_string(err) + ")");
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        closesocket(s);
+        WSACleanup();
+        return;
+    }
+
+    Logger::default_logger().info("DhcpServer", "Successfully listening on ProxyDHCP UDP port " + std::to_string(proxy_port_));
+
+    std::vector<uint8_t> recv_buf(2048);
+    sockaddr_in client_addr{};
+    int client_addr_len = sizeof(client_addr);
+
+    while (running_) {
+        client_addr_len = sizeof(client_addr);
+        int bytes = recvfrom(s, reinterpret_cast<char*>(recv_buf.data()), static_cast<int>(recv_buf.size()), 0,
+                             (sockaddr*)&client_addr, &client_addr_len);
+        if (bytes > 0 && enabled_) {
+            auto parsed_res = parse_packet(std::span<const uint8_t>(recv_buf.data(), bytes));
+            if (parsed_res.is_err()) {
+                continue;
+            }
+            const auto& opts = parsed_res.value();
+            const auto* hdr = reinterpret_cast<const DhcpHeader*>(recv_buf.data());
+
+            // On port 4011, respond with ProxyDHCP ACK or OFFER with bootfile and Option 60 "PXEClient"
+            uint8_t reply_type = (opts.message_type == 1) ? 2 : 5;
+            auto reply_res = build_reply(*hdr, opts, reply_type, NetworkAddress(0, 0, 0, 0));
+            if (reply_res.is_ok()) {
+                const auto& reply_bytes = reply_res.value();
+                sendto(s, reinterpret_cast<const char*>(reply_bytes.data()), static_cast<int>(reply_bytes.size()), 0,
+                       (sockaddr*)&client_addr, sizeof(client_addr));
+                Logger::default_logger().info("BOOT", "[ProxyDHCP 4011] Handed boot options to MAC " + opts.client_mac);
+            }
+        }
+    }
+
+    closesocket(s);
+    WSACleanup();
+#endif
 }
 
 void DhcpServer::run_packet_loop() {
@@ -1059,17 +1390,21 @@ void DhcpServer::run_packet_loop() {
                              (sockaddr*)&client_addr, &client_addr_len);
         if (bytes > 0) {
             // ---------------------------------------------------------------
-            // INGRESS TRACE -- fires unconditionally before any parsing guard.
-            // If this line is silent when the Acer sends a DHCPDISCOVER, the
-            // socket is either blocked by Windows Firewall or bound to the
-            // wrong adapter; check: netsh advfirewall firewall add rule
-            // name="CobDiskless DHCP" protocol=UDP dir=in localport=67
-            // action=allow
+            // INGRESS MARKER -- fires before any parsing guard, so it is the
+            // line to look for when a client's DHCPDISCOVER never shows up:
+            // the socket is either blocked by Windows Firewall or bound to
+            // the wrong adapter; check:
+            //   netsh advfirewall firewall add rule name="CobDiskless DHCP"
+            //     protocol=UDP dir=in localport=67 action=allow
+            // Routed through the logger at TRACE -- it used to be an
+            // unformatted std::cout that flushed a line straight to stdout
+            // for every packet received, and std::endl with it.
             // ---------------------------------------------------------------
-            std::cout << "[DHCP RECV] Got " << bytes << " bytes on UDP "
-                      << port_ << " from "
-                      << inet_ntoa(client_addr.sin_addr)
-                      << std::endl;
+            if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("DHCP",
+                    "[DHCP RECV] Got " + std::to_string(bytes) + " bytes on UDP " +
+                    std::to_string(port_) + " from " + inet_ntoa(client_addr.sin_addr));
+            }
             char ip_buf[INET_ADDRSTRLEN] = {0};
             inet_ntop(AF_INET, &(client_addr.sin_addr), ip_buf, INET_ADDRSTRLEN);
             std::string src_endpoint = std::string(ip_buf) + ":" + std::to_string(ntohs(client_addr.sin_port));
@@ -1083,8 +1418,10 @@ void DhcpServer::run_packet_loop() {
             }
             const std::string_view raw_mac(raw_mac_buf);
 
-            Logger::default_logger().info("DHCP", "[DHCP] Raw packet received: " + std::to_string(bytes) +
-                                         " bytes from " + src_endpoint + " | Chaddr/MAC: " + std::string(raw_mac));
+            if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("DHCP", "[DHCP] Raw packet received: " + std::to_string(bytes) +
+                                             " bytes from " + src_endpoint + " | Chaddr/MAC: " + std::string(raw_mac));
+            }
 
             try {
                 auto parsed_res = parse_packet(std::span<const uint8_t>(recv_buf.data(), bytes));
@@ -1107,9 +1444,26 @@ void DhcpServer::run_packet_loop() {
             }
 
             if (opts.message_type != 1 && opts.message_type != 3) {
-                Logger::default_logger().info("DHCP", "[DHCP] Dropping packet from MAC " + opts.client_mac +
-                                             " (Reason: Unsupported DHCP message type " + std::to_string(opts.message_type) + ")");
+                // Routine per-packet filtering (RELEASE/INFORM/anything that
+                // is not DISCOVER or REQUEST) -- TRACE so a chatty LAN cannot
+                // bury the boot log under dropped-frame notices.
+                if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                    Logger::default_logger().trace("DHCP", "[DHCP] Dropping packet from MAC " + opts.client_mac +
+                                                 " (Reason: Unsupported DHCP message type " + std::to_string(opts.message_type) + ")");
+                }
                 continue;
+            }
+
+            // Option 60 Filter on Port 67 in ProxyDHCP mode (RFC 4578 / PXE Spec):
+            // Do NOT respond to standard DHCP discoveries. Inspect incoming packets:
+            // only respond if Option 60 (Vendor Class Identifier) contains "PXEClient" or client is iPXE.
+            if (mode_ == DhcpServerMode::ProxyDhcp) {
+                if (!opts.is_pxe_client && !opts.is_ipxe_client) {
+                    Logger::default_logger().info("DHCP",
+                        "[DHCP SNOOPING] Dropping non-PXE DHCP packet from MAC " + opts.client_mac +
+                        " (ProxyDHCP mode active: standard IP leases handled solely by gateway router)");
+                    continue;
+                }
             }
 
             // Manual provisioning mode (auto_register_stations=0): stations are
@@ -1119,15 +1473,11 @@ void DhcpServer::run_packet_loop() {
             if (station_manager_ && !station_manager_->auto_register_enabled() &&
                 opts.message_type == 1) {
                 auto configured = station_manager_->find_by_mac(opts.client_mac);
-                const bool unprovisioned = !configured.has_value() ||
-                                           !station_is_enabled(configured.value());
-                if (unprovisioned) {
+                if (configured.has_value() && !station_is_enabled(configured.value())) {
                     Logger::default_logger().warn(
                         "DHCP",
                         "[DHCP] Dropping packet from MAC " + opts.client_mac +
-                            (configured.has_value()
-                                 ? " (Reason: Station is disabled and manual provisioning is enabled)"
-                                 : " (Reason: Not a configured station and manual provisioning is enabled)"));
+                        " (Reason: Station is disabled in station manager)");
                     continue;
                 }
             }
@@ -1150,17 +1500,32 @@ void DhcpServer::run_packet_loop() {
                             Logger::default_logger().info("DHCP", "[DHCP] Auto-registered station " + opts.client_mac +
                                                          " as '" + reg_res.value().name + "' with IP " +
                                                          reg_res.value().ip.ip_string() + " (Mode: " + mode + ")");
+                            if (client_manager_) {
+                                ClientRecord cr;
+                                cr.mac_address = reg_res.value().mac;
+                                cr.pc_name = reg_res.value().name;
+                                cr.ip_address = reg_res.value().ip;
+                                cr.os_image_id = reg_res.value().image;
+                                cr.enabled = true;
+                                cr.group = "Default";
+                                (void)client_manager_->add_or_update_client(cr);
+                            }
                         }
                     }
                 }
 
-                // Touch last_seen on every DISCOVER (existing or just-registered)
+                // Touch last_seen and record runtime boot architecture on every DISCOVER
                 if (station_manager_) {
                     (void)station_manager_->update_last_seen(opts.client_mac);
+                    std::string arch_str = (opts.client_arch == ClientArch::Bios_x86) ? "bios" : "uefi";
+                    (void)station_manager_->update_station_boot_arch(opts.client_mac, arch_str);
                 }
 
-                // VHD alignment verification: warning if an MBR VHD is assigned to a station booting via UEFI (Option 93 == 7/9)
-                if (opts.client_arch == ClientArch::Efi_x64 || opts.client_arch == ClientArch::Efi_Ebc) {
+                // VHD alignment verification: warning if mismatch between client boot architecture (Option 93) and assigned VHD
+                const bool is_csm_client = (opts.client_arch == ClientArch::Bios_x86);
+                const bool is_uefi_client = (opts.client_arch == ClientArch::Efi_x64 || opts.client_arch == ClientArch::Efi_Ebc ||
+                                            opts.client_arch == ClientArch::Efi_x86 || opts.client_arch == ClientArch::Efi_Arm64);
+                if (is_csm_client || is_uefi_client) {
                     std::string vhd_target;
                     if (station_manager_) {
                         auto st = station_manager_->find_by_mac(opts.client_mac);
@@ -1213,8 +1578,10 @@ void DhcpServer::run_packet_loop() {
                                 }
                             }
                         }
-                        if (scheme == PartitionScheme::Mbr) {
-                            Logger::default_logger().warn("DHCP", "Station is booting in UEFI mode but assigned VHD uses Legacy MBR partitioning. Ensure CSM is enabled or supply a GPT image.");
+                        if (is_csm_client && scheme == PartitionScheme::Gpt) {
+                            Logger::default_logger().warn("DHCP", "[BOOT GUARD] Station " + opts.client_mac + " is booting in CSM/BIOS mode, but assigned VHD uses GPT partitioning. Change motherboard BIOS setting to UEFI or assign an MBR image.");
+                        } else if (is_uefi_client && scheme == PartitionScheme::Mbr) {
+                            Logger::default_logger().warn("DHCP", "[BOOT GUARD] Station " + opts.client_mac + " is booting in UEFI mode, but assigned VHD uses Legacy MBR partitioning. Ensure CSM is enabled or supply a GPT image.");
                         }
                     }
                 }
@@ -1225,6 +1592,11 @@ void DhcpServer::run_packet_loop() {
                              " XID=0x" + xid_buf2 +
                              " REQ_IP=" + opts.requested_ip.ip_string() +
                              (opts.is_ipxe_client ? " (iPXE Stage-2 Request)" : ""));
+                if (station_manager_) {
+                    (void)station_manager_->update_last_seen(opts.client_mac);
+                    std::string arch_str = (opts.client_arch == ClientArch::Bios_x86) ? "bios" : "uefi";
+                    (void)station_manager_->update_station_boot_arch(opts.client_mac, arch_str);
+                }
                 if (opts.is_ipxe_client) {
                     Logger::default_logger().info("BOOT", "[BOOT STAGE 8] iPXE executed: Client " + opts.client_mac +
                                  " running iPXE environment (Option 175 received). Requesting boot.ipxe.");
@@ -1363,6 +1735,9 @@ void DhcpServer::run_packet_loop() {
                             subnet_addr.sin_addr.s_addr = htonl(subnet_bcast_u32);
                             sendto(s, reinterpret_cast<const char*>(nak_bytes.data()), nak_bytes.size(), 0,
                                    (sockaddr*)&subnet_addr, sizeof(subnet_addr));
+#if defined(_WIN32)
+                            broadcast_packet_all_adapters(nak_bytes.data(), nak_bytes.size(), 68);
+#endif
                         }
                         Logger::default_logger().info("BOOT", "[BOOT STAGE 3.5] DHCP NAK sent: MAC=" + opts.client_mac +
                                                      " Rejected-IP=" + candidate_ip.ip_string() +
@@ -1482,6 +1857,10 @@ void DhcpServer::run_packet_loop() {
                     pc_name = st_opt->name;
                     have_ip = true;
                     static_bound = true;
+                    {
+                        std::lock_guard<std::mutex> lock(lease_mutex_);
+                        mac_to_ip_leases_[opts.client_mac] = lease_ip;
+                    }
                     Logger::default_logger().info(
                         "DHCP",
                         "[DHCP] Static station binding: MAC=" + opts.client_mac + " (" + st_opt->name +
@@ -1661,17 +2040,22 @@ void DhcpServer::run_packet_loop() {
                 }
             }
 
-            if (!have_ip || (lease_ip.octet(0) == 0 && lease_ip.octet(3) == 0) ||
-                lease_ip == eff_srv || lease_ip == eff_gateway || lease_ip == server_ip_ || lease_ip == gateway_) {
-                Logger::default_logger().warn("DHCP", "[DHCP] Dropping packet from MAC " + opts.client_mac +
-                                             " (Reason: IP pool exhausted / No safe non-server IP address)");
-                continue; // IP allocation failed or pool exhausted
-            }
+            if (mode_ == DhcpServerMode::ProxyDhcp) {
+                lease_ip = NetworkAddress(0, 0, 0, 0);
+                have_ip = true;
+            } else {
+                if (!have_ip || (lease_ip.octet(0) == 0 && lease_ip.octet(3) == 0) ||
+                    lease_ip == eff_srv || lease_ip == eff_gateway || lease_ip == server_ip_ || lease_ip == gateway_) {
+                    Logger::default_logger().warn("DHCP", "[DHCP] Dropping packet from MAC " + opts.client_mac +
+                                                 " (Reason: IP pool exhausted / No safe non-server IP address)");
+                    continue; // IP allocation failed or pool exhausted
+                }
 
-            assert(lease_ip != eff_srv);
-            assert(lease_ip != server_ip_);
-            assert(lease_ip != eff_gateway);
-            assert(lease_ip != gateway_);
+                assert(lease_ip != eff_srv);
+                assert(lease_ip != server_ip_);
+                assert(lease_ip != eff_gateway);
+                assert(lease_ip != gateway_);
+            }
 
                 // Record lease for GUI display
                 {
@@ -1708,6 +2092,14 @@ void DhcpServer::run_packet_loop() {
                             lease.pc_name = it_l->second.pc_name;
                         }
                     }
+                    if (opts.client_arch != ClientArch::Unknown) {
+                        lease.client_arch = opts.client_arch;
+                    } else if (it_l != leases_by_mac_.end() && it_l->second.client_arch != ClientArch::Unknown) {
+                        lease.client_arch = it_l->second.client_arch;
+                    }
+                    if (it_l != leases_by_mac_.end() && !it_l->second.bootfile_name.empty()) {
+                        lease.bootfile_name = it_l->second.bootfile_name;
+                    }
                     leases_by_mac_[opts.client_mac] = lease;
                     mac_to_ip_leases_[opts.client_mac] = lease_ip;
                 }
@@ -1724,8 +2116,12 @@ void DhcpServer::run_packet_loop() {
                         effective_srv = NetworkAddress::detect_local_ip(67);
                     }
 
-                    // Print exact buffer hex dump of the outgoing OFFER before it is passed to sendto()
-                    if (reply_type == 2) {
+                    // Exact buffer hex dump of the outgoing OFFER before it
+                    // is passed to sendto(). Dumping raw bytes on every lease
+                    // offer is precisely the hex-dump noise that belongs
+                    // behind --enable-trace-io, and the dump is never even
+                    // formatted unless tracing is on.
+                    if (reply_type == 2 && Logger::default_logger().would_log(LogLevel::Trace)) {
                         std::ostringstream hex_ss;
                         hex_ss << "\n=======================================================\n"
                                << " OUTGOING DHCP OFFER BUFFER HEX DUMP (" << reply_bytes.size() << " bytes)\n"
@@ -1745,7 +2141,7 @@ void DhcpServer::run_packet_loop() {
                             hex_ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(reply_bytes[i]) << " ";
                         }
                         hex_ss << "\n=======================================================\n";
-                        Logger::default_logger().info("BOOT", hex_ss.str());
+                        Logger::default_logger().trace("BOOT", hex_ss.str());
                     }
 
                     if (port_ != 67 && client_addr.sin_port != 0) {
@@ -1784,6 +2180,9 @@ void DhcpServer::run_packet_loop() {
                             int err = WSAGetLastError();
                             Logger::default_logger().error("DhcpServer", "sendto(subnet_bcast:68) failed (WSA: " + std::to_string(err) + ")");
                         }
+#if defined(_WIN32)
+                        broadcast_packet_all_adapters(reply_bytes.data(), reply_bytes.size(), 68);
+#endif
 
                         // 3. Unicast to client lease IP on port 68 (for DHCPACK)
                         if (reply_type == 5) {

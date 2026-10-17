@@ -1,0 +1,167 @@
+﻿=== APPLYING SYSTEM HIVE PATCHES TO I:\Windows\System32\config\SYSTEM ===
+=== VERIFY ISCSIPRT ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt
+    DisplayName    REG_SZ    iScsiPort Driver
+    ImagePath    REG_EXPAND_SZ    System32\drivers\msiscsi.sys
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    CCiSCSI
+    BootFlags    REG_DWORD    0x1
+    Owners    REG_MULTI_SZ    iscsi.inf
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Enum
+    0    REG_SZ    ROOT\ISCSIPRT\0000
+    Count    REG_DWORD    0x1
+    NextInstance    REG_DWORD    0x1
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\iScsiPrt\Parameters
+    BusType    REG_DWORD    0x9
+    WaitForNetworkAtBoot    REG_DWORD    0x0
+    DelayForNetworkAtBoot    REG_DWORD    0x1
+
+=== VERIFY CDDB ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\CriticalDeviceDatabase\pci#ven_10ec&cc_0200
+    ClassGUID    REG_SZ    {4d36e972-e325-11ce-bfc1-08002be10318}
+    Service    REG_SZ    rt640x64
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\CriticalDeviceDatabase\pci#ven_10ec&cc_020000
+    ClassGUID    REG_SZ    {4d36e972-e325-11ce-bfc1-08002be10318}
+    Service    REG_SZ    rt640x64
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\CriticalDeviceDatabase\pci#ven_10ec&dev_8168
+    ClassGUID    REG_SZ    {4d36e972-e325-11ce-bfc1-08002be10318}
+    Service    REG_SZ    rt640x64
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\CriticalDeviceDatabase\pci#ven_10ec&dev_8168&rev_06
+    ClassGUID    REG_SZ    {4d36e972-e325-11ce-bfc1-08002be10318}
+    Service    REG_SZ    rt640x64
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\CriticalDeviceDatabase\root#iscsiprt
+    ClassGUID    REG_SZ    {4d36e97b-e325-11ce-bfc1-08002be10318}
+    Service    REG_SZ    iScsiPrt
+
+=== VERIFY NET 0000 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000
+    DriverDesc    REG_SZ    Realtek PCIe GbE Family Controller
+    ProviderName    REG_SZ    Realtek
+    DriverDateData    REG_BINARY    0000297A21C6DC01
+    DriverDate    REG_SZ    4-7-2026
+    DriverVersion    REG_SZ    10.80.50.407
+    InfPath    REG_SZ    oem0.inf
+    InfSection    REG_SZ    RTL8168E.ndi.NT
+    MatchingDeviceId    REG_SZ    PCI\VEN_10EC&DEV_8168&REV_06
+    *SpeedDuplex    REG_SZ    0
+    ForceMode    REG_SZ    0
+    *FlowControl    REG_SZ    0
+    *PriorityVLANTag    REG_SZ    3
+    *InterruptModeration    REG_SZ    1
+    *ReceiveBuffers    REG_SZ    512
+    *TransmitBuffers    REG_SZ    128
+    *JumboPacket    REG_SZ    1514
+    *IPChecksumOffloadIPv4    REG_SZ    3
+    *TCPChecksumOffloadIPv4    REG_SZ    3
+    *UDPChecksumOffloadIPv4    REG_SZ    3
+    S5WakeOnLan    REG_SZ    1
+    *TCPChecksumOffloadIPv6    REG_SZ    3
+    *UDPChecksumOffloadIPv6    REG_SZ    3
+    *LsoV2IPv4    REG_SZ    1
+    *LsoV2IPv6    REG_SZ    1
+    *WakeOnPattern    REG_SZ    1
+    *WakeOnMagicPacket    REG_SZ    1
+    WolShutdownLinkSpeed    REG_SZ    0
+    *PMARPOffload    REG_SZ    1
+    *PMNSOffload    REG_SZ    1
+    *IfType    REG_DWORD    0x6
+    *MediaType    REG_DWORD    0x0
+    *PhysicalMediaType    REG_DWORD    0xe
+    BusType    REG_SZ    5
+    Characteristics    REG_DWORD    0x84
+    IfTypePreStart    REG_DWORD    0x6
+    NetworkInterfaceInstallTimestamp    REG_QWORD    0x1dd4c7cad7ae6fa
+    InstallTimeStamp    REG_BINARY    EA0709000400180017000C002B007C00
+    DeviceInstanceID    REG_SZ    PCI\VEN_10EC&DEV_8168&SUBSYS_307C17AA&REV_06\01000000684CE00000
+    ComponentId    REG_SZ    PCI\VEN_10EC&DEV_8168&REV_06
+    NetCfgInstanceId    REG_SZ    {820C4568-D585-420E-94B3-AEA0E0DC3402}
+    NetLuidIndex    REG_DWORD    0x8000
+    BiosSetting    REG_DWORD    0x0
+    ASPM    REG_DWORD    0x0
+    CLKREQ    REG_DWORD    0x0
+    AutoDisableGigabit    REG_SZ    0
+    PowerDownPll    REG_DWORD    0x0
+    DeviceRemovable    REG_SZ    0
+    HwParaMask    REG_DWORD    0x0
+    HwPciOtherFunDevMask    REG_DWORD    0x0
+    HwOptimize    REG_DWORD    0x0
+    HwMode    REG_DWORD    0x0
+    HwOption    REG_DWORD    0x0
+    HwWolCrcVal    REG_DWORD    0x0
+    LogDisconnectEvent    REG_SZ    0
+    EnableEDT    REG_SZ    1
+    RIACP    REG_SZ    0
+    S5NicKeepOverrideMacAddr    REG_DWORD    0x1
+    S5NicKeepOverrideMacAddrV2    REG_DWORD    0x1
+    PPSW    REG_SZ    1
+    GPPSW    REG_SZ    0
+    S0MgcPkt    REG_SZ    1
+    HwFPSM    REG_DWORD    0x0
+    SwIML    REG_DWORD    0x0
+    SwIML100    REG_DWORD    0x0
+    SwIMLV2    REG_DWORD    0x0
+    SwIML100V2    REG_DWORD    0x0
+    ENPWMode    REG_SZ    0
+    Diskless    REG_DWORD    0x1
+    DisklessOption    REG_DWORD    0x1
+    TxOptimizeThreshold    REG_DWORD    0x0
+    RxOptimizeThreshold    REG_DWORD    0x0
+    CFHTime    REG_DWORD    0x0
+    LDWTime    REG_DWORD    0x0
+    RMPT    REG_DWORD    0x0
+    CRSPDThreshold    REG_DWORD    0x0
+    ComboPerfAdjust    REG_SZ    0
+    CHNLWTime    REG_DWORD    0x0
+    CHNLWCnt    REG_DWORD    0x0
+    L1L0sLT    REG_DWORD    0x0
+    MRRSize    REG_DWORD    0x0
+    TDBSize    REG_DWORD    0xffffffff
+    RDBSize    REG_DWORD    0xffffffff
+    HwOptionV2    REG_DWORD    0x0
+    HwOptionV3    REG_DWORD    0x0
+    HwOptionV4    REG_DWORD    0x0
+    HwOptionV5    REG_DWORD    0x0
+    HwBpMask    REG_DWORD    0x0
+    MonitorModeEnabled    REG_SZ    0
+    UCEM    REG_DWORD    0x0
+    FactoryMode    REG_SZ    0
+    SwParaMask    REG_DWORD    0x0
+    PowerSavingMode    REG_SZ    0
+    DisablePBA    REG_SZ    1
+    *RSS    REG_SZ    1
+    *ModernStandbyWoLMagicPacket    REG_SZ    0
+    *NumRssQueues    REG_SZ    4
+    *EEE    REG_SZ    0
+    EnableGreenEthernet    REG_SZ    0
+    RegVlanid    REG_SZ    0
+    PBPFA    REG_DWORD    0x1c05
+    HwPFA    REG_DWORD    0x20000
+    HwAutoloadMedia    REG_SZ    1
+    WaitAutoNegComplete    REG_DWORD    0x1
+    AutoPowerSave    REG_SZ    0
+    GigaLite    REG_SZ    0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000\Linkage
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000\Ndi
+=== VERIFY MOUNTED DEVICES ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\MountedDevices
+    \DosDevices\D:    REG_BINARY    444D494F3A49443AA52F5CA6EC3E1B42817BC3266B8696A6
+    \DosDevices\E:    REG_BINARY    444D494F3A49443AD23BF3C67BCB704480E9E34CA8399E71
+    \DosDevices\C:    REG_BINARY    8984123E0000602200000000
+    \??\Volume{3e128489-0000-0000-0000-602200000000}    REG_BINARY    8984123E0000602200000000
+    \??\Volume{3e128489-0000-0000-0000-100000000000}    REG_BINARY    8984123E0000100000000000
+
+Removed dirty log: SYSTEM.LOG1
+Removed dirty log: SYSTEM.LOG2

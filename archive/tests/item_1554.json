@@ -1,0 +1,106 @@
+﻿{
+    "windowsVersions":  {
+                            "1809":  {
+                                         "KB4580390":  {
+                                                           "updateInfo":  {
+                                                                              "heading":  "October 20, 2020—KB4580390 (OS Build 17763.1554) Preview",
+                                                                              "releaseDate":  "2020-10-20",
+                                                                              "releaseVersion":  "17763.1554",
+                                                                              "updateUrl":  "https://support.microsoft.com/help/4580390"
+                                                                          },
+                                                           "assemblies":  {
+                                                                              "amd64_dual_iscsi.inf_31bf3856ad364e35_10.0.17763.1554_none_fdf4d3f5ace7f19d":  {
+                                                                                                                                                                  "assemblyIdentity":  "@{name=dual_iscsi.inf; version=10.0.17763.1554; processorArchitecture=amd64; language=neutral; buildType=release; publicKeyToken=31bf3856ad364e35; versionScope=nonSxS; type=dualModeDriver}",
+                                                                                                                                                                  "attributes":  ""
+                                                                                                                                                              }
+                                                                          }
+                                                       },
+                                         "KB4586793":  {
+                                                           "updateInfo":  {
+                                                                              "heading":  "November 10, 2020—KB4586793 (OS Build 17763.1577)",
+                                                                              "releaseDate":  "2020-11-10",
+                                                                              "releaseVersion":  "17763.1577",
+                                                                              "updateUrl":  "https://support.microsoft.com/help/4586793"
+                                                                          },
+                                                           "assemblies":  {
+                                                                              "amd64_dual_iscsi.inf_31bf3856ad364e35_10.0.17763.1554_none_fdf4d3f5ace7f19d":  {
+                                                                                                                                                                  "assemblyIdentity":  "@{name=dual_iscsi.inf; version=10.0.17763.1554; processorArchitecture=amd64; language=neutral; buildType=release; publicKeyToken=31bf3856ad364e35; versionScope=nonSxS; type=dualModeDriver}",
+                                                                                                                                                                  "attributes":  ""
+                                                                                                                                                              }
+                                                                          }
+                                                       },
+                                         "KB4594442":  {
+                                                           "updateInfo":  {
+                                                                              "heading":  "November 17, 2020—KB4594442 (OS Build 17763.1579) Out-of-band",
+                                                                              "releaseDate":  "2020-11-17",
+                                                                              "releaseVersion":  "17763.1579",
+                                                                              "updateUrl":  "https://support.microsoft.com/help/4594442"
+                                                                          },
+                                                           "assemblies":  {
+                                                                              "amd64_dual_iscsi.inf_31bf3856ad364e35_10.0.17763.1554_none_fdf4d3f5ace7f19d":  {
+                                                                                                                                                                  "assemblyIdentity":  "@{name=dual_iscsi.inf; version=10.0.17763.1554; processorArchitecture=amd64; language=neutral; buildType=release; publicKeyToken=31bf3856ad364e35; versionScope=nonSxS; type=dualModeDriver}",
+                                                                                                                                                                  "attributes":  ""
+                                                                                                                                                              }
+                                                                          }
+                                                       },
+                                         "KB4586839":  {
+                                                           "updateInfo":  {
+                                                                              "heading":  "November 19, 2020—KB4586839 (OS Build 17763.1613) Preview",
+                                                                              "releaseDate":  "2020-11-19",
+                                                                              "releaseVersion":  "17763.1613",
+                                                                              "updateUrl":  "https://support.microsoft.com/help/4586839"
+                                                                          },
+                                                           "assemblies":  {
+                                                                              "amd64_dual_iscsi.inf_31bf3856ad364e35_10.0.17763.1554_none_fdf4d3f5ace7f19d":  {
+                                                                                                                                                                  "assemblyIdentity":  "@{name=dual_iscsi.inf; version=10.0.17763.1554; processorArchitecture=amd64; language=neutral; buildType=release; publicKeyToken=31bf3856ad364e35; versionScope=nonSxS; type=dualModeDriver}",
+                                                                                                                                                                  "attributes":  ""
+                                                                                                                                                              }
+                                                                          }
+                                                       },
+                                         "KB4592440":  {
+                                                           "updateInfo":  {
+                                                                              "heading":  "December 8, 2020—KB4592440 (OS Build 17763.1637)",
+                                                                              "releaseDate":  "2020-12-08",
+                                                                              "releaseVersion":  "17763.1637",
+                                                                              "updateUrl":  "https://support.microsoft.com/help/4592440"
+                                                                          },
+                                                           "assemblies":  {
+                                                                              "amd64_dual_iscsi.inf_31bf3856ad364e35_10.0.17763.1554_none_fdf4d3f5ace7f19d":  {
+                                                                                                                                                                  "assemblyIdentity":  "@{name=dual_iscsi.inf; version=10.0.17763.1554; processorArchitecture=amd64; language=neutral; buildType=release; publicKeyToken=31bf3856ad364e35; versionScope=nonSxS; type=dualModeDriver}",
+                                                                                                                                                                  "attributes":  ""
+                                                                                                                                                              }
+                                                                          }
+                                                       },
+                                         "KB4598230":  {
+                                                           "updateInfo":  {
+                                                                              "heading":  "January 12, 2021—KB4598230 (OS Build 17763.1697)",
+                                                                              "releaseDate":  "2021-01-12",
+                                                                              "releaseVersion":  "17763.1697",
+                                                                              "updateUrl":  "https://support.microsoft.com/help/4598230"
+                                                                          },
+                                                           "assemblies":  {
+                                                                              "amd64_dual_iscsi.inf_31bf3856ad364e35_10.0.17763.1554_none_fdf4d3f5ace7f19d":  {
+                                                                                                                                                                  "assemblyIdentity":  "@{name=dual_iscsi.inf; version=10.0.17763.1554; processorArchitecture=amd64; language=neutral; buildType=release; publicKeyToken=31bf3856ad364e35; versionScope=nonSxS; type=dualModeDriver}",
+                                                                                                                                                                  "attributes":  ""
+                                                                                                                                                              }
+                                                                          }
+                                                       }
+                                     }
+                        },
+    "fileInfo":  {
+                     "size":  292664,
+                     "md5":  "2bab7a9847db5515ed8b6d99a442b41f",
+                     "sha1":  "5b236cc1f1263dbacfcbf568871afeebd84c4c9a",
+                     "sha256":  "99cdbd8c0891bfdd8d41385a3b16a824bffa2593f8f51eedf33a3f47e1feea6b",
+                     "machineType":  34404,
+                     "timestamp":  3005342781,
+                     "virtualSize":  311296,
+                     "signingStatus":  "Signed",
+                     "version":  "10.0.17763.1554 (WinBuild.160101.0800)",
+                     "description":  "Microsoft iSCSI Initiator Driver",
+                     "signatureType":  "Overlay",
+                     "signingDate":  [
+                                         "2020-10-15T06:55:00"
+                                     ]
+                 }
+}

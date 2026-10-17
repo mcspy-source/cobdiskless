@@ -2,7 +2,8 @@
 
 #include "admin_app.hpp"
 #include "CobDisklessCore/config/simple_json.hpp"
-#include "CobDisklessCore/image/pnp_driver_armer.hpp"
+#include "CobDisklessCore/image/reg_bootstart.hpp"
+#include "CobDisklessCore/image/hardware_manifest.hpp"
 #include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/image/golden_image.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
@@ -16,7 +17,8 @@
 #include "CobDisklessCore/client/client_database.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/storage/block_cache.hpp"
-#include "CobDisklessCore/storage/cow_block_device.hpp"
+#include "CobDisklessCore/storage/unified_cow_device.hpp"
+#include "CobDisklessCore/storage/overlay_naming.hpp"
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
 #include "CobDisklessCore/storage/raw_image_backend.hpp"
 #include "CobDisklessCore/storage/vhdx_image_backend.hpp"
@@ -25,6 +27,7 @@
 #include <sstream>
 #include <fstream>
 #include <csignal>
+#include <chrono>
 #include <thread>
 #include <vector>
 #include <string>
@@ -53,6 +56,7 @@ static std::atomic<bool> g_cli_stop_requested{false};
 #if defined(_WIN32)
 static BOOL WINAPI ConsoleCtrlHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT) {
+        Logger::default_logger().warn("CORE", "[CORE] ConsoleCtrlHandler received signal: " + std::to_string(signal));
         g_cli_stop_requested.store(true);
         return TRUE;
     }
@@ -130,6 +134,7 @@ AdminApp::AdminApp()
     session_manager_->set_station_manager(station_manager_);
     session_manager_->set_super_client_identities(config_.super_client_identities());
     session_manager_->set_writeback_quota_bytes(config_.writeback_quota_mb() * 1024ull * 1024ull);
+    session_manager_->set_writeback_ram_bytes(config_.writeback_ram_mb() * 1024ull * 1024ull);
 }
 
 AdminApp::~AdminApp() = default;
@@ -165,8 +170,9 @@ int AdminApp::cli_status() {
     }
     std::cout << "---------------------------------------------------------\n";
     std::cout << "Network Bootloader Files:\n";
+    auto tftp_dir = Configuration::resolve_tftp_boot_directory(config_.tftp_boot_dir());
     for (const auto& bf : {"ipxe.efi", "snponly.efi", "undionly.kpxe", "boot.ipxe"}) {
-        std::filesystem::path bp = std::filesystem::path("tftp_boot") / bf;
+        std::filesystem::path bp = tftp_dir / bf;
         std::error_code ec;
         if (std::filesystem::exists(bp, ec)) {
             auto sz = std::filesystem::file_size(bp, ec);
@@ -224,8 +230,61 @@ int AdminApp::cli_list_clients() {
     return 0;
 }
 
-int AdminApp::cli_list_drives() {
-    std::cout << "=========================================================\n";
+int AdminApp::cli_superclient(bool enable, const std::string& mac_or_station) {
+    if (!client_manager_) {
+        std::cerr << "ERROR: Client manager not initialized\n";
+        return 1;
+    }
+    if (mac_or_station.empty()) {
+        std::cerr << "Usage: cobdiskless_app superclient <enable|disable> --mac <mac> [--station <name>]\n";
+        return 1;
+    }
+    std::optional<ClientRecord> rec = client_manager_->find_by_mac(mac_or_station);
+    if (!rec.has_value()) {
+        rec = client_manager_->find_by_name(mac_or_station);
+    }
+    if (!rec.has_value()) {
+        std::cerr << "ERROR: No client with MAC or station name '" << mac_or_station << "' found\n";
+        return 1;
+    }
+    const std::string mac = rec->mac_address;
+    auto res = client_manager_->set_super_client(mac, enable);
+    if (!res.is_ok()) {
+        std::cerr << "ERROR: " << res.error().message() << "\n";
+        return 1;
+    }
+    if (session_manager_) {
+        if (auto sess = session_manager_->find_session(ClientId(mac))) {
+            sess->set_super_client(enable);
+        } else if (auto by_mac = session_manager_->find_session_by_mac(mac)) {
+            by_mac->set_super_client(enable);
+        }
+    }
+    auto_save();
+    std::cout << "Super Client " << (enable ? "ENABLED" : "DISABLED")
+              << " for " << rec->pc_name << " (" << mac << ")\n";
+    if (enable) {
+        std::cout << "Writeback for this station will be retained across reboots. "
+                     "Other stations booting '" << rec->os_image_id
+                  << "' will log a torn-image warning until you commit.\n";
+    }
+    return 0;
+}
+
+int AdminApp::cli_commit(const std::string& mac_or_station, bool backup) {
+    if (mac_or_station.empty()) {
+        std::cerr << "Usage: cobdiskless_app commit --mac <mac> [--station <name>] [--backup]\n";
+        return 1;
+    }
+    auto res = CommitWritebackToBase(mac_or_station, backup);
+    if (!res.is_ok()) {
+        std::cerr << "ERROR: commit failed: " << res.error().message() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+int AdminApp::cli_list_drives() {    std::cout << "=========================================================\n";
     std::cout << " CobDiskless Physical Drive Roles\n";
     std::cout << "=========================================================\n";
     (void)storage_manager_->scan_drives();
@@ -337,11 +396,80 @@ int AdminApp::cli_inspect_image(const std::filesystem::path& image_path) {
 
     const auto& rep = report_res.value();
     std::cout << rep.detailed_inspection_summary() << "\n";
+    return 0;
+}
 
-    auto arm_res = PnpDriverArmer::ensure_image_armed(image_path);
-    if (arm_res.is_ok()) {
-        std::cout << arm_res.value().summary() << "\n";
+int AdminApp::cli_arm_image(const std::filesystem::path& vhd_path, uint16_t ven, uint16_t dev,
+                      const std::string& subsys_hex, const std::string& rev_hex) {
+    std::cout << "=========================================================\n";
+    std::cout << " CobDiskless Offline Image Armer & Driver Sanitization\n";
+    std::cout << " Target: " << vhd_path.string() << "\n";
+    if (ven != 0 && dev != 0) {
+        std::cout << " Enrolling PCI: VEN_" << std::hex << ven << " DEV_" << dev << std::dec << "\n";
     }
+    std::cout << "=========================================================\n";
+
+    PciHardwareId pci{ven, dev};
+    {
+        // SUBSYS_XXXXXXXX (sub-device first, Windows order) + REV_XX, as
+        // harvested from PCI config space offsets 0x2E/0x2C/0x08.
+        auto take_hex = [](const std::string& s, size_t digits, unsigned* out) -> bool {
+            if (s.size() != digits) return false;
+            try {
+                size_t pos = 0;
+                unsigned v = std::stoul(s, &pos, 16);
+                if (pos != s.size()) return false;
+                *out = v;
+                return true;
+            } catch (...) { return false; }
+        };
+        unsigned subsys = 0, rev = 0;
+        if (take_hex(subsys_hex, 8, &subsys)) {
+            pci.subsys_device = static_cast<uint16_t>((subsys >> 16) & 0xFFFF);
+            pci.subsys_vendor = static_cast<uint16_t>(subsys & 0xFFFF);
+            pci.has_subsys = (pci.subsys_device != 0 || pci.subsys_vendor != 0);
+        }
+        if (take_hex(rev_hex, 2, &rev)) {
+            pci.revision = static_cast<uint8_t>(rev & 0xFF);
+            pci.has_revision = true;
+        }
+    }
+    auto res = (ven != 0 && dev != 0)
+        ? RegBootStart::arm_image_offline_pipeline(vhd_path, &pci)
+        : RegBootStart::arm_image_offline_pipeline(vhd_path);
+    if (!res.is_ok()) {
+        std::cerr << "[ERROR] Arming pipeline failed: " << res.error().message() << "\n";
+        return 1;
+    }
+
+    const auto& report = res.value();
+    std::cout << report.summary() << "\n";
+
+    if (ven != 0 && dev != 0) {
+        const std::string hw_id = HardwareManifest::hardware_id(pci);
+        std::filesystem::path manifest_paths[] = {
+            "hardware_manifest.json",
+            "build/bin/hardware_manifest.json",
+            "C:/Windows/System32/hardware_manifest.json"
+        };
+        for (const auto& mp : manifest_paths) {
+            HardwareManifest manifest(mp);
+            (void)manifest.load();
+            if (manifest.enroll(hw_id)) {
+                std::cout << "[MANIFEST] Recorded " << hw_id << " in " << mp.string() << "\n";
+            }
+            if (pci.specific()) {
+                const std::string generic = HardwareManifest::hardware_id(ven, dev);
+                if (manifest.enroll(generic)) {
+                    std::cout << "[MANIFEST] Recorded " << generic << " in " << mp.string() << "\n";
+                }
+            }
+        }
+    }
+
+    std::cout << "=========================================================\n";
+    std::cout << "[SUCCESS] Offline image armed, sanitized, and stamped READ-ONLY.\n";
+    std::cout << "=========================================================\n";
     return 0;
 }
 
@@ -391,6 +519,39 @@ void AdminApp::auto_save() {
     if (image_manager_) {
         (void)image_manager_->save_images_to_config(images_config_path_);
     }
+    if (station_manager_) {
+        (void)station_manager_->save();
+    }
+    if (client_database_) {
+        (void)client_database_->save();
+    }
+}
+
+HttpResponse AdminApp::update_station_via_api(const std::string& mac, const std::string& json_body) {
+    if (!http_daemon_) {
+        auto http = std::make_shared<HttpDaemon>(NetworkAddress(0, 0, 0, 0, config_.http_port()));
+        http->set_client_database(client_database_);
+        http->set_station_manager(station_manager_);
+        http->set_client_manager(client_manager_);
+        http->set_server_ip(config_.server_address());
+        http->set_target_iqn("iqn.2026-09.com.cobdiskless:storage");
+        std::vector<std::filesystem::path> image_dirs;
+        if (!config_.os_images_dir().empty()) image_dirs.push_back(config_.os_images_dir());
+        if (storage_manager_ && storage_manager_->is_role_assigned(StorageRole::OsImages)) {
+            auto p = storage_manager_->get_role_path(StorageRole::OsImages);
+            if (!p.empty()) image_dirs.push_back(p);
+        }
+        http->set_image_search_dirs(std::move(image_dirs));
+        if (image_manager_) {
+            std::vector<std::pair<std::string, std::filesystem::path>> aliases;
+            for (const auto& info : image_manager_->list_all_images()) {
+                aliases.emplace_back(info.id.value(), info.file_path);
+            }
+            http->set_image_path_aliases(std::move(aliases));
+        }
+        http_daemon_ = http;
+    }
+    return http_daemon_->handle_request("PUT", "/api/v1/station?mac=" + StationManager::normalize_mac(mac), json_body);
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +585,7 @@ void AdminApp::apply_hot_config(const Configuration& new_cfg) {
     if (session_manager_) {
         session_manager_->set_super_client_identities(new_cfg.super_client_identities());
         session_manager_->set_writeback_quota_bytes(new_cfg.writeback_quota_mb() * 1024ull * 1024ull);
+        session_manager_->set_writeback_ram_bytes(new_cfg.writeback_ram_mb() * 1024ull * 1024ull);
     }
 
     Logger::default_logger().info("CONFIG",
@@ -482,42 +644,87 @@ void AdminApp::stop_config_watcher() {
 }
 
 Result<void> AdminApp::commit_super_client(const std::string& mac) {
+    auto r = CommitWritebackToBase(mac, /*backup=*/false);
+    if (!r.is_ok()) {
+        return r.error();
+    }
+    return {};
+}
+
+Result<AdminApp::CommitSummary> AdminApp::CommitWritebackToBase(
+    const std::string& mac_or_station, bool backup) {
     if (!client_manager_) {
         return Error(ErrorCode::InitializationFailure, "Client manager not initialized");
     }
 
-    auto rec = client_manager_->get_client_by_mac(mac);
-    if (!rec) {
-        return Error(ErrorCode::StorageFailure, "Client with MAC " + mac + " not found");
+    // 1. Resolve a MAC (any spelling) or a station/PC name to a record.
+    std::optional<ClientRecord> rec = client_manager_->find_by_mac(mac_or_station);
+    if (!rec.has_value()) {
+        rec = client_manager_->find_by_name(mac_or_station);
     }
+    if (!rec.has_value()) {
+        return Error(ErrorCode::StorageFailure,
+                     "No client with MAC or station name '" + mac_or_station + "' found");
+    }
+    const std::string mac = rec->mac_address;
 
     if (!rec->is_super_client) {
-        return Error(ErrorCode::InvalidConfiguration, "Client " + rec->pc_name + " is not in Super Client mode");
+        return Error(ErrorCode::InvalidConfiguration,
+                     "Client " + rec->pc_name + " is not in Super Client mode");
     }
 
-    // Try committing active session first
+    // 2. Safety pre-check: the station's iSCSI session must be closed and no
+    //    live TCP connection may reference it. Merging under a live writer
+    //    would race winload/msiscsi and corrupt the base image.
+    std::shared_ptr<ClientSession> live_session;
     if (session_manager_) {
-        auto active_sess = session_manager_->find_session(ClientId(mac));
-        if (active_sess) {
-            auto res = session_manager_->commit_super_client(ClientId(mac));
-            if (!res.is_ok()) {
-                return res;
-            }
-            auto_save();
-            return {};
+        live_session = session_manager_->find_session(ClientId(mac));
+        if (!live_session) {
+            live_session = session_manager_->find_session_by_mac(mac);
+        }
+    }
+    if (live_session) {
+        const bool quiet =
+            (live_session->state() == ClientState::Offline ||
+             live_session->state() == ClientState::Disconnected) &&
+            live_session->live_connections() == 0;
+        if (!quiet) {
+            return Error(ErrorCode::InvalidConfiguration,
+                         "Station " + rec->pc_name + " still has a live iSCSI session (state=" +
+                             std::string(to_string(live_session->state())) + ", live TCP=" +
+                             std::to_string(live_session->live_connections()) +
+                             "); disconnect it before committing");
         }
     }
 
-    // If no active session in memory, check if writeback overlay exists on disk
-    std::string safe_name = mac;
-    std::replace(safe_name.begin(), safe_name.end(), ':', '_');
-    std::replace(safe_name.begin(), safe_name.end(), '/', '_');
-    std::replace(safe_name.begin(), safe_name.end(), '\\', '_');
-    std::filesystem::path wb_path = rec->writeback_dir / ("wb_" + safe_name + ".cow");
-
+    // 3. Locate the overlay; refuse if another process (the running daemon)
+    //    holds it open -- an exclusive probe fails on a sharing violation.
+    std::filesystem::path wb_path =
+        overlay_naming::resolve_writeback_overlay(rec->writeback_dir, mac);
     if (!std::filesystem::exists(wb_path)) {
-        return Error(ErrorCode::StorageFailure, "No active session or writeback overlay file found for client " + rec->pc_name);
+        return Error(ErrorCode::StorageFailure,
+                     "No writeback overlay file found for client " + rec->pc_name +
+                         " (" + wb_path.string() + ")");
     }
+#if defined(_WIN32)
+    {
+        HANDLE probe = CreateFileW(wb_path.c_str(), GENERIC_READ, 0, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (probe == INVALID_HANDLE_VALUE) {
+            const DWORD gle = GetLastError();
+            if (gle == ERROR_SHARING_VIOLATION) {
+                return Error(ErrorCode::InvalidConfiguration,
+                             "Writeback overlay " + wb_path.string() +
+                                 " is open by a live session; disconnect " +
+                                 rec->pc_name + " before committing");
+            }
+        } else {
+            CloseHandle(probe);
+        }
+    }
+#endif
+
+    const auto t0 = std::chrono::steady_clock::now();
 
     if (!image_manager_) {
         image_manager_ = std::make_shared<ImageManager>(registry_);
@@ -531,170 +738,137 @@ Result<void> AdminApp::commit_super_client(const std::string& mac) {
     }
     auto golden_img = img_res.value();
 
-    auto cow_res = CowBlockDevice::create(golden_img->device(), wb_path);
-    if (!cow_res.is_ok()) {
-        (void)image_manager_->release_image(golden_img->id());
-        return cow_res.error();
-    }
-    auto cow = cow_res.value();
-
-    // Open target base image read-write
     auto info_res = image_manager_->get_image_info(golden_img->id());
     if (!info_res.is_ok()) {
         (void)image_manager_->release_image(golden_img->id());
         return info_res.error();
     }
-    const auto& file_path = info_res.value().file_path;
-    std::shared_ptr<BlockDevice> target_backend;
-    ImageFormat fmt = info_res.value().format;
+    const std::filesystem::path base_path = info_res.value().file_path;
 
-    // Drop the cached read-only handle first so the offline exclusive commit
-    // starts from a clean sharing state.
-    (void)image_manager_->evict_cached_image(golden_img->id());
+    // 4. Optional pre-commit backup of the base image.
+    std::string backup_path;
+    if (backup) {
+        backup_path = base_path.string() + ".bak";
+        std::error_code ec;
+        (void)std::filesystem::copy_file(
+            base_path, backup_path,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            (void)image_manager_->release_image(golden_img->id());
+            return Error(ErrorCode::StorageFailure,
+                         "Backup copy failed (" + base_path.string() + " -> " +
+                             backup_path + "): " + ec.message());
+        }
+        Logger::default_logger().info("SUPER_CLIENT",
+            "Base image backed up to " + backup_path + " before commit.");
+    }
 
-    if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic || fmt == ImageFormat::VhdDifferencing) {
-        auto vhd_res = VhdImageBackend::open(file_path, /*read_only=*/false);
-        if (!vhd_res.is_ok()) {
-            (void)image_manager_->reload_image(golden_img->id());
-            (void)image_manager_->release_image(golden_img->id());
-            return vhd_res.error();
+    UnifiedCowDevice::CowMergeStats stats;
+    if (live_session && live_session->cow_device()) {
+        // Quiesced in-memory session: account from pre-merge dirty bytes,
+        // then use the existing session commit path verbatim.
+        const uint64_t dirty = live_session->cow_device()->dirty_bytes();
+        auto res = session_manager_->commit_super_client(ClientId(mac));
+        if (!res.is_ok()) {
+            return res.error();
         }
-        target_backend = vhd_res.value();
-    } else if (fmt == ImageFormat::Vhdx) {
-        auto vhdx_res = VhdxImageBackend::open(file_path, /*read_only=*/false);
-        if (!vhdx_res.is_ok()) {
-            (void)image_manager_->reload_image(golden_img->id());
-            (void)image_manager_->release_image(golden_img->id());
-            return vhdx_res.error();
-        }
-        target_backend = vhdx_res.value();
+        stats.bytes_written = dirty;
+        stats.chunks_merged =
+            static_cast<size_t>((dirty + 65535) / 65536);
     } else {
-        auto raw_res = RawImageBackend::open(file_path, /*read_only=*/false);
-        if (!raw_res.is_ok()) {
+        auto cow_res = UnifiedCowDevice::create(golden_img->device(), wb_path);
+        if (!cow_res.is_ok()) {
+            (void)image_manager_->release_image(golden_img->id());
+            return cow_res.error();
+        }
+        auto cow = cow_res.value();
+
+        // Open target base image read-write (sanctioned master writer).
+        const auto& file_path = base_path;
+        ImageFormat fmt = info_res.value().format;
+        std::shared_ptr<BlockDevice> target_backend;
+
+        // Drop the cached read-only handle first so the offline exclusive
+        // commit starts from a clean sharing state.
+        (void)image_manager_->evict_cached_image(golden_img->id());
+
+        // Offline Super Client commit: the three opens below are the
+        // sanctioned master-image writers, so they carry the explicit
+        // ReadOnlyAttributePolicy that lifts FILE_ATTRIBUTE_READONLY and
+        // re-applies it when the writer closes (VHDX: the backend never
+        // writes, so there is nothing to lift).
+        if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic ||
+            fmt == ImageFormat::VhdDifferencing) {
+            auto vhd_res = VhdImageBackend::open(file_path, /*read_only=*/false,
+                                                 ReadOnlyAttributePolicy::Lift);
+            if (!vhd_res.is_ok()) {
+                (void)image_manager_->reload_image(golden_img->id());
+                (void)image_manager_->release_image(golden_img->id());
+                return vhd_res.error();
+            }
+            target_backend = vhd_res.value();
+        } else if (fmt == ImageFormat::Vhdx) {
+            auto vhdx_res = VhdxImageBackend::open(file_path, /*read_only=*/false);
+            if (!vhdx_res.is_ok()) {
+                (void)image_manager_->reload_image(golden_img->id());
+                (void)image_manager_->release_image(golden_img->id());
+                return vhdx_res.error();
+            }
+            target_backend = vhdx_res.value();
+        } else {
+            auto raw_res = RawImageBackend::open(file_path, /*read_only=*/false,
+                                                 ReadOnlyAttributePolicy::Lift);
+            if (!raw_res.is_ok()) {
+                (void)image_manager_->reload_image(golden_img->id());
+                (void)image_manager_->release_image(golden_img->id());
+                return raw_res.error();
+            }
+            target_backend = raw_res.value();
+        }
+
+        auto merge_res = cow->merge_into(target_backend, &stats);
+        (void)target_backend->flush();
+        target_backend.reset();
+
+        if (!merge_res.is_ok()) {
             (void)image_manager_->reload_image(golden_img->id());
             (void)image_manager_->release_image(golden_img->id());
-            return raw_res.error();
+            return merge_res.error();
         }
-        target_backend = raw_res.value();
-    }
 
-    auto merge_res = cow->merge_into(target_backend);
-    (void)target_backend->flush();
-    target_backend.reset();
-
-    if (!merge_res.is_ok()) {
-        (void)image_manager_->reload_image(golden_img->id());
+        (void)cow->reset();
+        cow->close();
         (void)image_manager_->release_image(golden_img->id());
-        return merge_res.error();
+        (void)image_manager_->reload_image(golden_img->id());
     }
 
-    (void)cow->reset();
-    cow->close();
-    (void)image_manager_->release_image(golden_img->id());
-    (void)image_manager_->reload_image(golden_img->id());
-
-    Logger::default_logger().info("SUPER_CLIENT",
-        "Client " + mac + " changes successfully committed to " + rec->os_image_id + ".");
-
+    // 5. Clear the flag so the next boot is a normal client boot, then save.
+    (void)client_manager_->set_super_client(mac, false);
     auto_save();
-    return {};
-}
 
-void AdminApp::auto_arm_vhd_images() {
-    std::cout << "[INFO] Auto-arming VHD images on boot (auto_arm_vhd_on_boot = true)...\n";
-    Logger::default_logger().info("ARMER", "Scanning configured images and directories for automated offline arming");
+    CommitSummary summary;
+    summary.chunks_merged = stats.chunks_merged;
+    summary.bytes_written = stats.bytes_written;
+    summary.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    summary.base_path = base_path.string();
+    summary.backup_path = backup_path;
 
-    std::vector<std::filesystem::path> scan_dirs;
-    std::error_code ec;
-
-    if (!config_.os_images_dir().empty()) scan_dirs.push_back(config_.os_images_dir());
-    if (!config_.storage_path().empty()) scan_dirs.push_back(config_.storage_path());
-    scan_dirs.push_back("./images");
-    scan_dirs.push_back("./images/os");
-
-    std::vector<std::filesystem::path> candidates;
-
-    // 1. Scan image directories
-    for (const auto& dir : scan_dirs) {
-        if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) continue;
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            if (ec) break;
-            if (entry.is_regular_file(ec)) {
-                std::string ext = entry.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (ext == ".vhd" || ext == ".vhdx") {
-                    candidates.push_back(entry.path());
-                }
-            }
-        }
+    const double mb =
+        static_cast<double>(summary.bytes_written) / (1024.0 * 1024.0);
+    std::ostringstream msg;
+    msg << "Commit complete for " << rec->pc_name << " (" << mac << "): "
+        << summary.chunks_merged << " blocks merged, "
+        << std::fixed << std::setprecision(1) << mb << " MB written to "
+        << summary.base_path << " in "
+        << std::setprecision(1) << summary.seconds << "s";
+    if (!summary.backup_path.empty()) {
+        msg << " [backup: " << summary.backup_path << "]";
     }
+    Logger::default_logger().info("SUPER_CLIENT", msg.str());
+    std::cout << msg.str() << "\n";
 
-    // 2. Parse config.json if present on disk for registered image paths
-    if (std::filesystem::exists(images_config_path_, ec)) {
-        std::ifstream in(images_config_path_, std::ios::binary);
-        if (in.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            auto parsed = JsonValue::parse(content);
-            if (parsed && parsed->is_object()) {
-                const auto* images_val = parsed->find("images");
-                if (images_val && images_val->is_array()) {
-                    for (const auto& item : images_val->as_array()) {
-                        if (item.is_object()) {
-                            std::string p_str = item["path"].as_string();
-                            if (!p_str.empty()) {
-                                std::filesystem::path p(p_str);
-                                if (!std::filesystem::exists(p, ec) && !config_.os_images_dir().empty()) {
-                                    p = config_.os_images_dir() / p;
-                                }
-                                if (std::filesystem::exists(p, ec)) {
-                                    std::string ext = p.extension().string();
-                                    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                                    if (ext == ".vhd" || ext == ".vhdx") {
-                                        candidates.push_back(p);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Deduplicate candidate VHD paths
-    std::vector<std::filesystem::path> unique_vhds;
-    for (const auto& cand : candidates) {
-        bool already_seen = false;
-        for (const auto& u : unique_vhds) {
-            std::error_code eq_ec;
-            if (std::filesystem::equivalent(cand, u, eq_ec)) {
-                already_seen = true;
-                break;
-            }
-        }
-        if (!already_seen && std::filesystem::exists(cand, ec)) {
-            unique_vhds.push_back(cand);
-        }
-    }
-
-    // 4. Arm each VHD image
-    size_t armed_count = 0;
-    for (const auto& vhd_path : unique_vhds) {
-        auto arm_res = PnpDriverArmer::arm_vhd_image(vhd_path);
-        if (arm_res.is_ok()) {
-            ++armed_count;
-            Logger::default_logger().info(
-                "ARMER",
-                "Armed " + vhd_path.filename().string() + " (" +
-                    std::to_string(arm_res.value().armed_services.size()) +
-                    " native boot service(s) armed)");
-        } else {
-            Logger::default_logger().warn("ARMER", "Failed to auto-arm VHD " + vhd_path.string() + ": " + std::string(arm_res.error().message()));
-        }
-    }
-    if (armed_count > 0) {
-        Logger::default_logger().info("ARMER", "Completed auto-arming for " + std::to_string(armed_count) + " VHD image(s).");
-    }
+    return summary;
 }
 
 // ---------------------------------------------------------------------------
@@ -720,8 +894,18 @@ void AdminApp::warm_assigned_images() {
     if (!config_.storage_path().empty()) {
         search_dirs.push_back(config_.storage_path());
     }
-    search_dirs.emplace_back("./images");
-    search_dirs.emplace_back("./images/os");
+    if (storage_manager_ && storage_manager_->is_role_assigned(StorageRole::OsImages)) {
+        auto role_p = storage_manager_->get_role_path(StorageRole::OsImages);
+        if (!role_p.empty()) search_dirs.push_back(role_p);
+    }
+    // Also include the parent directories of any registered images in image_manager_ / registry_
+    if (registry_) {
+        for (const auto& img : registry_->get_all_images()) {
+            if (!img->path().empty()) {
+                search_dirs.push_back(img->path().parent_path());
+            }
+        }
+    }
 
     const AssignedImageReport report =
         collect_assigned_images(station_manager_->list_stations(), search_dirs);
@@ -774,12 +958,14 @@ void AdminApp::warm_assigned_images() {
             continue; // already reported and flagged; keep warming the rest
         }
 
+        const std::filesystem::path on_disk_resolved = resolve_on_disk(image);
+
         auto warm = image_manager_->acquire_image(image);
         if (!warm.is_ok()) {
             // The file is on disk but was never scanned into ImageManager (e.g. it
             // was dropped in after the last scan). Register it now so the station
             // can actually boot, rather than logging a dead end and moving on.
-            const std::filesystem::path on_disk = resolve_on_disk(image);
+            const std::filesystem::path on_disk = on_disk_resolved;
             if (!on_disk.empty()) {
                 auto import = image_manager_->import_image(
                     on_disk, ImageRole::OsImage, ImageId(on_disk.stem().string()),
@@ -826,10 +1012,14 @@ Result<void> AdminApp::start_server_services() {
         return dir_res;
     }
 
-    // Auto-arm offline SYSTEM hives for VHD images before opening iSCSI listener / target
-    if (config_.auto_arm_vhd_on_boot()) {
-        auto_arm_vhd_images();
-    }
+    // Server start-up is deliberately passive with respect to every master
+    // VHD. Nothing in this function -- or anywhere else below it in the
+    // listener/target bring-up -- arms, sanitises or otherwise mutates a
+    // SYSTEM hive: images are opened and served read-only. Arming happens
+    // only on an explicit command (cob_armer arm, this app's 1-Click button,
+    // its arm subcommand, or the WinPE staging callback), never as a side
+    // effect of coming up. The auto_arm_vhd_on_boot switch that used to sweep
+    // every configured image here is gone with the behaviour it enabled.
 
     if (!image_manager_) {
         image_manager_ = std::make_shared<ImageManager>(registry_);
@@ -845,11 +1035,13 @@ Result<void> AdminApp::start_server_services() {
         session_manager_->set_station_manager(station_manager_);
         session_manager_->set_super_client_identities(config_.super_client_identities());
         session_manager_->set_writeback_quota_bytes(config_.writeback_quota_mb() * 1024ull * 1024ull);
+    session_manager_->set_writeback_ram_bytes(config_.writeback_ram_mb() * 1024ull * 1024ull);
     } else {
         // Keep a recreated/updated configuration in sync with live sessions.
         session_manager_->set_station_manager(station_manager_);
         session_manager_->set_super_client_identities(config_.super_client_identities());
         session_manager_->set_writeback_quota_bytes(config_.writeback_quota_mb() * 1024ull * 1024ull);
+    session_manager_->set_writeback_ram_bytes(config_.writeback_ram_mb() * 1024ull * 1024ull);
     }
 
     active_core_ = std::make_unique<Core>(config_);
@@ -876,14 +1068,22 @@ Result<void> AdminApp::start_server_services() {
         }
     }
 
-    // Resolve effective server IP (prefer detected adapter over loopback/unspecified)
+    // Resolve effective server IP (prefer detected adapter over loopback/unspecified or stale mismatch)
     NetworkAddress effective_srv = config_.server_address();
     const bool needs_server_ip = effective_srv.is_loopback() ||
-                                 (effective_srv.octet(0) == 0 && effective_srv.octet(3) == 0);
-    if (needs_server_ip) {
-        NetworkAddress detected = host_net.usable()
-            ? host_net.ip
-            : NetworkAddress::detect_local_ip(67);
+                                 (effective_srv.octet(0) == 0 && effective_srv.octet(3) == 0) ||
+                                 (config_.network_auto_detect() && host_net.usable() &&
+                                  (config_.network_interface().empty() || config_.network_interface() == "default" ||
+                                   config_.network_interface() == host_net.interface_name));
+    if (needs_server_ip && host_net.usable()) {
+        effective_srv = NetworkAddress(host_net.ip.octet(0), host_net.ip.octet(1),
+                                       host_net.ip.octet(2), host_net.ip.octet(3),
+                                       effective_srv.port());
+    } else if (needs_server_ip && config_.network_auto_detect()) {
+        // NAT/sim contexts (e.g. QEMU user-net guests reaching us via the
+        // host loopback) explicitly configure 127.0.0.1 with auto-detect off;
+        // honour that instead of substituting the LAN adapter address.
+        NetworkAddress detected = NetworkAddress::detect_local_ip(67);
         if (!detected.is_loopback() && (detected.octet(0) != 0 || detected.octet(3) != 0)) {
             effective_srv = NetworkAddress(detected.octet(0), detected.octet(1),
                                            detected.octet(2), detected.octet(3),
@@ -891,10 +1091,10 @@ Result<void> AdminApp::start_server_services() {
         }
     }
 
-    // Determine active default OS image (resolved dynamically from config.json -
-    // never hardcode an image ID such as "w11")
-    std::string active_default_img;
-    if (image_manager_) {
+    // Determine active default OS image (respect explicit config or user selection;
+    // do not force an arbitrary image as default on clean setups)
+    std::string active_default_img = config_.default_master_vhd();
+    if (active_default_img.empty() && image_manager_) {
         active_default_img = image_manager_->default_os_image_id();
     }
     if (active_default_img.empty() && client_manager_) {
@@ -903,16 +1103,10 @@ Result<void> AdminApp::start_server_services() {
             active_default_img = prof_img;
         }
     }
-    if (active_default_img.empty() && image_manager_) {
-        auto os_images = image_manager_->list_images(ImageRole::OsImage);
-        if (!os_images.empty()) {
-            active_default_img = os_images.front().id.value();
-        }
-    }
-    if (image_manager_) {
+    if (!active_default_img.empty() && image_manager_) {
         image_manager_->set_default_os_image_id(active_default_img, true);
     }
-    if (client_manager_) {
+    if (!active_default_img.empty() && client_manager_) {
         auto prof = client_manager_->default_profile();
         if (prof.os_image_id.empty() || prof.os_image_id == "default" || prof.os_image_id == "default_os") {
             prof.os_image_id = active_default_img;
@@ -996,10 +1190,20 @@ Result<void> AdminApp::start_server_services() {
         dhcp->set_station_manager(station_manager_);
     }
 
-    std::filesystem::path tftp_root = "tftp_boot";
-    if (!std::filesystem::exists(tftp_root)) {
-        tftp_root = config_.os_images_dir();
+    if (config_.dhcp_mode() == "standard" || config_.dhcp_mode() == "full") {
+        dhcp->set_mode(DhcpServerMode::Standard);
+        Logger::default_logger().info("DHCP", "Configured DHCP mode: Standard (full DHCP server, rogue probe disabled)");
+    } else if (config_.dhcp_mode() == "proxy" || config_.dhcp_mode() == "proxydhcp") {
+        dhcp->set_mode(DhcpServerMode::ProxyDhcp);
+        Logger::default_logger().info("DHCP", "Configured DHCP mode: ProxyDHCP");
     }
+
+    std::filesystem::path tftp_root = Configuration::resolve_tftp_boot_directory(config_.tftp_boot_dir());
+    std::error_code ec_tftp;
+    if (!std::filesystem::exists(tftp_root, ec_tftp)) {
+        std::filesystem::create_directories(tftp_root, ec_tftp);
+    }
+    Logger::default_logger().info("TFTP", "TFTP root directory initialized at: " + tftp_root.string());
     auto tftp = std::make_shared<TftpServer>(
         effective_srv,
         tftp_root,
@@ -1007,6 +1211,8 @@ Result<void> AdminApp::start_server_services() {
     );
     tftp->set_client_manager(client_manager_);
     tftp->set_image_manager(image_manager_);
+    tftp->set_session_manager(session_manager_);
+    tftp->set_dhcp_server(dhcp);
 
     IscsiTargetConfig iscsi_cfg;
     iscsi_cfg.listen_address = NetworkAddress(0, 0, 0, 0, 3260);
@@ -1054,6 +1260,7 @@ Result<void> AdminApp::start_server_services() {
     // WinPE staging state machine: /api/boot-script routes UNPROFILED/STAGING
     // clients into the in-RAM image and /api/client/staged arms the hive.
     http->set_client_manager(client_manager_);
+    http->set_session_manager(session_manager_);
     // Static /static/* asset root. build_winpe.ps1 publishes wimboot, bootmgr,
     // bcd, boot.sdi and boot.wim into <assets>/wim, which is what the wimboot
     // script fetched from /api/boot-script points at.
@@ -1072,9 +1279,23 @@ Result<void> AdminApp::start_server_services() {
         if (!config_.storage_path().empty()) {
             image_dirs.push_back(config_.storage_path());
         }
-        image_dirs.emplace_back("./images");
-        image_dirs.emplace_back("./images/os");
         http->set_image_search_dirs(std::move(image_dirs));
+
+        // config.json already binds every image id to its file
+        // (`{"id":"csmw10","path":"./images/csmw10.VHD"}`), and the station
+        // registry stores the *id*. Without this mapping the guard probes
+        // a name that carries no extension, resolves nothing, and stays
+        // open -- which is how a UEFI client was once served a
+        // Legacy-BIOS sanboot and died in iPXE's EFI block driver.
+        if (image_manager_) {
+            std::vector<std::pair<std::string, std::filesystem::path>> aliases;
+            for (const auto& info : image_manager_->list_all_images()) {
+                if (!info.id.empty() && !info.file_path.empty()) {
+                    aliases.emplace_back(info.id.value(), info.file_path);
+                }
+            }
+            http->set_image_path_aliases(std::move(aliases));
+        }
     }
 
     // Stage-2 iPXE bootfile now points at the per-MAC dynamic script so
@@ -1228,24 +1449,35 @@ int AdminApp::cli_start_server(bool run_in_background) {
     std::cout << "---------------------------------------------------------\n";
 
     if (!run_in_background) {
-        std::cout << "Server running in foreground. Press Enter or Ctrl+C to stop...\n";
-        std::thread input_thread([]() {
-            std::string dummy;
-            std::getline(std::cin, dummy);
-            g_cli_stop_requested.store(true);
-        });
-        input_thread.detach();
+        std::cout << "Server running in foreground. Press Ctrl+C to stop...\n";
+        // Only read from stdin if it's connected to a genuine console/terminal
+#if defined(_WIN32)
+        DWORD mode = 0;
+        bool is_interactive_console = (GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0);
+#else
+        bool is_interactive_console = isatty(fileno(stdin));
+#endif
+        if (is_interactive_console) {
+            std::thread input_thread([]() {
+                std::string dummy;
+                if (std::getline(std::cin, dummy)) {
+                    g_cli_stop_requested.store(true);
+                }
+            });
+            input_thread.detach();
+        }
 
         while (!g_cli_stop_requested.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     } else {
-        std::cout << "Server running in daemon mode. Waiting for shutdown signal...\n";
+        std::cout << "Server running in daemon mode. Waiting for shutdown signal (Ctrl+C)...\n";
         while (!g_cli_stop_requested.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
 
+    Logger::default_logger().info("CORE", "[CORE] g_cli_stop_requested triggered, shutting down diskless services...");
     std::cout << "\nShutting down diskless services...\n";
     stop_server_services();
     std::cout << "CobDiskless Server safely stopped.\n";
@@ -1320,9 +1552,10 @@ static LRESULT CALLBACK ClientPropsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             HWND hCmbImg = CreateWindowExW(0, WC_COMBOBOXW, L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                 150, y, 250, 200, hwnd, reinterpret_cast<HMENU>(3006), NULL, NULL);
-            auto all_images = ctx->app->registry()->get_all_images();
+            SendMessageW(hCmbImg, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"(None - Unassigned)"));
             int sel_idx = 0;
-            int cur_idx = 0;
+            int cur_idx = 1;
+            auto all_images = ctx->app->registry()->get_all_images();
             for (const auto& img : all_images) {
                 std::wstring img_id_w = to_wstr(img->id().value());
                 SendMessageW(hCmbImg, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(img_id_w.c_str()));
@@ -1331,11 +1564,27 @@ static LRESULT CALLBACK ClientPropsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 }
                 cur_idx++;
             }
-            if (all_images.empty()) {
-                std::wstring def_w = ctx->record.os_image_id.empty() ? L"default" : to_wstr(ctx->record.os_image_id);
-                SendMessageW(hCmbImg, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(def_w.c_str()));
-            }
             SendMessageW(hCmbImg, CB_SETCURSEL, sel_idx, 0);
+
+            y += 35;
+            CreateWindowExW(0, L"STATIC", L"Boot Mode:", WS_CHILD | WS_VISIBLE, 20, y, 120, 20, hwnd, NULL, NULL, NULL);
+            HWND hCmbBootMode = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                150, y, 250, 120, hwnd, reinterpret_cast<HMENU>(3014), NULL, NULL);
+            SendMessageW(hCmbBootMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto (DHCP Option 93)"));
+            SendMessageW(hCmbBootMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"UEFI"));
+            SendMessageW(hCmbBootMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"CSM / BIOS"));
+
+            std::string cur_bm = "auto";
+            if (ctx->app->station_manager()) {
+                if (auto st = ctx->app->station_manager()->find_by_mac(ctx->record.mac_address); st.has_value()) {
+                    cur_bm = st->boot_mode;
+                }
+            }
+            int bm_sel = 0;
+            if (cur_bm == "uefi") bm_sel = 1;
+            else if (cur_bm == "bios") bm_sel = 2;
+            SendMessageW(hCmbBootMode, CB_SETCURSEL, bm_sel, 0);
 
             y += 35;
             HWND hSuperChk = CreateWindowExW(0, L"BUTTON", L"Super Client (Image Update Mode)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 150, y, 280, 24, hwnd, reinterpret_cast<HMENU>(3012), NULL, NULL);
@@ -1406,11 +1655,15 @@ static LRESULT CALLBACK ClientPropsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 ctx->record.group = to_utf8(buf);
 
                 int sel_img = static_cast<int>(SendMessageW(GetDlgItem(hwnd, 3006), CB_GETCURSEL, 0, 0));
-                if (sel_img >= 0) {
+                std::string chosen_img = "";
+                if (sel_img > 0) {
                     wchar_t img_buf[256] = {0};
                     SendMessageW(GetDlgItem(hwnd, 3006), CB_GETLBTEXT, sel_img, reinterpret_cast<LPARAM>(img_buf));
-                    ctx->record.os_image_id = to_utf8(img_buf);
+                    chosen_img = to_utf8(img_buf);
                 }
+
+                int sel_bm = static_cast<int>(SendMessageW(GetDlgItem(hwnd, 3014), CB_GETCURSEL, 0, 0));
+                std::string chosen_bm = (sel_bm == 1) ? "uefi" : (sel_bm == 2) ? "bios" : "auto";
 
                 ctx->record.is_super_client = (SendMessageW(GetDlgItem(hwnd, 3012), BM_GETCHECK, 0, 0) == BST_CHECKED);
 
@@ -1446,6 +1699,38 @@ static LRESULT CALLBACK ClientPropsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
 
                 ctx->record.enable_write_cache = (SendMessageW(GetDlgItem(hwnd, 3011), BM_GETCHECK, 0, 0) == BST_CHECKED);
 
+                // Ensure station exists in StationManager so PUT /api/v1/station can validate and update
+                if (ctx->app->station_manager() && !ctx->app->station_manager()->find_by_mac(ctx->record.mac_address).has_value()) {
+                    StationEntry new_se;
+                    new_se.mac = ctx->record.mac_address;
+                    new_se.name = ctx->record.pc_name;
+                    new_se.ip = ctx->record.ip_address;
+                    new_se.boot_mode = chosen_bm;
+                    new_se.status = ctx->record.enabled ? "active" : "disabled";
+                    (void)ctx->app->station_manager()->add_or_update_station(new_se);
+                }
+
+                // Execute PUT /api/v1/station for firmware/partition validation and persistence
+                JsonValue put_body = JsonValue::make_object();
+                put_body["name"] = ctx->record.pc_name;
+                put_body["image"] = chosen_img;
+                put_body["boot_mode"] = chosen_bm;
+
+                HttpResponse resp = ctx->app->update_station_via_api(ctx->record.mac_address, put_body.dump(0));
+                if (resp.status >= 400) {
+                    std::string err_msg;
+                    if (auto pj = JsonValue::parse(resp.body)) {
+                        if (const auto* m = pj->find("message")) err_msg = m->as_string();
+                        else if (const auto* w = pj->find("warning")) err_msg = w->as_string();
+                        else if (const auto* e = pj->find("error")) err_msg = e->as_string();
+                    }
+                    if (err_msg.empty()) err_msg = resp.body;
+                    MessageBoxW(hwnd, to_wstr(err_msg).c_str(), L"Firmware Validation Error", MB_OK | MB_ICONERROR);
+                    // DO NOT update ctx->record.os_image_id or table row!
+                    return 0; // Dialog stays open so operator can fix boot_mode or image
+                }
+
+                ctx->record.os_image_id = chosen_img;
                 auto res = ctx->app->client_manager()->add_or_update_client(ctx->record);
                 if (!res.is_ok()) {
                     std::wstring err = to_wstr(std::string(res.error().message()));
@@ -1453,7 +1738,27 @@ static LRESULT CALLBACK ClientPropsWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                     return 0;
                 }
 
+                if (ctx->app->client_database()) {
+                    (void)ctx->app->client_database()->enroll_client(ctx->record.mac_address, ctx->record.pc_name, chosen_img);
+                    (void)ctx->app->client_database()->save();
+                }
+                if (ctx->app->station_manager()) {
+                    StationEntry se;
+                    if (auto existing_st = ctx->app->station_manager()->find_by_mac(ctx->record.mac_address); existing_st.has_value()) {
+                        se = *existing_st;
+                    }
+                    se.mac = ctx->record.mac_address;
+                    se.name = ctx->record.pc_name;
+                    se.image = chosen_img;
+                    se.boot_mode = chosen_bm;
+                    se.ip = ctx->record.ip_address;
+                    se.status = ctx->record.enabled ? "active" : "disabled";
+                    (void)ctx->app->station_manager()->add_or_update_station(se);
+                    (void)ctx->app->station_manager()->save();
+                }
+
                 ctx->app->auto_save();
+                ctx->app->notify_clients_changed();
                 ctx->saved = true;
                 DestroyWindow(hwnd);
                 return 0;
@@ -1499,7 +1804,7 @@ static void ShowClientPropertiesDialog(HWND hParent, AdminApp* app, const Client
         WS_EX_DLGMODALFRAME, L"CobDisklessClientPropsClass",
         title.c_str(),
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 480, 590,
+        CW_USEDEFAULT, CW_USEDEFAULT, 480, 630,
         hParent, NULL, hInstance, &ctx
     );
 
@@ -1723,6 +2028,30 @@ struct GuiHandles {
 
 static void PopulateClientsTab(GuiHandles& g, AdminApp* app) {
     ListView_DeleteAllItems(g.hClientsList);
+
+    // Sync any auto-registered or externally loaded stations into client_manager
+    if (app->station_manager() && app->client_manager()) {
+        for (const auto& st : app->station_manager()->list_stations()) {
+            auto rec = app->client_manager()->get_client_by_mac(st.mac);
+            if (!rec.has_value()) {
+                ClientRecord cr;
+                cr.mac_address = st.mac;
+                cr.pc_name = st.name;
+                cr.ip_address = st.ip;
+                cr.os_image_id = st.image;
+                cr.enabled = (st.status != "disabled");
+                cr.group = "Default";
+                (void)app->client_manager()->add_or_update_client(cr);
+            } else if (rec->pc_name != st.name || rec->os_image_id != st.image || rec->ip_address != st.ip) {
+                ClientRecord cr = *rec;
+                cr.pc_name = st.name;
+                cr.os_image_id = st.image;
+                cr.ip_address = st.ip;
+                (void)app->client_manager()->add_or_update_client(cr);
+            }
+        }
+    }
+
     auto clients = app->client_manager()->list_clients();
     int row = 0;
     for (const auto& c : clients) {
@@ -1730,13 +2059,21 @@ static void PopulateClientsTab(GuiHandles& g, AdminApp* app) {
         std::wstring last_seen_str = (c.last_seen_epoch == 0) ? L"Never" : L"Active";
         std::wstring cache_str = std::to_wstring(c.ram_cache_mb) + L" MB";
         std::wstring wb_str = c.writeback_dir.empty() ? L"(Default)" : to_wstr(c.writeback_dir.string());
-        std::wstring img_str = c.os_image_id.empty() ? L"(Default)" : to_wstr(c.os_image_id);
+        std::string effective_name = c.pc_name;
+        std::string effective_img = c.os_image_id;
+        if (app->station_manager()) {
+            if (auto st = app->station_manager()->find_by_mac(c.mac_address); st.has_value()) {
+                if (!st->name.empty()) effective_name = st->name;
+                effective_img = st->image;
+            }
+        }
+        std::wstring img_str = effective_img.empty() ? L"(None)" : to_wstr(effective_img);
         std::wstring game_str = c.game_dir.empty() ? L"(Default)" : to_wstr(c.game_dir.string());
         std::wstring super_str = c.is_super_client ? L"YES (Update)" : L"No";
 
         std::vector<std::wstring> cols = {
             status_str,
-            to_wstr(c.pc_name),
+            to_wstr(effective_name),
             to_wstr(c.ip_address.to_string()),
             to_wstr(c.mac_address),
             super_str,
@@ -2012,15 +2349,18 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             g.tab_controls[1].push_back(g.hImagesList);
 
             HWND hBtnImportImg = CreateWindowExW(0, L"BUTTON", L"Import Image File...", WS_CHILD | BS_PUSHBUTTON,
-                25, 315, 150, 30, hwnd, reinterpret_cast<HMENU>(2104), GetModuleHandleW(NULL), NULL);
-            HWND hBtnDeepInsp = CreateWindowExW(0, L"BUTTON", L"Deep Inspect Virtual Disk", WS_CHILD | BS_PUSHBUTTON,
-                185, 315, 180, 30, hwnd, reinterpret_cast<HMENU>(2101), GetModuleHandleW(NULL), NULL);
+                25, 315, 140, 30, hwnd, reinterpret_cast<HMENU>(2104), GetModuleHandleW(NULL), NULL);
+            HWND hBtnArmImg = CreateWindowExW(0, L"BUTTON", L"Arm Image & PnP (1-Click)", WS_CHILD | BS_PUSHBUTTON,
+                170, 315, 175, 30, hwnd, reinterpret_cast<HMENU>(2105), GetModuleHandleW(NULL), NULL);
+            HWND hBtnDeepInsp = CreateWindowExW(0, L"BUTTON", L"Deep Inspect Disk", WS_CHILD | BS_PUSHBUTTON,
+                350, 315, 140, 30, hwnd, reinterpret_cast<HMENU>(2101), GetModuleHandleW(NULL), NULL);
             HWND hBtnRescanImg = CreateWindowExW(0, L"BUTTON", L"Rescan Images Folder", WS_CHILD | BS_PUSHBUTTON,
-                375, 315, 160, 30, hwnd, reinterpret_cast<HMENU>(2102), GetModuleHandleW(NULL), NULL);
+                495, 315, 150, 30, hwnd, reinterpret_cast<HMENU>(2102), GetModuleHandleW(NULL), NULL);
             HWND hBtnSetDefImg = CreateWindowExW(0, L"BUTTON", L"Set As Default OS Image", WS_CHILD | BS_PUSHBUTTON,
-                545, 315, 180, 30, hwnd, reinterpret_cast<HMENU>(2103), GetModuleHandleW(NULL), NULL);
+                650, 315, 175, 30, hwnd, reinterpret_cast<HMENU>(2103), GetModuleHandleW(NULL), NULL);
 
             g.tab_controls[1].push_back(hBtnImportImg);
+            g.tab_controls[1].push_back(hBtnArmImg);
             g.tab_controls[1].push_back(hBtnDeepInsp);
             g.tab_controls[1].push_back(hBtnRescanImg);
             g.tab_controls[1].push_back(hBtnSetDefImg);
@@ -2251,6 +2591,31 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             // Initially show Tab 0
             SwitchTab(g, app, 0);
             AppendConsoleLog(g, L"[SYSTEM] CobDiskless Console initialized. Ready for operations.");
+            SetTimer(hwnd, 9999, 1500, NULL);
+            return 0;
+        }
+
+        case WM_TIMER: {
+            if (wParam == 9999) {
+                auto* app = reinterpret_cast<AdminApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+                if (app && g.hTab) {
+                    int cur_sel = TabCtrl_GetCurSel(g.hTab);
+                    if (cur_sel == 0 && g.hClientsList) {
+                        static uint32_t last_gen = 0;
+                        size_t total_count = app->client_manager() ? app->client_manager()->client_count() : 0;
+                        if (app->station_manager()) {
+                            total_count += app->station_manager()->station_count();
+                        }
+                        static size_t last_known_count = 0;
+                        uint32_t cur_gen = app->clients_generation();
+                        if (total_count != last_known_count || cur_gen != last_gen) {
+                            last_known_count = total_count;
+                            last_gen = cur_gen;
+                            PopulateClientsTab(g, app);
+                        }
+                    }
+                }
+            }
             return 0;
         }
 
@@ -2272,9 +2637,16 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (sel >= 0) {
                     wchar_t mac_buf[64];
                     GetListViewText(g.hClientsList, sel, 3, mac_buf, 64);
-                    auto rec = app->client_manager()->get_client_by_mac(to_utf8(mac_buf));
+                    std::string mac_str = to_utf8(mac_buf);
+                    auto rec = app->client_manager()->get_client_by_mac(mac_str);
                     if (rec) {
-                        ShowClientPropertiesDialog(hwnd, app, *rec, false, [hwnd, app]() {
+                        if (app->station_manager()) {
+                            if (auto st = app->station_manager()->find_by_mac(mac_str); st.has_value() && !st->name.empty()) {
+                                rec->pc_name = st->name;
+                            }
+                        }
+                        ShowClientPropertiesDialog(hwnd, app, *rec, false, [app]() {
+                            app->notify_clients_changed();
                             PopulateClientsTab(g, app);
                         });
                     }
@@ -2302,6 +2674,7 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 new_rec.game_dir = app->client_manager()->default_profile().games_dir;
 
                 ShowClientPropertiesDialog(hwnd, app, new_rec, true, [app]() {
+                    app->notify_clients_changed();
                     PopulateClientsTab(g, app);
                 });
             } else if (wmId == 2002) { // Edit Client
@@ -2312,9 +2685,16 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 }
                 wchar_t mac_buf[64];
                 GetListViewText(g.hClientsList, sel, 3, mac_buf, 64);
-                auto rec = app->client_manager()->get_client_by_mac(to_utf8(mac_buf));
+                std::string mac_str = to_utf8(mac_buf);
+                auto rec = app->client_manager()->get_client_by_mac(mac_str);
                 if (rec) {
+                    if (app->station_manager()) {
+                        if (auto st = app->station_manager()->find_by_mac(mac_str); st.has_value() && !st->name.empty()) {
+                            rec->pc_name = st->name;
+                        }
+                    }
                     ShowClientPropertiesDialog(hwnd, app, *rec, false, [app]() {
+                        app->notify_clients_changed();
                         PopulateClientsTab(g, app);
                     });
                 }
@@ -2326,10 +2706,28 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 }
                 wchar_t mac_buf[64];
                 GetListViewText(g.hClientsList, sel, 3, mac_buf, 64);
+                std::string target_mac = to_utf8(mac_buf);
                 if (MessageBoxW(hwnd, (L"Are you sure you want to delete client with MAC: " + std::wstring(mac_buf) + L"?").c_str(),
                                 L"Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                    (void)app->client_manager()->remove_client(to_utf8(mac_buf));
+                    if (app->client_manager()) {
+                        (void)app->client_manager()->remove_client(target_mac);
+                    }
+                    if (app->station_manager()) {
+                        (void)app->station_manager()->remove_station(target_mac);
+                        (void)app->station_manager()->save();
+                    }
+                    if (app->client_database()) {
+                        (void)app->client_database()->remove_client(target_mac);
+                        (void)app->client_database()->save();
+                    }
+                    if (app->session_manager()) {
+                        (void)app->session_manager()->terminate_session(ClientId(target_mac));
+                    }
+                    if (app->dhcp_server()) {
+                        (void)app->dhcp_server()->release_lease(target_mac);
+                    }
                     app->auto_save();
+                    app->notify_clients_changed();
                     PopulateClientsTab(g, app);
                     MessageBoxW(hwnd, L"Client removed.", L"CobDiskless", MB_OK | MB_ICONINFORMATION);
                 }
@@ -2454,11 +2852,9 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     return 0;
                 }
 
-                auto arm_res = PnpDriverArmer::ensure_image_armed(img->path());
-                std::string pnp_info = arm_res.is_ok() ? ("\r\n\r\n" + arm_res.value().summary()) : "";
-                std::wstring rep_text = to_wstr(rep_res.value().detailed_inspection_summary() + pnp_info);
+                std::wstring rep_text = to_wstr(rep_res.value().detailed_inspection_summary());
                 SetWindowTextW(g.hImageDetailEdit, rep_text.c_str());
-                AppendConsoleLog(g, L"[INSPECT] Deep inspection and PNP driver check completed for image " + std::wstring(id_buf));
+                AppendConsoleLog(g, L"[INSPECT] Deep inspection completed for image " + std::wstring(id_buf));
             } else if (wmId == 2102) { // Rescan Images
                 auto img_mgr = app->image_manager();
                 if (!img_mgr) {
@@ -2481,12 +2877,25 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 GetListViewText(g.hImagesList, sel, 0, id_buf, 128);
                 std::string sel_img_id = to_utf8(id_buf);
 
+                std::string old_default;
                 auto img_mgr = app->image_manager();
                 if (img_mgr) {
+                    old_default = img_mgr->default_os_image_id();
                     img_mgr->set_default_os_image_id(sel_img_id, /*persist=*/true);
                     (void)img_mgr->save_images_to_config(app->images_config_path());
                 }
 
+                // 1. Update app configuration & save to cobdiskless.conf
+                app->mutable_config().set_default_master_vhd(sel_img_id);
+                (void)app->mutable_config().save_to_file("cobdiskless.conf");
+
+                // 2. Update station_manager default image & cascade to existing stations
+                if (app->station_manager()) {
+                    app->station_manager()->set_default_image(sel_img_id);
+                    (void)app->station_manager()->update_default_image_for_stations(old_default, sel_img_id);
+                }
+
+                // 3. Update client_manager profile & clients
                 auto prof = app->client_manager()->default_profile();
                 prof.os_image_id = sel_img_id;
                 prof.default_os_image_id = sel_img_id;
@@ -2499,6 +2908,7 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
                 app->auto_save();
                 PopulateImagesTab(g, app);
+                PopulateClientsTab(g, app);
                 AppendConsoleLog(g, L"[IMAGE] Active default OS image updated to: " + std::wstring(id_buf));
                 MessageBoxW(hwnd, (L"Default OS image set to: " + std::wstring(id_buf)).c_str(), L"CobDiskless", MB_OK | MB_ICONINFORMATION);
             } else if (wmId == 2104) { // Import Image File
@@ -2545,6 +2955,62 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         MessageBoxW(hwnd, (L"Failed to import image:\n" + err).c_str(), L"Import Error", MB_OK | MB_ICONERROR);
                     }
                 }
+            } else if (wmId == 2105) { // One-Click Arm Image & PnP
+                int sel = ListView_GetNextItem(g.hImagesList, -1, LVNI_SELECTED);
+                if (sel < 0) {
+                    MessageBoxW(hwnd, L"Please select a golden image from the list to arm and sanitize.", L"CobDiskless Armer", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                wchar_t id_buf[128];
+                GetListViewText(g.hImagesList, sel, 0, id_buf, 128);
+                auto img = app->registry()->find_image(ImageId(to_utf8(id_buf)));
+                if (!img) {
+                    MessageBoxW(hwnd, L"Image not found in registry.", L"Error", MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+
+                std::wstring confirm_msg = L"Execute 1-Click Offline PnP Arming & Driver Sanitization on image:\r\n" +
+                    img->path().wstring() + L"?\r\n\r\n"
+                    L"Actions applied:\r\n"
+                    L"1. Inject BOOT_START (0) & BootFlags=0x1 into network drivers & iSCSI stack\r\n"
+                    L"2. Strip WFP Lightweight Filter (ms_wfplwf) to prevent NIC freeze\r\n"
+                    L"3. Remove PagingFiles (prevents smss.exe pagefile deadlock on SAN volumes)\r\n"
+                    L"4. Remove stale MountedDevices \\DosDevices\\C: (preserves volume GUIDs)\r\n"
+                    L"5. Decompress CompactOS / WOF binaries on boot path (bootres.dll, etc.)\r\n"
+                    L"6. Inject CriticalDeviceDatabase bindings for Realtek/Intel cafe NICs\r\n"
+                    L"7. Guarantee Read-Only filesystem protection on finish";
+                if (MessageBoxW(hwnd, confirm_msg.c_str(), L"Confirm 1-Click Arm Image & PnP", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    AppendConsoleLog(g, L"[ARMER] Starting 1-Click PnP Arming for: " + img->path().wstring());
+                    HCURSOR hOldCursor = SetCursor(LoadCursor(NULL, IDC_WAIT));
+
+                    // Temporarily release backend handle in image_manager so VirtDisk has exclusive access
+                    auto img_id = img->id();
+                    auto img_path = img->path();
+                    if (app->image_manager()) {
+                        (void)app->image_manager()->release_image(img_id);
+                    }
+
+                    auto arm_res = RegBootStart::arm_image_offline_pipeline(img_path);
+
+                    if (app->image_manager()) {
+                        (void)app->image_manager()->reload_image(img_id);
+                    }
+
+                    SetCursor(hOldCursor);
+
+                    if (arm_res.is_ok()) {
+                        const auto& rep = arm_res.value();
+                        std::wstring sum = to_wstr(rep.summary());
+                        SetWindowTextW(g.hImageDetailEdit, sum.c_str());
+                        AppendConsoleLog(g, L"[SUCCESS] [ARMER] Image successfully armed and sanitized: " + img->path().wstring());
+                        MessageBoxW(hwnd, (L"Image successfully armed and sanitized!\r\n\r\n" + to_wstr(rep.message)).c_str(),
+                                    L"1-Click Arming Complete", MB_OK | MB_ICONINFORMATION);
+                    } else {
+                        std::wstring err = to_wstr(std::string(arm_res.error().message()));
+                        AppendConsoleLog(g, L"[ERROR] [ARMER] Arming failed: " + err);
+                        MessageBoxW(hwnd, (L"Image arming failed:\r\n" + err).c_str(), L"Arming Error", MB_OK | MB_ICONERROR);
+                    }
+                }
             }
 
             // --- TAB 2: STORAGE ACTIONS ---
@@ -2566,6 +3032,22 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
                 (void)app->storage_manager()->set_drive_role(drv_path, role);
                 (void)app->storage_manager()->save_to_file(app->storage_config_path());
+
+                if (role == StorageRole::OsImages) {
+                    if (app->image_manager()) {
+                        app->image_manager()->set_os_images_dir(drv_path);
+                        (void)app->image_manager()->scan_directories();
+                        (void)app->image_manager()->save_images_to_config(app->images_config_path());
+                    }
+                    PopulateImagesTab(g, app);
+                } else if (!app->storage_manager()->is_role_assigned(StorageRole::OsImages)) {
+                    if (app->image_manager()) {
+                        app->image_manager()->clear_role_images(ImageRole::OsImage);
+                        (void)app->image_manager()->save_images_to_config(app->images_config_path());
+                    }
+                    PopulateImagesTab(g, app);
+                }
+
                 PopulateStorageTab(g, app);
                 SetWindowTextW(g.hStorageStatusLabel, (L"Assigned role '" + to_wstr(std::string(to_string(role))) + L"' to drive " + std::wstring(drv_buf)).c_str());
             } else if (wmId == 2204) { // Configure Attached Cache
@@ -2739,6 +3221,7 @@ static LRESULT CALLBACK AdminWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         case WM_DESTROY: {
+            KillTimer(hwnd, 9999);
             auto* app = reinterpret_cast<AdminApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
             if (app) {
                 app->auto_save();
@@ -2796,7 +3279,31 @@ int AdminApp::run_gui() {
 #endif
 }
 
-int AdminApp::run(int argc, char* argv[]) {
+int AdminApp::run(int argc_in, char* argv_in[]) {
+    // --enable-trace-io is a modifier, not a subcommand. It is recognised
+    // anywhere in argv and stripped before dispatch so every command below
+    // -- and the whole server stack it starts -- sees per-sector, per-packet
+    // and DHCP wire-inspect output promoted from TRACE to visible.
+    bool trace_io = false;
+    std::vector<char*> args;
+    args.reserve(static_cast<size_t>(argc_in));
+    for (int i = 0; i < argc_in; ++i) {
+        if (std::string(argv_in[i]) == "--enable-trace-io") {
+            trace_io = true;
+            continue;
+        }
+        args.push_back(argv_in[i]);
+    }
+    const int argc = static_cast<int>(args.size());
+    char** argv = args.data();
+
+    if (trace_io) {
+        Logger::default_logger().set_min_level(LogLevel::Trace);
+        Logger::default_logger().info("CORE",
+            "--enable-trace-io active: per-sector / per-packet / wire-inspect "
+            "logging is now visible at TRACE.");
+    }
+
     if (argc <= 1) {
         // Default execution on double-click: Launch native Windows GUI
 #if defined(_WIN32)
@@ -2820,6 +3327,64 @@ int AdminApp::run(int argc, char* argv[]) {
             return 1;
         }
         return cli_inspect_image(argv[2]);
+    } else if (arg1 == "--arm-image" || arg1 == "--arm" || arg1 == "arm") {
+        if (argc < 3) {
+            std::cerr << "Usage: cobdiskless_app arm <path_to_vhd_or_hive> [ven_hex] [dev_hex] [subsys_hex] [rev_hex]\n";
+            std::cerr << "  subsys_hex: SUBSYS_<subdev><subven> (8 hex, PCI config 0x2E/0x2C)\n";
+            std::cerr << "  rev_hex:    revision ID (2 hex, PCI config 0x08)\n";
+            return 1;
+        }
+        uint16_t ven = 0;
+        uint16_t dev = 0;
+        std::string subsys, rev;
+        if (argc >= 5) {
+            try {
+                ven = static_cast<uint16_t>(std::stoul(argv[3], nullptr, 16));
+                dev = static_cast<uint16_t>(std::stoul(argv[4], nullptr, 16));
+            } catch (...) {}
+        }
+        if (argc >= 6) subsys = argv[5];
+        if (argc >= 7) rev = argv[6];
+        return cli_arm_image(argv[2], ven, dev, subsys, rev);
+    } else if (arg1 == "superclient" || arg1 == "--superclient") {
+        bool enable = true;
+        bool have_mode = false;
+        std::string target;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--mac" || a == "--station") && i + 1 < argc) {
+                target = argv[++i];
+            } else if (a == "enable") {
+                enable = true;
+                have_mode = true;
+            } else if (a == "disable") {
+                enable = false;
+                have_mode = true;
+            }
+        }
+        if (!have_mode || target.empty()) {
+            std::cerr << "Usage: cobdiskless_app superclient <enable|disable> --mac <mac>\n"
+                      << "       cobdiskless_app superclient <enable|disable> --station <name>\n";
+            return 1;
+        }
+        return cli_superclient(enable, target);
+    } else if (arg1 == "commit" || arg1 == "--commit") {
+        std::string target;
+        bool backup = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--mac" || a == "--station") && i + 1 < argc) {
+                target = argv[++i];
+            } else if (a == "--backup") {
+                backup = true;
+            }
+        }
+        if (target.empty()) {
+            std::cerr << "Usage: cobdiskless_app commit --mac <mac> [--backup]\n"
+                      << "       cobdiskless_app commit --station <name> [--backup]\n";
+            return 1;
+        }
+        return cli_commit(target, backup);
     } else if (arg1 == "--list-images") {
         return cli_list_images();
     } else if (arg1 == "--add-image") {
@@ -2846,11 +3411,15 @@ int AdminApp::run(int argc, char* argv[]) {
                   << "  --start-daemon            Launch diskless server stack in non-blocking mode\n"
                   << "  --test-storage [dir]      Run performance and health benchmark\n"
                   << "  --inspect <image_path>    Inspect disk image headers & partitions\n"
+                  << "  --arm-image <path_to_vhd> Arm offline VHD image with boot-critical NIC drivers & CDDB\n"
                   << "  --add-image <file> <id>   Register a golden image in the catalog\n"
                   << "  --list-images             List registered golden images\n"
                   << "  --list-clients            List registered diskless clients\n"
                   << "  --list-drives             List physical drives and assigned roles\n"
-                  << "  --gui                     Launch Windows management GUI window\n";
+                  << "  --gui                     Launch Windows management GUI window\n"
+                  << "  --enable-trace-io         Modifier: also print per-sector / per-packet / wire-inspect TRACE\n"
+                  << "                            output (may be combined with any option above, e.g.\n"
+                  << "                            cobdiskless --enable-trace-io --start)\n";
         return 0;
     }
 

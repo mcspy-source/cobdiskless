@@ -2,23 +2,13 @@
   "images": [
     {
       "id": "csmw10",
-      "path": "G:/csmw10.VHD",
+      "path": "G:\\csmw10.VHD",
       "role": "OsImage",
       "format": "VHD (Dynamic)",
       "virtual_size_bytes": 500107862016,
-      "file_size_bytes": 4353609216,
+      "file_size_bytes": 4332632576,
       "boot_mode": "Legacy BIOS",
       "partition_scheme": "MBR"
-    },
-    {
-      "id": "w11eufi",
-      "path": "G:/w11eufi.VHD",
-      "role": "OsImage",
-      "format": "VHD (Dynamic)",
-      "virtual_size_bytes": 500107862016,
-      "file_size_bytes": 6121939968,
-      "boot_mode": "BIOS + UEFI (Dual)",
-      "partition_scheme": "GPT"
     }
   ],
   "default_os_image": "csmw10"

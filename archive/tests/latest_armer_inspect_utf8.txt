@@ -1,0 +1,335 @@
+﻿C:\Users\Admin\Desktop\cobdiskless\build\cob-armer.exe : [INFO] Inspecting offline image: G:/csmw10.VHD
+At line:1 char:1
++ C:\Users\Admin\Desktop\cobdiskless\build\cob-armer.exe --inspect G:/c ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([INFO] Inspecti...: G:/csmw10.VHD:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[INFO] === CobDiskless Offline SYSTEM Hive Inspection ===
+Hive:        \\?\Volume{3e128489-0000-0000-0000-602200000000}\Windows\System32\config\SYSTEM
+Volume:      <not provided -- hash/version checks skipped>
+ControlSet:  ControlSet001
+Guest OS:    unknown
+Status:      OK
+Message:     Inspected ControlSet001: 14 service(s), 1 net class binding(s), 0 driver binary check(s)
+
+-- NIC / boot driver services (14) --
+  Services\msiscsi: Start=-1 (<absent or unknown>), BootFlags=ABSENT, Parameters=(2 value(s), 0 subkey(s)) 
+[LinkDownTime, MaxRequestHoldTime]
+  Services\Tcpip: Start=0 (SERVICE_BOOT_START), Group=PNP_TDI, BootFlags=1, Parameters=(12 value(s), 6 subkey(s)) 
+[DataBasePath, Domain, ForwardBroadcasts, ICSDomain, IPEnableRouter, NameServer, SyncDomainWithMembership, NV 
+Hostname, DhcpNameServer, Hostname, DisableTaskOffload, TcpMaxDataRetransmissions]
+  Services\ndis: Start=0 (SERVICE_BOOT_START), Group=NDIS Wrapper, BootFlags=ABSENT, Parameters=(8 value(s), 0 
+subkey(s)) [MaxCachedNblContextSize, PortAuthReceiveAuthorizationState, PortAuthReceiveControlState, 
+PortAuthSendAuthorizationState, PortAuthSendControlState, ReceiveWorkerDisableAutoStart, TrackNblOwner, 
+DefaultPnPCapabilities]
+  Services\iscsiprt: Start=0 (SERVICE_BOOT_START), Group=CCiSCSI, BootFlags=1, Parameters=(4 value(s), 0 subkey(s)) 
+[BusType, DelayForNetworkAtBoot, LinkDownTime, MaxRequestHoldTime]
+  Services\mlx4_bus: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=1, Parameters=(3 value(s), 1 subkey(s)) 
+[DeviceManagedSteering, NumOfDevices, LoadedDevices]
+  Services\NativeWifiP: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT
+  Services\NdisTapi: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT
+  Services\Ndisuio: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT
+  Services\ndiswanlegacy: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT
+  Services\rt640x64: Start=0 (SERVICE_BOOT_START), Group=NDIS, BootFlags=1, Parameters=(18 value(s), 1 subkey(s)) 
+[DrvOption, DrvMode, DmaRemappingCompatible, WppRecorder_TraceGuid, WaitAutoNegComplete, *EEE, AutoPowerSave, 
+GigaLite, *FlowControl, Diskless, DisklessOption, PowerSavingMode, EnableGreenEthernet, AutoDisableGigabit, 
+PowerDownPll, S5NicKeepOverrideMacAddr, S5NicKeepOverrideMacAddrV2, *SpeedDuplex]
+  Services\tunnel: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT
+  Services\vwififlt: Start=1 (SERVICE_SYSTEM_START), Group=NDIS, BootFlags=ABSENT, Parameters=(1 value(s), 0 
+subkey(s)) [DefaultFilterSettings]
+  Services\wanarp: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT
+  Services\wanarpv6: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT
+
+-- Net class bindings (Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}) --
+  0000: DriverDesc='Realtek PCIe GbE Family Controller', MatchingDeviceId='PCI\VEN_10EC&DEV_8168&REV_06', 
+ComponentId='PCI\VEN_10EC&DEV_8168&REV_06'
+
+-- Driver binary identity (0) --
+  (no volume provided -- skipped)
+
+-- Findings (15) --
+  * Services\msiscsi: Start=-1 (<absent or unknown>), Parameters present (LinkDownTime, MaxRequestHoldTime)
+  * Services\Tcpip: Start=0 (SERVICE_BOOT_START), Group=PNP_TDI, BootFlags=1, Parameters present (DataBasePath, 
+Domain, ForwardBroadcasts, ICSDomain, IPEnableRouter, NameServer, SyncDomainWithMembership, NV Hostname, 
+DhcpNameServer, Hostname, DisableTaskOffload, TcpMaxDataRetransmissions)
+  * Services\ndis: Start=0 (SERVICE_BOOT_START), Group=NDIS Wrapper, Parameters present (MaxCachedNblContextSize, 
+PortAuthReceiveAuthorizationState, PortAuthReceiveControlState, PortAuthSendAuthorizationState, 
+PortAuthSendControlState, ReceiveWorkerDisableAutoStart, TrackNblOwner, DefaultPnPCapabilities)
+  * Services\iscsiprt: Start=0 (SERVICE_BOOT_START), Group=CCiSCSI, BootFlags=1, Parameters present (BusType, 
+DelayForNetworkAtBoot, LinkDownTime, MaxRequestHoldTime)
+  * Services\mlx4_bus: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=1, Parameters present 
+(DeviceManagedSteering, NumOfDevices, LoadedDevices)
+  * Services\NativeWifiP: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent
+  * Services\NdisTapi: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent
+  * Services\Ndisuio: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent
+  * Services\ndiswanlegacy: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent
+  * Services\rt640x64: Start=0 (SERVICE_BOOT_START), Group=NDIS, BootFlags=1, Parameters present (DrvOption, DrvMode, 
+DmaRemappingCompatible, WppRecorder_TraceGuid, WaitAutoNegComplete, *EEE, AutoPowerSave, GigaLite, *FlowControl, 
+Diskless, DisklessOption, PowerSavingMode, EnableGreenEthernet, AutoDisableGigabit, PowerDownPll, 
+S5NicKeepOverrideMacAddr, S5NicKeepOverrideMacAddrV2, *SpeedDuplex)
+  * Services\tunnel: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent
+  * Services\vwififlt: Start=1 (SERVICE_SYSTEM_START), Group=NDIS, Parameters present (DefaultFilterSettings)
+  * Services\wanarp: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent
+  * Services\wanarpv6: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent
+  * Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000: DriverDesc='Realtek PCIe GbE Family Controller', 
+MatchingDeviceId='PCI\VEN_10EC&DEV_8168&REV_06', ComponentId='PCI\VEN_10EC&DEV_8168&REV_06'
+
+{
+  "success": true,
+  "hive": "\\\\?\\Volume{3e128489-0000-0000-0000-602200000000}\\Windows\\System32\\config\\SYSTEM",
+  "volume": "",
+  "control_set": "ControlSet001",
+  "guest_os_family": "unknown",
+  "message": "Inspected ControlSet001: 14 service(s), 1 net class binding(s), 0 driver binary check(s)",
+  "services": [
+    {
+      "service": "msiscsi",
+      "present": true,
+      "start": -1,
+      "group": "",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": true,
+      "parameter_values": [
+        "LinkDownTime",
+        "MaxRequestHoldTime"
+      ],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "Tcpip",
+      "present": true,
+      "start": 0,
+      "group": "PNP_TDI",
+      "has_boot_flags": true,
+      "boot_flags": 1,
+      "has_parameters": true,
+      "parameter_values": [
+        "DataBasePath",
+        "Domain",
+        "ForwardBroadcasts",
+        "ICSDomain",
+        "IPEnableRouter",
+        "NameServer",
+        "SyncDomainWithMembership",
+        "NV Hostname",
+        "DhcpNameServer",
+        "Hostname",
+        "DisableTaskOffload",
+        "TcpMaxDataRetransmissions"
+      ],
+      "parameter_subkeys": [
+        "Adapters",
+        "DNSRegisteredAdapters",
+        "Interfaces",
+        "NsiObjectSecurity",
+        "PersistentRoutes",
+        "Winsock"
+      ]
+    },
+    {
+      "service": "ndis",
+      "present": true,
+      "start": 0,
+      "group": "NDIS Wrapper",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": true,
+      "parameter_values": [
+        "MaxCachedNblContextSize",
+        "PortAuthReceiveAuthorizationState",
+        "PortAuthReceiveControlState",
+        "PortAuthSendAuthorizationState",
+        "PortAuthSendControlState",
+        "ReceiveWorkerDisableAutoStart",
+        "TrackNblOwner",
+        "DefaultPnPCapabilities"
+      ],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "iscsiprt",
+      "present": true,
+      "start": 0,
+      "group": "CCiSCSI",
+      "has_boot_flags": true,
+      "boot_flags": 1,
+      "has_parameters": true,
+      "parameter_values": [
+        "BusType",
+        "DelayForNetworkAtBoot",
+        "LinkDownTime",
+        "MaxRequestHoldTime"
+      ],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "mlx4_bus",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": true,
+      "boot_flags": 1,
+      "has_parameters": true,
+      "parameter_values": [
+        "DeviceManagedSteering",
+        "NumOfDevices",
+        "LoadedDevices"
+      ],
+      "parameter_subkeys": [
+        "Wdf"
+      ]
+    },
+    {
+      "service": "NativeWifiP",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": false,
+      "parameter_values": [],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "NdisTapi",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": false,
+      "parameter_values": [],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "Ndisuio",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": false,
+      "parameter_values": [],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "ndiswanlegacy",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": false,
+      "parameter_values": [],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "rt640x64",
+      "present": true,
+      "start": 0,
+      "group": "NDIS",
+      "has_boot_flags": true,
+      "boot_flags": 1,
+      "has_parameters": true,
+      "parameter_values": [
+        "DrvOption",
+        "DrvMode",
+        "DmaRemappingCompatible",
+        "WppRecorder_TraceGuid",
+        "WaitAutoNegComplete",
+        "*EEE",
+        "AutoPowerSave",
+        "GigaLite",
+        "*FlowControl",
+        "Diskless",
+        "DisklessOption",
+        "PowerSavingMode",
+        "EnableGreenEthernet",
+        "AutoDisableGigabit",
+        "PowerDownPll",
+        "S5NicKeepOverrideMacAddr",
+        "S5NicKeepOverrideMacAddrV2",
+        "*SpeedDuplex"
+      ],
+      "parameter_subkeys": [
+        "Wdf"
+      ]
+    },
+    {
+      "service": "tunnel",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": false,
+      "parameter_values": [],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "vwififlt",
+      "present": true,
+      "start": 1,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": true,
+      "parameter_values": [
+        "DefaultFilterSettings"
+      ],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "wanarp",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": false,
+      "parameter_values": [],
+      "parameter_subkeys": []
+    },
+    {
+      "service": "wanarpv6",
+      "present": true,
+      "start": 3,
+      "group": "NDIS",
+      "has_boot_flags": false,
+      "boot_flags": 0,
+      "has_parameters": false,
+      "parameter_values": [],
+      "parameter_subkeys": []
+    }
+  ],
+  "net_class_bindings": [
+    {
+      "subkey": "0000",
+      "driver_desc": "Realtek PCIe GbE Family Controller",
+      "matching_device_id": "PCI\\VEN_10EC&DEV_8168&REV_06",
+      "component_id": "PCI\\VEN_10EC&DEV_8168&REV_06"
+    }
+  ],
+  "driver_files": [],
+  "findings": [
+    "Services\\msiscsi: Start=-1 (<absent or unknown>), Parameters present (LinkDownTime, MaxRequestHoldTime)",
+    "Services\\Tcpip: Start=0 (SERVICE_BOOT_START), Group=PNP_TDI, BootFlags=1, Parameters present (DataBasePath, Domain, ForwardBroadcasts, ICSDomain, IPEnableRouter, NameServer, SyncDomainWithMembership, NV Hostname, DhcpNameServer, Hostname, DisableTaskOffload, TcpMaxDataRetransmissions)",
+    "Services\\ndis: Start=0 (SERVICE_BOOT_START), Group=NDIS Wrapper, Parameters present (MaxCachedNblContextSize, PortAuthReceiveAuthorizationState, PortAuthReceiveControlState, PortAuthSendAuthorizationState, PortAuthSendControlState, ReceiveWorkerDisableAutoStart, TrackNblOwner, DefaultPnPCapabilities)",
+    "Services\\iscsiprt: Start=0 (SERVICE_BOOT_START), Group=CCiSCSI, BootFlags=1, Parameters present (BusType, DelayForNetworkAtBoot, LinkDownTime, MaxRequestHoldTime)",
+    "Services\\mlx4_bus: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=1, Parameters present (DeviceManagedSteering, NumOfDevices, LoadedDevices)",
+    "Services\\NativeWifiP: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent",
+    "Services\\NdisTapi: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent",
+    "Services\\Ndisuio: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent",
+    "Services\\ndiswanlegacy: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent",
+    "Services\\rt640x64: Start=0 (SERVICE_BOOT_START), Group=NDIS, BootFlags=1, Parameters present (DrvOption, DrvMode, DmaRemappingCompatible, WppRecorder_TraceGuid, WaitAutoNegComplete, *EEE, AutoPowerSave, GigaLite, *FlowControl, Diskless, DisklessOption, PowerSavingMode, EnableGreenEthernet, AutoDisableGigabit, PowerDownPll, S5NicKeepOverrideMacAddr, S5NicKeepOverrideMacAddrV2, *SpeedDuplex)",
+    "Services\\tunnel: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent",
+    "Services\\vwififlt: Start=1 (SERVICE_SYSTEM_START), Group=NDIS, Parameters present (DefaultFilterSettings)",
+    "Services\\wanarp: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent",
+    "Services\\wanarpv6: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent",
+    "Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}\\0000: DriverDesc='Realtek PCIe GbE Family Controller', MatchingDeviceId='PCI\\VEN_10EC&DEV_8168&REV_06', ComponentId='PCI\\VEN_10EC&DEV_8168&REV_06'"
+  ],
+  "summary": "=== CobDiskless Offline SYSTEM Hive Inspection ===\nHive:        \\\\?\\Volume{3e128489-0000-0000-0000-602200000000}\\Windows\\System32\\config\\SYSTEM\nVolume:      <not provided -- hash/version checks skipped>\nControlSet:  ControlSet001\nGuest OS:    unknown\nStatus:      OK\nMessage:     Inspected ControlSet001: 14 service(s), 1 net class binding(s), 0 driver binary check(s)\n\n-- NIC / boot driver services (14) --\n  Services\\msiscsi: Start=-1 (<absent or unknown>), BootFlags=ABSENT, Parameters=(2 value(s), 0 subkey(s)) [LinkDownTime, MaxRequestHoldTime]\n  Services\\Tcpip: Start=0 (SERVICE_BOOT_START), Group=PNP_TDI, BootFlags=1, Parameters=(12 value(s), 6 subkey(s)) [DataBasePath, Domain, ForwardBroadcasts, ICSDomain, IPEnableRouter, NameServer, SyncDomainWithMembership, NV Hostname, DhcpNameServer, Hostname, DisableTaskOffload, TcpMaxDataRetransmissions]\n  Services\\ndis: Start=0 (SERVICE_BOOT_START), Group=NDIS Wrapper, BootFlags=ABSENT, Parameters=(8 value(s), 0 subkey(s)) [MaxCachedNblContextSize, PortAuthReceiveAuthorizationState, PortAuthReceiveControlState, PortAuthSendAuthorizationState, PortAuthSendControlState, ReceiveWorkerDisableAutoStart, TrackNblOwner, DefaultPnPCapabilities]\n  Services\\iscsiprt: Start=0 (SERVICE_BOOT_START), Group=CCiSCSI, BootFlags=1, Parameters=(4 value(s), 0 subkey(s)) [BusType, DelayForNetworkAtBoot, LinkDownTime, MaxRequestHoldTime]\n  Services\\mlx4_bus: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=1, Parameters=(3 value(s), 1 subkey(s)) [DeviceManagedSteering, NumOfDevices, LoadedDevices]\n  Services\\NativeWifiP: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT\n  Services\\NdisTapi: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT\n  Services\\Ndisuio: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT\n  Services\\ndiswanlegacy: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT\n  Services\\rt640x64: Start=0 (SERVICE_BOOT_START), Group=NDIS, BootFlags=1, Parameters=(18 value(s), 1 subkey(s)) [DrvOption, DrvMode, DmaRemappingCompatible, WppRecorder_TraceGuid, WaitAutoNegComplete, *EEE, AutoPowerSave, GigaLite, *FlowControl, Diskless, DisklessOption, PowerSavingMode, EnableGreenEthernet, AutoDisableGigabit, PowerDownPll, S5NicKeepOverrideMacAddr, S5NicKeepOverrideMacAddrV2, *SpeedDuplex]\n  Services\\tunnel: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT\n  Services\\vwififlt: Start=1 (SERVICE_SYSTEM_START), Group=NDIS, BootFlags=ABSENT, Parameters=(1 value(s), 0 subkey(s)) [DefaultFilterSettings]\n  Services\\wanarp: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT\n  Services\\wanarpv6: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=ABSENT, Parameters=ABSENT\n\n-- Net class bindings (Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}) --\n  0000: DriverDesc='Realtek PCIe GbE Family Controller', MatchingDeviceId='PCI\\VEN_10EC&DEV_8168&REV_06', ComponentId='PCI\\VEN_10EC&DEV_8168&REV_06'\n\n-- Driver binary identity (0) --\n  (no volume provided -- skipped)\n\n-- Findings (15) --\n  * Services\\msiscsi: Start=-1 (<absent or unknown>), Parameters present (LinkDownTime, MaxRequestHoldTime)\n  * Services\\Tcpip: Start=0 (SERVICE_BOOT_START), Group=PNP_TDI, BootFlags=1, Parameters present (DataBasePath, Domain, ForwardBroadcasts, ICSDomain, IPEnableRouter, NameServer, SyncDomainWithMembership, NV Hostname, DhcpNameServer, Hostname, DisableTaskOffload, TcpMaxDataRetransmissions)\n  * Services\\ndis: Start=0 (SERVICE_BOOT_START), Group=NDIS Wrapper, Parameters present (MaxCachedNblContextSize, PortAuthReceiveAuthorizationState, PortAuthReceiveControlState, PortAuthSendAuthorizationState, PortAuthSendControlState, ReceiveWorkerDisableAutoStart, TrackNblOwner, DefaultPnPCapabilities)\n  * Services\\iscsiprt: Start=0 (SERVICE_BOOT_START), Group=CCiSCSI, BootFlags=1, Parameters present (BusType, DelayForNetworkAtBoot, LinkDownTime, MaxRequestHoldTime)\n  * Services\\mlx4_bus: Start=3 (SERVICE_DEMAND_START), Group=NDIS, BootFlags=1, Parameters present (DeviceManagedSteering, NumOfDevices, LoadedDevices)\n  * Services\\NativeWifiP: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent\n  * Services\\NdisTapi: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent\n  * Services\\Ndisuio: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent\n  * Services\\ndiswanlegacy: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent\n  * Services\\rt640x64: Start=0 (SERVICE_BOOT_START), Group=NDIS, BootFlags=1, Parameters present (DrvOption, DrvMode, DmaRemappingCompatible, WppRecorder_TraceGuid, WaitAutoNegComplete, *EEE, AutoPowerSave, GigaLite, *FlowControl, Diskless, DisklessOption, PowerSavingMode, EnableGreenEthernet, AutoDisableGigabit, PowerDownPll, S5NicKeepOverrideMacAddr, S5NicKeepOverrideMacAddrV2, *SpeedDuplex)\n  * Services\\tunnel: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent\n  * Services\\vwififlt: Start=1 (SERVICE_SYSTEM_START), Group=NDIS, Parameters present (DefaultFilterSettings)\n  * Services\\wanarp: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent\n  * Services\\wanarpv6: Start=3 (SERVICE_DEMAND_START), Group=NDIS, Parameters absent\n  * Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}\\0000: DriverDesc='Realtek PCIe GbE Family Controller', MatchingDeviceId='PCI\\VEN_10EC&DEV_8168&REV_06', ComponentId='PCI\\VEN_10EC&DEV_8168&REV_06'\n"
+}
+[INFO] Inspection complete.

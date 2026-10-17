@@ -7,11 +7,13 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include "CobDisklessCore/types/network_address.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
-#include "CobDisklessCore/storage/cow_block_device.hpp"
+#include "CobDisklessCore/storage/unified_cow_device.hpp"
+#include "CobDisklessCore/storage/tiered_storage_engine.hpp"
 #include "CobDisklessCore/errors/result.hpp"
 
 #include "CobDisklessCore/types/common_types.hpp"
@@ -31,15 +33,17 @@ enum class ClientState {
     Offline,
     Booting,
     Online,
-    Resetting
+    Resetting,
+    Disconnected
 };
 
 [[nodiscard]] constexpr std::string_view to_string(ClientState state) noexcept {
     switch (state) {
-        case ClientState::Offline:   return "Offline";
-        case ClientState::Booting:   return "Booting";
-        case ClientState::Online:    return "Online";
-        case ClientState::Resetting: return "Resetting";
+        case ClientState::Offline:      return "Offline";
+        case ClientState::Booting:      return "Booting";
+        case ClientState::Online:       return "Online";
+        case ClientState::Resetting:    return "Resetting";
+        case ClientState::Disconnected: return "Disconnected";
     }
     return "Unknown";
 }
@@ -49,9 +53,18 @@ public:
     ClientSession(
         ClientId id,
         NetworkAddress ip,
-        ImageId os_image_id,
-        std::shared_ptr<CowBlockDevice> cow_device
+        ImageId os_image_id = ImageId("default"),
+        std::shared_ptr<UnifiedCowDevice> cow_device = nullptr
     );
+
+    void init_cow_cluster_map(uint64_t total_sectors) {
+        // Historical session-side cluster map. The writeback engine now owns
+        // its own allocation table inside the .cow file, so nothing is bound
+        // into the device any more; the map is kept for diagnostics/tests.
+        uint64_t total_clusters = (total_sectors + 127) / 128;
+        cow_cluster_map.assign(total_clusters, 0xFFFFFFFF);
+        next_free_cluster.store(0);
+    }
 
     [[nodiscard]] const ClientId& id() const noexcept { return id_; }
     [[nodiscard]] const NetworkAddress& ip() const noexcept { return ip_; }
@@ -59,12 +72,23 @@ public:
     [[nodiscard]] ClientState state() const noexcept { return state_; }
     void set_state(ClientState s) noexcept { state_ = s; }
 
-    [[nodiscard]] std::shared_ptr<CowBlockDevice> cow_device() const noexcept { return cow_device_; }
+    [[nodiscard]] std::shared_ptr<UnifiedCowDevice> cow_device() const noexcept { return cow_device_; }
+    [[nodiscard]] std::shared_ptr<UnifiedCowDevice> cow_block_device() const noexcept { return cow_device_; }
     [[nodiscard]] std::shared_ptr<BlockDevice> game_device() const noexcept { return game_device_; }
-    void set_game_device(std::shared_ptr<BlockDevice> dev) noexcept { game_device_ = std::move(dev); }
+    void set_game_device(std::shared_ptr<BlockDevice> dev) noexcept;
+
+    // Specification 1: In-Memory Flattened QCOW2-Lite Translation Table
+    std::vector<uint32_t> cow_cluster_map;
+    std::atomic<uint32_t> next_free_cluster{0};
+
+    [[nodiscard]] std::shared_ptr<TieredBlockDevice> tiered_device() const noexcept { return tiered_device_; }
+    void set_tiered_device(std::shared_ptr<TieredBlockDevice> dev) noexcept { tiered_device_ = std::move(dev); }
 
     [[nodiscard]] std::shared_ptr<BlockDevice> get_device_for_lun(uint64_t lun) const noexcept {
         if (lun == 0) {
+            if (tiered_device_) {
+                return tiered_device_;
+            }
             return cow_device_;
         }
         if (lun == 1) {
@@ -95,7 +119,7 @@ public:
 
     /**
      * @brief The shared read-only golden image this session was created from.
-     *        Super Client direct mode temporarily swaps the CowBlockDevice's
+     *        Super Client direct mode temporarily swaps the UnifiedCowDevice's
      *        base for an exclusive read-write backend; terminating the session
      *        re-attaches this handle so the shared read-only pool resumes.
      */
@@ -113,6 +137,20 @@ public:
     [[nodiscard]] std::chrono::steady_clock::time_point last_scsi_time() const noexcept { return last_scsi_time_; }
     void set_last_scsi_time(std::chrono::steady_clock::time_point t) noexcept { last_scsi_time_ = t; }
 
+    // Restart this session's idle clock.
+    //
+    // Called at the one moment a TCP connection adopts a session that already
+    // exists: the RFC 3720 5.3.5 reinstatement, the IP-keyed fallback, and
+    // resolve_session(). The silence before that point belongs to the socket
+    // being replaced -- msiscsi logging in ~112s after iPXE went quiet must not
+    // inherit those 112 seconds, or the idle watchdog reads the new connection
+    // as "idle for 112538ms" and closes it a few hundred milliseconds after the
+    // login completed, leaving the initiator spinning on unacknowledged I/O.
+    void note_connection_bound() noexcept {
+        last_scsi_time_ = std::chrono::steady_clock::now();
+        watchdog_warned_ = false;
+    }
+
     [[nodiscard]] uint64_t last_active_lba() const noexcept { return last_lba_; }
     [[nodiscard]] uint32_t last_active_sectors() const noexcept { return last_sectors_; }
     void record_scsi_activity(uint64_t lba, uint32_t sectors) noexcept {
@@ -128,6 +166,71 @@ public:
     [[nodiscard]] const std::string& initiator_iqn() const noexcept { return initiator_iqn_; }
     void set_initiator_iqn(std::string iqn) { initiator_iqn_ = std::move(iqn); }
 
+    [[nodiscard]] uint32_t live_connections() const noexcept { return live_connections_.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint32_t active_connections() const noexcept { return live_connections(); }
+    uint32_t increment_connections() noexcept { return ++live_connections_; }
+    uint32_t decrement_connections() noexcept {
+        uint32_t cur = live_connections_.load(std::memory_order_relaxed);
+        while (cur > 0 && !live_connections_.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel)) {}
+        return (cur > 0) ? (cur - 1) : 0;
+    }
+    uint32_t retain_connection() noexcept { return increment_connections(); }
+    uint32_t release_connection() noexcept { return decrement_connections(); }
+
+    [[nodiscard]] bool has_pending_swap() const noexcept { return has_pending_swap_; }
+    [[nodiscard]] const ImageId& pending_swap_image_id() const noexcept { return pending_swap_image_id_; }
+    void set_pending_swap(ImageId id) noexcept {
+        pending_swap_image_id_ = std::move(id);
+        has_pending_swap_ = true;
+    }
+    void clear_pending_swap() noexcept {
+        has_pending_swap_ = false;
+        pending_swap_image_id_ = ImageId("");
+    }
+
+    [[nodiscard]] uint64_t isid() const noexcept { return isid_; }
+    void set_isid(uint64_t val) noexcept { isid_ = val; }
+
+    [[nodiscard]] uintptr_t active_socket() const noexcept { return active_socket_.load(std::memory_order_relaxed); }
+    void set_active_socket(uintptr_t sock) noexcept { active_socket_.store(sock, std::memory_order_release); }
+
+    // Drop this connection's claim on `sock`, but only while the claim still
+    // *is* this connection's. Between the read and the write another thread may
+    // have reinstated the session onto a replacement socket; a plain store
+    // would clobber that new claim and the next reinstatement would then
+    // retire (shutdown) a handle belonging to somebody else's connection.
+    bool release_active_socket(uintptr_t sock) noexcept {
+        uintptr_t expected = sock;
+        return active_socket_.compare_exchange_strong(expected, ~static_cast<uintptr_t>(0),
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint32_t exp_cmd_sn() const noexcept { return exp_cmd_sn_.load(std::memory_order_relaxed); }
+    void set_exp_cmd_sn(uint32_t sn) noexcept { exp_cmd_sn_.store(sn, std::memory_order_release); }
+
+    void mark_disconnected() noexcept {
+        state_ = ClientState::Disconnected;
+        disconnect_time_ = std::chrono::steady_clock::now();
+    }
+    [[nodiscard]] bool is_disconnected() const noexcept { return state_ == ClientState::Disconnected; }
+    [[nodiscard]] std::chrono::steady_clock::time_point disconnect_time() const noexcept { return disconnect_time_; }
+    [[nodiscard]] bool is_in_disconnect_grace_period(uint32_t grace_sec = 60) const noexcept {
+        if (state_ != ClientState::Disconnected) return false;
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::seconds>(now - disconnect_time_).count() < grace_sec;
+    }
+
+    Result<void> ensure_storage_ready() noexcept {
+        if (tiered_device_) {
+            (void)tiered_device_->reopen();
+        }
+        if (cow_device_ && !cow_device_->is_open() && !cow_device_->writeback_path().empty()) {
+            (void)cow_device_->open(cow_device_->writeback_path());
+        }
+        return {};
+    }
+
     [[nodiscard]] Result<void> reset() noexcept;
 
 private:
@@ -137,7 +240,8 @@ private:
     std::filesystem::path physical_image_path_;
     std::shared_ptr<GoldenImage> base_image_;
     ClientState state_{ClientState::Booting};
-    std::shared_ptr<CowBlockDevice> cow_device_;
+    std::shared_ptr<UnifiedCowDevice> cow_device_;
+    std::shared_ptr<TieredBlockDevice> tiered_device_;
     std::shared_ptr<BlockDevice> game_device_;
     uint64_t bytes_read_{0};
     uint64_t bytes_written_{0};
@@ -149,6 +253,13 @@ private:
     uint32_t last_sectors_{0};
     bool watchdog_warned_{false};
     std::string initiator_iqn_;
+    std::atomic<uint32_t> live_connections_{0};
+    bool has_pending_swap_{false};
+    ImageId pending_swap_image_id_{""};
+    uint64_t isid_{0};
+    std::atomic<uintptr_t> active_socket_{~static_cast<uintptr_t>(0)};
+    std::atomic<uint32_t> exp_cmd_sn_{0};
+    std::chrono::steady_clock::time_point disconnect_time_{std::chrono::steady_clock::now()};
 };
 
 /**
@@ -221,6 +332,21 @@ public:
     }
 
     /**
+     * @brief Per-session RAM writeback absorption budget in bytes, applied to
+     *        every newly created overlay (0 = keep the engine default).
+     *        Dirty chunks land here first at memory speed and spill to the
+     *        .cow file afterwards, so boot bursts do not hammer the disk.
+     */
+    void set_writeback_ram_bytes(uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        writeback_ram_bytes_ = bytes;
+    }
+    [[nodiscard]] uint64_t writeback_ram_bytes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return writeback_ram_bytes_;
+    }
+
+    /**
      * @brief Allocates or retrieves an existing client session with its COW writeback overlay.
      *
      * Sessions are keyed by the initiator IQN when one is supplied (one logical
@@ -237,6 +363,24 @@ public:
      * @brief Queries an active session by its initiator IQN. nullptr if unknown.
      */
     [[nodiscard]] std::shared_ptr<ClientSession> find_session_by_iqn(const std::string& iqn) const;
+
+    /**
+     * @brief Queries an active session by the client's IP address.
+     *
+     * This is the Windows NDIS handover path: msiscsi reconnects with a
+     * generated IQN that carries no MAC, so the incoming TCP peer address is
+     * the only stable identity left. The existing session -- and its existing
+     * wb_<cleanmac>.cow overlay -- must be reattached, never duplicated.
+     * nullptr when no live session owns that address.
+     */
+    [[nodiscard]] std::shared_ptr<ClientSession> find_session_by_ip(const NetworkAddress& client_ip) const;
+
+    /**
+     * @brief Queries an active session by MAC address, case- and
+     *        separator-insensitive ("aa:bb:..", "AA-BB-..", "aabb.." all match).
+     *        nullptr when no live session was created under that MAC.
+     */
+    [[nodiscard]] std::shared_ptr<ClientSession> find_session_by_mac(const std::string& mac) const;
 
     /**
      * @brief Associates an initiator IQN with an existing session (used when the
@@ -276,9 +420,20 @@ public:
     [[nodiscard]] size_t active_clients_count() const;
 
 private:
+    Result<void> terminate_session_locked(const ClientId& client_id);
+    Result<void> terminate_session_locked(std::shared_ptr<ClientSession> session);
     Result<void> commit_super_client_session_locked(std::shared_ptr<ClientSession> session);
     [[nodiscard]] bool is_super_identity_locked(const std::string& identity) const;
     void index_session_iqn_locked(const std::shared_ptr<ClientSession>& session);
+    // Publishes every identity a login may present for this session (session
+    // id, the MAC-shaped id it was looked up with, and both IP spellings) in
+    // the secondary MAC/IP indexes. Caller must hold mutex_.
+    void index_session_identity_locked(const std::shared_ptr<ClientSession>& session,
+                                       const ClientId& queried_id,
+                                       const NetworkAddress& queried_ip);
+    // Removes every MAC/IP index entry that points at client_id. Caller must
+    // hold mutex_.
+    void unindex_session_identity_locked(const ClientId& client_id);
 
     mutable std::mutex mutex_;
     std::shared_ptr<ImageManager> image_manager_;
@@ -289,8 +444,16 @@ private:
     std::unordered_map<ClientId, std::shared_ptr<ClientSession>, ClientIdHash> sessions_;
     // initiator IQN -> ClientId of the owning session (stable across reconnects)
     std::unordered_map<std::string, std::string> sessions_by_iqn_;
+    // normalized MAC (hex-only, lowercased) -> ClientId of the owning session:
+    // the same machine presents different spellings of its MAC across
+    // reboots/handovers, and all of them must resolve to one session.
+    std::unordered_map<std::string, std::string> sessions_by_mac_;
+    // dotted-quad peer IP -> ClientId of the owning session: the identity a
+    // Windows msiscsi login (generated IQN, no MAC) is resolved by.
+    std::unordered_map<std::string, std::string> sessions_by_ip_;
     std::vector<std::string> super_client_identities_;
     uint64_t writeback_quota_bytes_{0};
+    uint64_t writeback_ram_bytes_{0};
 
     mutable std::mutex superclient_lock_mutex_;
     std::unordered_map<std::string, ClientId> active_superclients_by_image_;

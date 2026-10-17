@@ -1,0 +1,62 @@
+﻿=== DISK PARTITIONS & VOLUMES ===
+Part 1: DriveLetter=H Size=575668224 Label=System Reserved
+Part 2: DriveLetter=I Size=499530072064 Label=
+Hive Path: I:\Windows\System32\config\SYSTEM
+Volume Root: I:\
+=== DRIVERS IN I:\Windows\System32\drivers ===
+  rt640x64.sys : Exists=True Size=1473064
+  rt68cx64.sys : Exists=False Size=0
+  e1d68x64.sys : Exists=False Size=0
+  e2f68.sys : Exists=False Size=0
+  msiscsi.sys : Exists=True Size=292664
+  ndis.sys : Exists=True Size=1355072
+  tcpip.sys : Exists=True Size=2926920
+=== HKLM\OFFLINE_SYS SUBKEYS ===
+  ActivationBroker
+  ControlSet001
+  DriverDatabase
+  HardwareConfig
+  Input
+  Keyboard Layout
+  Maps
+  MountedDevices
+  ResourceManager
+  ResourcePolicyStore
+  RNG
+  Select
+  Setup
+  Software
+  WPA
+=== MOUNTED DEVICES ===
+  \DosDevices\D: = 44 4D 49 4F 3A 49 44 3A A5 2F 5C A6 EC 3E 1B 42 81 7B C3 26 6B 86 96 A6
+  \DosDevices\E: = 44 4D 49 4F 3A 49 44 3A D2 3B F3 C6 7B CB 70 44 80 E9 E3 4C A8 39 9E 71
+=== SERVICES RT640X64 ===
+  Start = 0
+  Type = 1
+  ErrorControl = 1
+  Group = NDIS
+  ImagePath = system32\drivers\rt640x64.sys
+  BootFlags = 1
+  Parameters exists: 
+
+DrvOption              : 0
+DrvMode                : 0
+DmaRemappingCompatible : 0
+WppRecorder_TraceGuid  : {88c289a9-e366-45a1-b478-feb5157fdb8c}
+WaitAutoNegComplete    : 1
+*EEE                   : 0
+AutoPowerSave          : 0
+GigaLite               : 0
+*FlowControl           : 0
+PSPath                 : Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt64
+                         0x64\Parameters
+PSParentPath           : Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt64
+                         0x64
+PSChildName            : Parameters
+PSDrive                : HKLM
+PSProvider             : Microsoft.PowerShell.Core\Registry
+
+
+
+
+=== CDDB Realtek ===

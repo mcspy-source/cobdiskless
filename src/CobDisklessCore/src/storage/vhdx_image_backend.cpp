@@ -338,4 +338,17 @@ Result<void> VhdxImageBackend::flush() {
     return {};
 }
 
+bool VhdxImageBackend::has_block(uint64_t offset) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (metadata_.block_size == 0) return false;
+    uint32_t block_size = metadata_.block_size;
+    uint64_t chunk_ratio = (static_cast<uint64_t>(8388608) * metadata_.sector_size) / block_size;
+    if (chunk_ratio == 0) chunk_ratio = 1;
+    uint64_t payload_block_idx = offset / block_size;
+    uint64_t bat_idx = payload_block_idx + (payload_block_idx / chunk_ratio);
+    if (bat_idx >= bat_.size()) return false;
+    uint8_t state = static_cast<uint8_t>(bat_[bat_idx] & 0x07);
+    return state == 6; // PAYLOAD_BLOCK_FULLY_PRESENT
+}
+
 } // namespace cobdiskless

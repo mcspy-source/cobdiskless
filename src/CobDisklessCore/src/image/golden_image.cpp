@@ -4,7 +4,9 @@
 #include "CobDisklessCore/storage/raw_image_backend.hpp"
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
 #include "CobDisklessCore/storage/vhdx_image_backend.hpp"
+#include "CobDisklessCore/storage/base_cache.hpp"
 #include "CobDisklessCore/storage/block_cache.hpp"
+#include "CobDisklessCore/storage/file_attributes.hpp"
 
 namespace cobdiskless {
 
@@ -29,6 +31,16 @@ Result<std::shared_ptr<GoldenImage>> GoldenImage::open(
 
     std::shared_ptr<BlockDevice> backend;
     ImageFormat fmt = ImageInspector::detect_format(path);
+
+    if (fmt == ImageFormat::Vhdx || fmt == ImageFormat::VhdFixed ||
+        fmt == ImageFormat::VhdDynamic || fmt == ImageFormat::VhdDifferencing) {
+        // Master image immutability layer 1: mark the file itself read-only
+        // so no write path holding only the path (a stray GENERIC_WRITE open,
+        // a tool, an accidental deploy copy) can modify what every client
+        // boots from. Maintenance paths (super-client RW open, attribute
+        // guard, force delete) clear it explicitly around their writes.
+        (void)set_read_only_attribute(path);
+    }
 
     if (fmt == ImageFormat::Vhdx) {
         auto vhdx_res = VhdxImageBackend::open(path, true);
@@ -57,11 +69,8 @@ Result<std::shared_ptr<GoldenImage>> GoldenImage::open(
 
     bool has_cache = false;
     if (ram_cache_bytes > 0) {
-        auto cache_res = CachedBlockDevice::create(backend, ram_cache_bytes);
-        if (cache_res.is_ok()) {
-            backend = cache_res.value();
-            has_cache = true;
-        }
+        backend = std::make_shared<BaseCache>(backend, ram_cache_bytes);
+        has_cache = true;
     }
 
     auto golden = std::make_shared<GoldenImage>(

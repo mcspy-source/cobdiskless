@@ -1,0 +1,246 @@
+﻿=== BOOT PARTITION: H ===
+=== OS PARTITION: I ===
+=== BCDEDIT ENUM ALL ===
+
+Windows Boot Manager
+--------------------
+identifier              {9dea862c-5cdd-4e70-acc1-f32b344d4795}
+device                  partition=H:
+description             Windows Boot Manager
+locale                  en-US
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+default                 {8ef8a6b1-b875-11f1-826b-c774f3307f8b}
+resumeobject            {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+displayorder            {8ef8a6b1-b875-11f1-826b-c774f3307f8b}
+toolsdisplayorder       {b2721d73-1db4-4c62-bf78-c548a880142d}
+timeout                 30
+
+Windows Boot Loader
+-------------------
+identifier              {8ef8a6b1-b875-11f1-826b-c774f3307f8b}
+device                  partition=I:
+path                    \Windows\system32\winload.exe
+description             Windows 10
+locale                  en-US
+inherit                 {6efb52bf-1766-41db-a6b3-0ee5eff72bd7}
+allowedinmemorysettings 0x15000075
+osdevice                partition=I:
+systemroot              \Windows
+resumeobject            {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+nx                      OptIn
+bootmenupolicy          Standard
+
+Resume from Hibernate
+---------------------
+identifier              {8ef8a6b0-b875-11f1-826b-c774f3307f8b}
+device                  partition=I:
+path                    \Windows\system32\winresume.exe
+description             Windows Resume Application
+locale                  en-US
+inherit                 {1afa9c49-16ab-4a5c-901b-212802da9460}
+allowedinmemorysettings 0x15000075
+filedevice              partition=I:
+filepath                \hiberfil.sys
+bootmenupolicy          Standard
+debugoptionenabled      No
+
+Windows Memory Tester
+---------------------
+identifier              {b2721d73-1db4-4c62-bf78-c548a880142d}
+device                  partition=H:
+path                    \boot\memtest.exe
+description             Windows Memory Diagnostic
+locale                  en-US
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+badmemoryaccess         Yes
+
+EMS Settings
+------------
+identifier              {0ce4991b-e6b3-4b16-b23c-5e0d9250e5d9}
+bootems                 No
+
+Debugger Settings
+-----------------
+identifier              {4636856e-540f-4170-a130-a84776f4c654}
+debugtype               Local
+
+RAM Defects
+-----------
+identifier              {5189b25c-5558-4bf2-bca4-289b11bd29e2}
+
+Global Settings
+---------------
+identifier              {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+inherit                 {4636856e-540f-4170-a130-a84776f4c654}
+                        {0ce4991b-e6b3-4b16-b23c-5e0d9250e5d9}
+                        {5189b25c-5558-4bf2-bca4-289b11bd29e2}
+
+Boot Loader Settings
+--------------------
+identifier              {6efb52bf-1766-41db-a6b3-0ee5eff72bd7}
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+                        {7ff607e0-4395-11db-b0de-0800200c9a66}
+
+Hypervisor Settings
+-------------------
+identifier              {7ff607e0-4395-11db-b0de-0800200c9a66}
+hypervisordebugtype     Serial
+hypervisordebugport     1
+hypervisorbaudrate      115200
+
+Resume Loader Settings
+----------------------
+identifier              {1afa9c49-16ab-4a5c-901b-212802da9460}
+inherit                 {7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}
+=== NET ADAPTER 0000 ALL PROPERTIES ===
+  DriverDesc = Realtek PCIe GbE Family Controller
+  ProviderName = Realtek
+  DriverDateData = 0 0 41 122 33 198 220 1
+  DriverDate = 4-7-2026
+  DriverVersion = 10.80.50.407
+  InfPath = oem0.inf
+  InfSection = RTL8168E.ndi.NT
+  MatchingDeviceId = PCI\VEN_10EC&DEV_8168&REV_06
+  *SpeedDuplex = 0
+  ForceMode = 0
+  *FlowControl = 3
+  *PriorityVLANTag = 3
+  *InterruptModeration = 1
+  *ReceiveBuffers = 512
+  *TransmitBuffers = 128
+  *JumboPacket = 1514
+  *IPChecksumOffloadIPv4 = 3
+  *TCPChecksumOffloadIPv4 = 3
+  *UDPChecksumOffloadIPv4 = 3
+  S5WakeOnLan = 1
+  *TCPChecksumOffloadIPv6 = 3
+  *UDPChecksumOffloadIPv6 = 3
+  *LsoV2IPv4 = 1
+  *LsoV2IPv6 = 1
+  *WakeOnPattern = 1
+  *WakeOnMagicPacket = 1
+  WolShutdownLinkSpeed = 0
+  *PMARPOffload = 1
+  *PMNSOffload = 1
+  *IfType = 6
+  *MediaType = 0
+  *PhysicalMediaType = 14
+  BusType = 5
+  Characteristics = 132
+  IfTypePreStart = 6
+  NetworkInterfaceInstallTimestamp = 134347662261151482
+  InstallTimeStamp = 234 7 9 0 4 0 24 0 23 0 12 0 43 0 124 0
+  DeviceInstanceID = PCI\VEN_10EC&DEV_8168&SUBSYS_307C17AA&REV_06\01000000684CE00000
+  ComponentId = PCI\VEN_10EC&DEV_8168&REV_06
+  NetCfgInstanceId = {820C4568-D585-420E-94B3-AEA0E0DC3402}
+  NetLuidIndex = 32768
+  BiosSetting = 0
+  ASPM = 0
+  CLKREQ = 0
+  AutoDisableGigabit = 0
+  PowerDownPll = 1
+  DeviceRemovable = 0
+  HwParaMask = 0
+  HwPciOtherFunDevMask = 0
+  HwOptimize = 0
+  HwMode = 0
+  HwOption = 0
+  HwWolCrcVal = 0
+  LogDisconnectEvent = 0
+  EnableEDT = 1
+  RIACP = 0
+  S5NicKeepOverrideMacAddr = 0
+  S5NicKeepOverrideMacAddrV2 = 1
+  PPSW = 1
+  GPPSW = 0
+  S0MgcPkt = 1
+  HwFPSM = 0
+  SwIML = 0
+  SwIML100 = 0
+  SwIMLV2 = 0
+  SwIML100V2 = 0
+  ENPWMode = 0
+  Diskless = 0
+  DisklessOption = 0
+  TxOptimizeThreshold = 0
+  RxOptimizeThreshold = 0
+  CFHTime = 0
+  LDWTime = 0
+  RMPT = 0
+  CRSPDThreshold = 0
+  ComboPerfAdjust = 0
+  CHNLWTime = 0
+  CHNLWCnt = 0
+  L1L0sLT = 0
+  MRRSize = 0
+  TDBSize = 4294967295
+  RDBSize = 4294967295
+  HwOptionV2 = 0
+  HwOptionV3 = 0
+  HwOptionV4 = 0
+  HwOptionV5 = 0
+  HwBpMask = 0
+  MonitorModeEnabled = 0
+  UCEM = 0
+  FactoryMode = 0
+  SwParaMask = 0
+  PowerSavingMode = 1
+  DisablePBA = 1
+  *RSS = 1
+  *ModernStandbyWoLMagicPacket = 0
+  *NumRssQueues = 4
+  *EEE = 1
+  EnableGreenEthernet = 1
+  RegVlanid = 0
+  PBPFA = 7173
+  HwPFA = 131072
+  HwAutoloadMedia = 1
+  PSPath = Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000
+  PSParentPath = Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}
+  PSChildName = 0000
+  PSDrive = HKLM
+  PSProvider = Microsoft.PowerShell.Core\Registry
+=== SERVICES MSISCSI ===
+=== SERVICES TCPIP ===
+  BootFlags = 1
+  Description = @%SystemRoot%\system32\tcpipcfg.dll,-50003
+  DisplayName = @%SystemRoot%\system32\drivers\tcpip.sys,-10001
+  ErrorControl = 1
+  Group = PNP_TDI
+  ImagePath = System32\drivers\tcpip.sys
+  Start = 0
+  Tag = 3
+  Type = 1
+  NdisMajorVersion = 6
+  NdisMinorVersion = 40
+  DriverMajorVersion = 0
+  DriverMinorVersion = 0
+  PSPath = Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Tcpip
+  PSParentPath = Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services
+  PSChildName = Tcpip
+  PSDrive = HKLM
+  PSProvider = Microsoft.PowerShell.Core\Registry
+=== SERVICES NDIS ===
+  Description = @%SystemRoot%\system32\drivers\ndis.sys,-201
+  DisplayName = @%SystemRoot%\system32\drivers\ndis.sys,-200
+  ErrorControl = 3
+  Group = NDIS Wrapper
+  ImagePath = system32\drivers\ndis.sys
+  Start = 0
+  Type = 1
+  PSPath = Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\ndis
+  PSParentPath = Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services
+  PSChildName = ndis
+  PSDrive = HKLM
+  PSProvider = Microsoft.PowerShell.Core\Registry
+=== CONTROL SESSION MANAGER ===
+  BootExecute = autocheck autochk *
+=== MOUNTED DEVICES REG QUERY ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\MountedDevices
+    \DosDevices\D:    REG_BINARY    444D494F3A49443AA52F5CA6EC3E1B42817BC3266B8696A6
+    \DosDevices\E:    REG_BINARY    444D494F3A49443AD23BF3C67BCB704480E9E34CA8399E71
+    \DosDevices\C:    REG_BINARY    8984123E0000602200000000
+    \??\Volume{3e128489-0000-0000-0000-602200000000}    REG_BINARY    8984123E0000602200000000
+    \??\Volume{3e128489-0000-0000-0000-100000000000}    REG_BINARY    8984123E0000100000000000
+

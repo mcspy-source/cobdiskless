@@ -1,0 +1,29 @@
+﻿=== REG QUERY SERVICES MSISCSI ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_iscsi_service.ps1:11 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\msiscsi ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_iscsi_service.ps1:12 char:10
++ $out += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\MsiSCSI ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== REG QUERY SERVICES SEARCH ISCSI ===
+Found service: cht4iscsi
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\cht4iscsi
+    ImagePath    REG_EXPAND_SZ    System32\drivers\cht4sx64.sys
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    SCSI Miniport
+    Tag    REG_DWORD    0x1b
+    Owners    REG_MULTI_SZ    cht4sx64.inf
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\cht4iscsi\Parameters
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\cht4iscsi\StartOverride

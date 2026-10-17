@@ -1,0 +1,179 @@
+﻿OS Partition Drive: I:
+System Path: I:\Windows\System32\config\SYSTEM
+File Windows\System32\drivers\Wdf01000.sys : True
+File Windows\System32\drivers\WDFLDR.SYS : True
+File Windows\System32\drivers\rt640x64.sys : True
+File Windows\System32\drivers\msiscsi.sys : True
+File Windows\System32\drivers\tcpip.sys : True
+File Windows\System32\drivers\ndis.sys : True
+=== Services Wdf01000 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\Wdf01000
+    DisplayName    REG_SZ    @%SystemRoot%\system32\drivers\Wdf01000.sys,-1000
+    ErrorControl    REG_DWORD    0x1
+    Group    REG_SZ    WdfLoadGroup
+    ImagePath    REG_EXPAND_SZ    system32\drivers\Wdf01000.sys
+    Start    REG_DWORD    0x0
+    Type    REG_DWORD    0x1
+
+=== Services WDFLDR ===
+reg.exe : ERROR: The system was unable to find the specified registry key or value.
+At C:\Users\Admin\Desktop\cobdiskless\check_vhd_wdf_and_drivers.ps1:33 char:10
++ $res += (& reg query "HKLM\OFFLINE_SYS\ControlSet001\Services\WDFLDR" ...
++          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: The syst...y key or value.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== Services rt640x64 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64
+    Type    REG_DWORD    0x1
+    Start    REG_DWORD    0x0
+    ErrorControl    REG_DWORD    0x1
+    Tag    REG_DWORD    0xd
+    ImagePath    REG_EXPAND_SZ    system32\drivers\rt640x64.sys
+    DisplayName    REG_SZ    @oem0.inf,%rt640.Service.DispName%;Realtek RT640 NT Driver
+    Group    REG_SZ    NDIS
+    Owners    REG_MULTI_SZ    oem0.inf\0rt640x64.inf
+    BootFlags    REG_DWORD    0x1
+    NdisMajorVersion    REG_DWORD    0x6
+    NdisMinorVersion    REG_DWORD    0x28
+    DriverMajorVersion    REG_DWORD    0xa
+    DriverMinorVersion    REG_DWORD    0x50
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64\Parameters
+    DrvOption    REG_DWORD    0x0
+    DrvMode    REG_DWORD    0x0
+    DmaRemappingCompatible    REG_DWORD    0x0
+    WppRecorder_TraceGuid    REG_SZ    {88c289a9-e366-45a1-b478-feb5157fdb8c}
+    WaitAutoNegComplete    REG_DWORD    0x1
+    *EEE    REG_SZ    0
+    AutoPowerSave    REG_SZ    0
+    GigaLite    REG_SZ    0
+    *FlowControl    REG_SZ    0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Services\rt640x64\Parameters\Wdf
+    WdfMajorVersion    REG_DWORD    0x1
+    WdfMinorVersion    REG_DWORD    0xf
+
+=== ServiceGroupOrder List ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\ServiceGroupOrder
+    List    REG_MULTI_SZ    System Reserved\0EMS\0WdfLoadGroup\0Boot Bus Extender\0System Bus Extender\0NDIS Wrapper\0NDIS\0Base\0PNP_TDI\0CCiSCSI\0SCSI miniport\0Port\0Primary Disk\0SCSI Class\0SCSI CDROM Class\0FSFilter Infrastructure\0FSFilter System\0FSFilter Bottom\0FSFilter Copy Protection\0FSFilter Security Enhancer\0FSFilter Open File\0FSFilter Physical Quota Management\0FSFilter Virtualization\0FSFilter Encryption\0FSFilter Compression\0FSFilter Imaging\0FSFilter HSM\0FSFilter Cluster File System\0FSFilter System Recovery\0FSFilter Quota Management\0FSFilter Content Screener\0FSFilter Continuous Backup\0FSFilter Replication\0FSFilter Anti-Virus\0FSFilter Undelete\0FSFilter Activity Monitor\0FSFilter Top\0Filter\0Boot File System\0Pointer Port\0Keyboard Port\0Pointer Class\0Keyboard Class\0Video Init\0Video\0Video Save\0File System\0Streams Drivers\0COM Infrastructure\0Event Log\0PerceptionGroup\0ProfSvc_Group\0AudioGroup\0UIGroup\0MS_WindowsLocalValidation\0PlugPlay\0Cryptography\0TDI\0iSCSI\0NetBIOSGroup\0ShellSvcGroup\0SchedulerGroup\0SpoolerGroup\0SmartCardGroup\0NetworkProvider\0MS_WindowsRemoteValidation\0NetDDEGroup\0Parallel arbitrator\0Extended Base\0PCI Configuration\0MS Transactions
+
+=== BootExecute ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Session Manager
+    BootExecute    REG_MULTI_SZ    
+
+=== Net Class 0000 ===
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000
+    DriverDesc    REG_SZ    Realtek PCIe GbE Family Controller
+    ProviderName    REG_SZ    Realtek
+    DriverDateData    REG_BINARY    0000297A21C6DC01
+    DriverDate    REG_SZ    4-7-2026
+    DriverVersion    REG_SZ    10.80.50.407
+    InfPath    REG_SZ    oem0.inf
+    InfSection    REG_SZ    RTL8168E.ndi.NT
+    MatchingDeviceId    REG_SZ    PCI\VEN_10EC&DEV_8168&REV_06
+    *SpeedDuplex    REG_SZ    0
+    ForceMode    REG_SZ    0
+    *FlowControl    REG_SZ    0
+    *PriorityVLANTag    REG_SZ    3
+    *InterruptModeration    REG_SZ    1
+    *ReceiveBuffers    REG_SZ    512
+    *TransmitBuffers    REG_SZ    128
+    *JumboPacket    REG_SZ    1514
+    *IPChecksumOffloadIPv4    REG_SZ    3
+    *TCPChecksumOffloadIPv4    REG_SZ    3
+    *UDPChecksumOffloadIPv4    REG_SZ    3
+    S5WakeOnLan    REG_SZ    1
+    *TCPChecksumOffloadIPv6    REG_SZ    3
+    *UDPChecksumOffloadIPv6    REG_SZ    3
+    *LsoV2IPv4    REG_SZ    1
+    *LsoV2IPv6    REG_SZ    1
+    *WakeOnPattern    REG_SZ    1
+    *WakeOnMagicPacket    REG_SZ    1
+    WolShutdownLinkSpeed    REG_SZ    0
+    *PMARPOffload    REG_SZ    1
+    *PMNSOffload    REG_SZ    1
+    *IfType    REG_DWORD    0x6
+    *MediaType    REG_DWORD    0x0
+    *PhysicalMediaType    REG_DWORD    0xe
+    BusType    REG_SZ    5
+    Characteristics    REG_DWORD    0x84
+    IfTypePreStart    REG_DWORD    0x6
+    NetworkInterfaceInstallTimestamp    REG_QWORD    0x1dd4c7cad7ae6fa
+    InstallTimeStamp    REG_BINARY    EA0709000400180017000C002B007C00
+    DeviceInstanceID    REG_SZ    PCI\VEN_10EC&DEV_8168&SUBSYS_307C17AA&REV_06\01000000684CE00000
+    ComponentId    REG_SZ    PCI\VEN_10EC&DEV_8168&REV_06
+    NetCfgInstanceId    REG_SZ    {820C4568-D585-420E-94B3-AEA0E0DC3402}
+    NetLuidIndex    REG_DWORD    0x8000
+    BiosSetting    REG_DWORD    0x0
+    ASPM    REG_DWORD    0x0
+    CLKREQ    REG_DWORD    0x0
+    AutoDisableGigabit    REG_SZ    0
+    PowerDownPll    REG_DWORD    0x0
+    DeviceRemovable    REG_SZ    0
+    HwParaMask    REG_DWORD    0x0
+    HwPciOtherFunDevMask    REG_DWORD    0x0
+    HwOptimize    REG_DWORD    0x0
+    HwMode    REG_DWORD    0x0
+    HwOption    REG_DWORD    0x0
+    HwWolCrcVal    REG_DWORD    0x0
+    LogDisconnectEvent    REG_SZ    0
+    EnableEDT    REG_SZ    1
+    RIACP    REG_SZ    0
+    S5NicKeepOverrideMacAddr    REG_DWORD    0x1
+    S5NicKeepOverrideMacAddrV2    REG_DWORD    0x1
+    PPSW    REG_SZ    1
+    GPPSW    REG_SZ    0
+    S0MgcPkt    REG_SZ    1
+    HwFPSM    REG_DWORD    0x0
+    SwIML    REG_DWORD    0x0
+    SwIML100    REG_DWORD    0x0
+    SwIMLV2    REG_DWORD    0x0
+    SwIML100V2    REG_DWORD    0x0
+    ENPWMode    REG_SZ    0
+    Diskless    REG_DWORD    0x1
+    DisklessOption    REG_DWORD    0x1
+    TxOptimizeThreshold    REG_DWORD    0x0
+    RxOptimizeThreshold    REG_DWORD    0x0
+    CFHTime    REG_DWORD    0x0
+    LDWTime    REG_DWORD    0x0
+    RMPT    REG_DWORD    0x0
+    CRSPDThreshold    REG_DWORD    0x0
+    ComboPerfAdjust    REG_SZ    0
+    CHNLWTime    REG_DWORD    0x0
+    CHNLWCnt    REG_DWORD    0x0
+    L1L0sLT    REG_DWORD    0x0
+    MRRSize    REG_DWORD    0x0
+    TDBSize    REG_DWORD    0xffffffff
+    RDBSize    REG_DWORD    0xffffffff
+    HwOptionV2    REG_DWORD    0x0
+    HwOptionV3    REG_DWORD    0x0
+    HwOptionV4    REG_DWORD    0x0
+    HwOptionV5    REG_DWORD    0x0
+    HwBpMask    REG_DWORD    0x0
+    MonitorModeEnabled    REG_SZ    0
+    UCEM    REG_DWORD    0x0
+    FactoryMode    REG_SZ    0
+    SwParaMask    REG_DWORD    0x0
+    PowerSavingMode    REG_SZ    0
+    DisablePBA    REG_SZ    1
+    *RSS    REG_SZ    1
+    *ModernStandbyWoLMagicPacket    REG_SZ    0
+    *NumRssQueues    REG_SZ    4
+    *EEE    REG_SZ    0
+    EnableGreenEthernet    REG_SZ    0
+    RegVlanid    REG_SZ    0
+    PBPFA    REG_DWORD    0x1c05
+    HwPFA    REG_DWORD    0x20000
+    HwAutoloadMedia    REG_SZ    1
+    WaitAutoNegComplete    REG_DWORD    0x1
+    AutoPowerSave    REG_SZ    0
+    GigaLite    REG_SZ    0
+
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000\Linkage
+HKEY_LOCAL_MACHINE\OFFLINE_SYS\ControlSet001\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0000\Ndi

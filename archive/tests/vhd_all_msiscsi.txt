@@ -1,0 +1,5 @@
+﻿Searching all msiscsi in VHD...
+Windows drive: I:
+Found: I:\Windows\System32\drivers\msiscsi.sys (329032 bytes) modified: 09/29/2026 08:24:56 ver: 10.0.26100.1150 (WinBuild.160101.0800)
+Found: I:\Windows\System32\DriverStore\FileRepository\iscsi.inf_amd64_a0af6a89760de7bd\msiscsi.sys (329032 bytes) modified: 09/29/2026 08:24:56 ver: 10.0.26100.1150 (WinBuild.160101.0800)
+Done.

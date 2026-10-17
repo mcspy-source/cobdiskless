@@ -234,6 +234,9 @@ Result<void> read_stations_json(const std::filesystem::path& path, MachineMap& b
         if (const JsonValue* v = item.find("boot_mode")) {
             rec.boot_mode = v->as_string();
         }
+        if (const JsonValue* v = item.find("last_arch")) {
+            rec.last_arch = v->as_string();
+        }
         if (const JsonValue* v = item.find("registered_at")) {
             rec.registered_at = v->as_string();
         }
@@ -505,7 +508,9 @@ bool MachineRecord::is_empty() const noexcept {
            game_dir == std::filesystem::path("./games") &&
            cache_dir == std::filesystem::path("./cache") && cache_size_mb == 512 &&
            ram_cache_mb == 512 && ssd_cache_mb == 0 && read_cache_enabled && !write_cache_enabled &&
-           ram_cache_enabled && !enable_write_cache;
+           ram_cache_enabled && !enable_write_cache && uuid.empty() && !is_validated &&
+           hardware_id.empty() && subsystem_id.empty() && hardware_profile.empty() &&
+           hardware_layer_path.empty();
 }
 
 // --- construction -----------------------------------------------------------
@@ -699,6 +704,7 @@ Result<void> MachineStore::load_file_locked(const std::filesystem::path& path) {
             if (const JsonValue* v = item.find("image")) rec.image = v->as_string();
             if (const JsonValue* v = item.find("image_path")) rec.image_path = v->as_string();
             if (const JsonValue* v = item.find("boot_mode")) rec.boot_mode = v->as_string();
+            if (const JsonValue* v = item.find("last_arch")) rec.last_arch = v->as_string();
             if (const JsonValue* v = item.find("uefi_bootloader")) rec.uefi_bootloader = v->as_string();
             if (const JsonValue* v = item.find("status")) rec.status = v->as_string();
             if (const JsonValue* v = item.find("enabled")) rec.enabled = v->as_bool(rec.enabled);
@@ -717,6 +723,7 @@ Result<void> MachineStore::load_file_locked(const std::filesystem::path& path) {
             if (const JsonValue* v = item.find("gateway")) rec.gateway = NetworkAddress::parse(v->as_string());
             if (const JsonValue* v = item.find("dns")) rec.dns = NetworkAddress::parse(v->as_string());
             if (const JsonValue* v = item.find("super_client")) rec.super_client = v->as_bool(false);
+            if (const JsonValue* v = item.find("force_sniff")) rec.force_sniff = v->as_bool(false);
             if (const JsonValue* v = item.find("writeback_dir")) rec.writeback_dir = v->as_string();
             if (const JsonValue* v = item.find("game_dir")) rec.game_dir = v->as_string();
             if (const JsonValue* v = item.find("cache_dir")) rec.cache_dir = v->as_string();
@@ -734,6 +741,15 @@ Result<void> MachineStore::load_file_locked(const std::filesystem::path& path) {
                 rec.ram_cache_enabled = v->as_bool(rec.ram_cache_enabled);
             if (const JsonValue* v = item.find("enable_write_cache"))
                 rec.enable_write_cache = v->as_bool(rec.enable_write_cache);
+            if (const JsonValue* v = item.find("uuid")) rec.uuid = v->as_string();
+            if (const JsonValue* v = item.find("is_validated")) rec.is_validated = v->as_bool(false);
+            if (const JsonValue* v = item.find("hardware_id")) rec.hardware_id = v->as_string();
+            if (const JsonValue* v = item.find("subsystem_id")) rec.subsystem_id = v->as_string();
+            if (const JsonValue* v = item.find("revision")) rec.revision = v->as_string();
+            if (const JsonValue* v = item.find("device_instance")) rec.device_instance = v->as_string();
+            if (const JsonValue* v = item.find("hardware_profile")) rec.hardware_profile = v->as_string();
+            if (const JsonValue* v = item.find("hardware_layer_path")) rec.hardware_layer_path = v->as_string();
+            if (const JsonValue* v = item.find("pci_topology")) rec.pci_topology = v->as_string();
         }
     }
 
@@ -765,6 +781,7 @@ Result<void> MachineStore::save_locked() const {
         obj["image"] = rec.image;
         obj["image_path"] = rec.image_path;
         obj["boot_mode"] = rec.boot_mode;
+        obj["last_arch"] = rec.last_arch;
         obj["uefi_bootloader"] = rec.uefi_bootloader;
         obj["status"] = rec.status;
         obj["enabled"] = rec.enabled;
@@ -782,6 +799,7 @@ Result<void> MachineStore::save_locked() const {
         obj["gateway"] = rec.gateway.ip_string();
         obj["dns"] = rec.dns.ip_string();
         obj["super_client"] = rec.super_client;
+        obj["force_sniff"] = rec.force_sniff;
         obj["writeback_dir"] = rec.writeback_dir.string();
         obj["game_dir"] = rec.game_dir.string();
         obj["cache_dir"] = rec.cache_dir.string();
@@ -792,6 +810,15 @@ Result<void> MachineStore::save_locked() const {
         obj["write_cache_enabled"] = rec.write_cache_enabled;
         obj["ram_cache_enabled"] = rec.ram_cache_enabled;
         obj["enable_write_cache"] = rec.enable_write_cache;
+        obj["uuid"] = rec.uuid;
+        obj["is_validated"] = rec.is_validated;
+        obj["hardware_id"] = rec.hardware_id;
+        obj["subsystem_id"] = rec.subsystem_id;
+        obj["revision"] = rec.revision;
+        obj["device_instance"] = rec.device_instance;
+        obj["hardware_profile"] = rec.hardware_profile;
+        obj["hardware_layer_path"] = rec.hardware_layer_path;
+        obj["pci_topology"] = rec.pci_topology;
         entries.push_back(std::move(obj));
     }
 

@@ -295,22 +295,29 @@ them to [`archive/tests/`](archive/tests/README.md).
 
 ## Third-Party Components
 
-Upstream projects under `third_party/` are preserved unmodified with their
-original licenses, copyright notices, and headers:
+Upstream projects under `third_party/` are preserved with their original
+licenses, copyright notices, and headers:
 
 | Component | Purpose | Upstream license |
 |---|---|---|
 | `dhcplite/` | DHCP reference implementation | MIT |
-| `ipxe/` | Network bootloader source | GPLv2 / UDBL |
+| `ipxe/` | Network bootloader source (the CobPXE firmware fork) | GPLv2 / UBDL |
 | `iscsi/` | Legacy iSCSI target reference | GPLv2 |
 | `libvhdi/` | VHD/VHDX image parsing | LGPLv3 / GPLv3 |
-| `tftp/` | TFTP client & server reference | Freeware |
 
 > **Note:** these are *reference* components and are not linked into the default
 > build. `tftp_boot/` ships prebuilt iPXE binaries that are tracked because they
 > are required at runtime. Licensing details and known upstream bugs are
 > documented in [`docs/THIRD_PARTY_NOTES.md`](docs/THIRD_PARTY_NOTES.md) and
 > [`docs/THIRD_PARTY_INTEGRATION.md`](docs/THIRD_PARTY_INTEGRATION.md).
+>
+> One upstream source file has been deliberately modified for the build —
+> `third_party/ipxe/src/util/elf2efi.c` — and the change is recorded in
+> `docs/THIRD_PARTY_NOTES.md` §7. Everything else is untouched.
+>
+> The former `third_party/tftp/` (GkWare) has been **removed**: it was
+> freeware with no redistribution grant, was never compiled into any target,
+> and is documented in `docs/THIRD_PARTY_NOTES.md` §1 and §6.
 
 ---
 

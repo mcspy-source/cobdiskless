@@ -1,0 +1,13 @@
+﻿
+
+DriveLetter FriendlyName   FileSystemType DriveType HealthStatus OperationalStatus SizeRemaining      Size
+----------- ------------   -------------- --------- ------------ ----------------- -------------      ----
+D           Games          NTFS           Fixed     Healthy      OK                    198.78 GB 385.37 GB
+E           writeback      NTFS           Fixed     Healthy      OK                    253.08 GB 253.17 GB
+F           myownfile      NTFS           Fixed     Healthy      OK                    274.51 GB 292.97 GB
+                           FAT32          Fixed     Healthy      OK                     82.86 MB     96 MB
+C           Windows X-Lite NTFS           Fixed     Healthy      OK                    151.99 GB 238.36 GB
+I           os             NTFS           Fixed     Healthy      OK                       105 GB 119.23 GB
+
+
+

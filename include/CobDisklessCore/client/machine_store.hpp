@@ -50,6 +50,7 @@ struct MachineRecord {
     std::string image_path;   // clients.conf:os_image_path (explicit path override)
     std::string boot_mode{"auto"};       // stations.json ("auto" | "uefi" | "bios")
     std::string uefi_bootloader;         // stations.json (optional iPXE EFI bootloader)
+    std::string last_arch;               // runtime architecture detected via DHCP Option 93 ("bios" | "uefi")
 
     // --- registration lifecycle (stations.json vocabulary) ----------------
     // "active" | "offline" | "error" | "disabled". Deliberately distinct from
@@ -83,6 +84,24 @@ struct MachineRecord {
 
     // --- enrollment (clients.json / clients.conf agree on one flag) -------
     bool super_client{false};
+
+    // --- strict hardware gate ------------------------------------------------
+    // force_sniff pins a station to the cobsniffer detour regardless of image
+    // assignment or cached state. Operator-set (management console / PUT
+    // /api/v1/station); default false. Used to force a fresh telemetry cycle
+    // on bare-metal stations whose NIC was never exactly enrolled.
+    bool force_sniff{false};
+
+    // --- hardware validation & zero-touch enrollment ----------------------
+    std::string uuid;
+    bool is_validated{false};
+    std::string hardware_id;
+    std::string subsystem_id;
+    std::string revision;
+    std::string device_instance;
+    std::string hardware_profile;
+    std::string hardware_layer_path;
+    std::string pci_topology;
 
     // --- per-machine storage and cache overrides --------------------------
     // These are operator-facing settings the admin GUI edits per client; the

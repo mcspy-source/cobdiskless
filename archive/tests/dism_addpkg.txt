@@ -1,0 +1,16 @@
+﻿Mounting VHD...
+Windows drive: I:\
+Running DISM Add-Package...
+
+Deployment Image Servicing and Management tool
+Version: 10.0.26100.1150
+
+Image Version: 10.0.17763.1637
+
+Processing 1 of 1 - Adding package C:\Users\Admin\Desktop\cobdiskless\kb4580390.msu
+
+[==========================100.0%==========================] 
+The operation completed successfully.
+DISM Exit code: 0
+msiscsi.sys after Add-Package: ver: 10.0.26100.1150 (WinBuild.160101.0800) length: 329032
+Done.

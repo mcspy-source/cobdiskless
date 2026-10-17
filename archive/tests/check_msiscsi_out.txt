@@ -1,0 +1,5 @@
+﻿Starting...
+Windows drive: I:
+ntoskrnl.exe ver: 10.0.17763.1637 (WinBuild.160101.0800)
+DriverStore match: I:\Windows\System32\DriverStore\FileRepository\iscsi.inf_amd64_a0af6a89760de7bd\msiscsi.sys
+Done.

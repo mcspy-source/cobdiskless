@@ -4,8 +4,14 @@
 #include <cstring>
 #include <system_error>
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <vector>
+
+extern "C" {
+#include "minivhd.h"
+#include "internal.h"
+}
 
 namespace cobdiskless {
 
@@ -32,6 +38,10 @@ constexpr char VHD_DYNAMIC_COOKIE[] = "cxsparse";
 } // namespace
 
 VhdImageBackend::~VhdImageBackend() {
+    if (vhdm_) {
+        mvhd_close(vhdm_);
+        vhdm_ = nullptr;
+    }
     file_.close();
 }
 
@@ -45,6 +55,8 @@ VhdImageBackend::VhdImageBackend(VhdImageBackend&& other) noexcept {
     bat_ = std::move(other.bat_);
     bitmap_sectors_ = other.bitmap_sectors_;
     read_only_ = other.read_only_;
+    vhdm_ = other.vhdm_;
+    other.vhdm_ = nullptr;
 }
 
 VhdImageBackend& VhdImageBackend::operator=(VhdImageBackend&& other) noexcept {
@@ -52,6 +64,10 @@ VhdImageBackend& VhdImageBackend::operator=(VhdImageBackend&& other) noexcept {
         std::unique_lock<std::shared_mutex> lock1(mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> lock2(other.mutex_, std::defer_lock);
         std::lock(lock1, lock2);
+        if (vhdm_) {
+            mvhd_close(vhdm_);
+            vhdm_ = nullptr;
+        }
         file_.close();
         path_ = std::move(other.path_);
         file_ = std::move(other.file_);
@@ -59,6 +75,8 @@ VhdImageBackend& VhdImageBackend::operator=(VhdImageBackend&& other) noexcept {
         bat_ = std::move(other.bat_);
         bitmap_sectors_ = other.bitmap_sectors_;
         read_only_ = other.read_only_;
+        vhdm_ = other.vhdm_;
+        other.vhdm_ = nullptr;
     }
     return *this;
 }
@@ -111,7 +129,8 @@ bool VhdImageBackend::is_vhd(const std::filesystem::path& path) {
 
 Result<std::shared_ptr<VhdImageBackend>> VhdImageBackend::open(
     const std::filesystem::path& path,
-    bool read_only
+    bool read_only,
+    ReadOnlyAttributePolicy attribute_policy
 ) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec) || ec) {
@@ -128,8 +147,17 @@ Result<std::shared_ptr<VhdImageBackend>> VhdImageBackend::open(
     backend->metadata_.physical_size = phys_size;
     backend->read_only_ = read_only;
 
+    int mvhd_err = 0;
+#if defined(_WIN32)
+    std::string path_str = path.string();
+#else
+    std::string path_str = path.u8string();
+#endif
+    backend->vhdm_ = mvhd_open(path_str.c_str(), read_only ? 1 : 0, &mvhd_err);
+
     auto open_res = backend->file_.open(path, read_only ? RandomAccessFile::Access::ReadOnly
-                                                        : RandomAccessFile::Access::ReadWrite);
+                                                        : RandomAccessFile::Access::ReadWrite,
+                                        attribute_policy);
     if (!open_res.is_ok()) {
         return open_res.error();
     }
@@ -255,11 +283,21 @@ Result<size_t> VhdImageBackend::read(
     size_t dest_offset = 0;
 
     while (bytes_remaining > 0) {
-        uint32_t block_idx = static_cast<uint32_t>(cur_offset / metadata_.block_size);
-        uint32_t in_block_offset = static_cast<uint32_t>(cur_offset % metadata_.block_size);
+        // The block number stays 64-bit until it has been range-checked.
+        // Narrowing first would wrap a request that reached past 2^32 blocks
+        // onto an earlier block and read it back as this one's data.
+        const uint64_t block_no = cur_offset / metadata_.block_size;
+        const uint32_t in_block_offset = static_cast<uint32_t>(cur_offset % metadata_.block_size);
         size_t chunk_len = std::min(static_cast<size_t>(metadata_.block_size - in_block_offset), bytes_remaining);
 
-        if (block_idx >= bat_.size() || bat_[block_idx] == 0xFFFFFFFF) {
+        if (block_no >= bat_.size()) {
+            return Error(ErrorCode::StorageFailure,
+                         "VHD block index " + std::to_string(block_no) + " is past the " +
+                             std::to_string(bat_.size()) + "-entry allocation table");
+        }
+        const uint32_t block_idx = static_cast<uint32_t>(block_no);
+
+        if (bat_[block_idx] == 0xFFFFFFFF) {
             // Sparse unallocated block: return zeroes
             std::memset(destination.data() + dest_offset, 0, chunk_len);
         } else {
@@ -322,13 +360,17 @@ Result<size_t> VhdImageBackend::write(
     size_t src_offset = 0;
 
     while (bytes_remaining > 0) {
-        uint32_t block_idx = static_cast<uint32_t>(cur_offset / metadata_.block_size);
-        uint32_t in_block_offset = static_cast<uint32_t>(cur_offset % metadata_.block_size);
+        // Same 64-bit-then-check discipline as the read path: a block number
+        // narrowed before the bounds test would pass the test as a wrapped
+        // value and write this chunk into somebody else's block.
+        const uint64_t block_no = cur_offset / metadata_.block_size;
+        const uint32_t in_block_offset = static_cast<uint32_t>(cur_offset % metadata_.block_size);
         size_t chunk_len = std::min(static_cast<size_t>(metadata_.block_size - in_block_offset), bytes_remaining);
 
-        if (block_idx >= bat_.size()) {
+        if (block_no >= bat_.size()) {
             return Error(ErrorCode::StorageFailure, "VHD block index out of BAT bounds");
         }
+        const uint32_t block_idx = static_cast<uint32_t>(block_no);
 
         if (bat_[block_idx] == 0xFFFFFFFF) {
             // Allocate new block at EOF before trailing footer
@@ -415,6 +457,17 @@ Result<void> VhdImageBackend::flush() {
         return file_.flush();
     }
     return {};
+}
+
+bool VhdImageBackend::has_block(uint64_t offset) const noexcept {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (metadata_.format == ImageFormat::VhdFixed) {
+        return offset < metadata_.virtual_size;
+    }
+    if (metadata_.block_size == 0) return false;
+    uint64_t block_index = offset / metadata_.block_size;
+    if (block_index >= bat_.size()) return false;
+    return bat_[block_index] != 0xFFFFFFFF;
 }
 
 } // namespace cobdiskless

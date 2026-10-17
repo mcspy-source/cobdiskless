@@ -9,6 +9,10 @@
 #include "CobDisklessCore/storage/random_access_file.hpp"
 #include "CobDisklessCore/image/image_format.hpp"
 
+extern "C" {
+struct MVHDMeta;
+}
+
 namespace cobdiskless {
 
 /**
@@ -66,10 +70,15 @@ public:
      * @param read_only true  -> strict shared read-only handle (normal boot path)
      *                  false -> exclusive-writer handle (Super Client maintenance;
      *                            suspends the shared read-only pool for this path)
+     * @param attribute_policy what a read-write open does when the file carries
+     *        FILE_ATTRIBUTE_READONLY: Refuse (default -> Access Denied; nothing
+     *        ever clears the attribute implicitly) or Lift (explicit Super
+     *        Client maintenance lift, restored when the writer closes).
      */
     [[nodiscard]] static Result<std::shared_ptr<VhdImageBackend>> open(
         const std::filesystem::path& path,
-        bool read_only = true
+        bool read_only = true,
+        ReadOnlyAttributePolicy attribute_policy = ReadOnlyAttributePolicy::Refuse
     );
 
     [[nodiscard]] Result<size_t> read(
@@ -111,6 +120,8 @@ public:
         return !read_only_ && file_.access() == RandomAccessFile::Access::ReadWrite;
     }
 
+    [[nodiscard]] bool has_block(uint64_t offset) const noexcept;
+
 private:
     std::filesystem::path path_;
     RandomAccessFile file_;
@@ -119,6 +130,7 @@ private:
     std::vector<uint32_t> bat_; // Block Allocation Table (sector offsets)
     uint32_t bitmap_sectors_{0};
     bool read_only_{true};
+    ::MVHDMeta* vhdm_{nullptr};
 
     [[nodiscard]] static bool verify_footer_checksum(const uint8_t* footer_bytes);
 };

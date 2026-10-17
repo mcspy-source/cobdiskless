@@ -1,0 +1,26 @@
+﻿Mounting VHD...
+Windows drive: I:
+Running DISM RestoreHealth...
+
+Deployment Image Servicing and Management tool
+Version: 10.0.26100.1150
+
+Image Version: 10.0.17763.1637
+
+
+[==                         4.5%                           ] 
+
+[===                        5.5%                           ] 
+
+[===                        6.5%                           ] 
+
+[===========================72.7%==========                ] 
+
+Error: 0x800f081f
+
+The source files could not be found. 
+Use the "Source" option to specify the location of the files that are required to restore the feature. For more information on specifying a source location, see http://go.microsoft.com/fwlink/?LinkId=243077.
+
+The DISM log file can be found at C:\Windows\Logs\DISM\dism.log
+Exit code: -2146498529
+Done.

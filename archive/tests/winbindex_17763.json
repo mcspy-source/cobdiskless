@@ -1,0 +1,82 @@
+﻿[
+    {
+        "Hash":  "0c767747001653fcad95487b254df3c1ef179152c093e7e13369cf07ca55f857",
+        "Version":  "10.0.17763.1 (WinBuild.160101.0800)",
+        "Timestamp":  1603763402,
+        "Size":  292864,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "7ca19bec1ad90382a8396c0191f51157ed079dab6eea9785d3fbddd27e13164c",
+        "Version":  "10.0.17763.593 (WinBuild.160101.0800)",
+        "Timestamp":  3953954810,
+        "Size":  292152,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "ce46e267d64bb7c28b71e96a07a1b17b5aad68fa36cb2a90f272417ebeca468e",
+        "Version":  "10.0.17763.529 (WinBuild.160101.0800)",
+        "Timestamp":  2644885636,
+        "Size":  292664,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "99cdbd8c0891bfdd8d41385a3b16a824bffa2593f8f51eedf33a3f47e1feea6b",
+        "Version":  "10.0.17763.1554 (WinBuild.160101.0800)",
+        "Timestamp":  3005342781,
+        "Size":  292664,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "60601a9d629eec3f7b3b6c17c0cc7ced3154e2c90937b19148327fc0466e583f",
+        "Version":  "10.0.17763.1728 (WinBuild.160101.0800)",
+        "Timestamp":  2508951203,
+        "Size":  292664,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "2c6fd94f617734100b71ab04ac18161e0fc28dc51dc618058a03d9064fbde92c",
+        "Version":  "10.0.17763.4377 (WinBuild.160101.0800)",
+        "Timestamp":  1803003694,
+        "Size":  294272,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "72c58b3c113b59958cab79e8f9c6a113d1e0f9d5f73989e0563eadfa3461bb80",
+        "Version":  "10.0.17763.8148 (WinBuild.160101.0800)",
+        "Timestamp":  1284314902,
+        "Size":  294376,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "064f43460f896f18a102c11ea19d99fd6f308d277f0136132490c465524c2b68",
+        "Version":  "10.0.17763.8755 (WinBuild.160101.0800)",
+        "Timestamp":  2756114437,
+        "Size":  294384,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "035adc743dfa2049576b0bb660cb6f10df64a17b7e8e236bc04058700f80240e",
+        "Version":  "10.0.17763.8880 (WinBuild.160101.0800)",
+        "Timestamp":  2756114437,
+        "Size":  294376,
+        "Machine":  34404,
+        "Urls":  null
+    },
+    {
+        "Hash":  "e34112b145c82d962014ef8ac265e385b4d257191a247a33abfabe75afccea8b",
+        "Version":  "10.0.17763.9245 (WinBuild.160101.0800)",
+        "Timestamp":  3158630944,
+        "Size":  296424,
+        "Machine":  34404,
+        "Urls":  null
+    }
+]

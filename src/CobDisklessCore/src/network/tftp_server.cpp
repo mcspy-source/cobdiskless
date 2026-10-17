@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "CobDisklessCore/network/tftp_server.hpp"
+#include "CobDisklessCore/network/dhcp_server.hpp"
+#include "CobDisklessCore/client/client_session.hpp"
+#include "CobDisklessCore/config/configuration.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
 #include "CobDisklessCore/client/client_manager.hpp"
 #include "CobDisklessCore/logging/logger.hpp"
@@ -154,23 +157,22 @@ TftpServer::~TftpServer() {
 }
 
 std::string TftpServer::generate_ipxe_script(const std::string& target_iqn) const {
-    // SINGLE ATTACH DESIGN (fixes iPXE error 0x03232019 / EADDRINUSE on drive 0x80):
-    //  * The DHCP server deliberately does NOT send Option 17 (Root-Path), so the
-    //    'dhcp' line below configures the NIC only - it never auto-attaches the SAN.
-    //  * There is exactly ONE attach command in this script ('sanboot'). Never emit
-    //    a 'sanhook' + 'sanboot' pair and never hardcode '--drive 0x80' anywhere.
-    //  * 'sanboot iscsi:...' transparently uses INT 13h for Legacy BIOS and the EFI
-    //    Block I/O protocol for UEFI, so no firmware-specific flags are required.
+    (void)target_iqn;
     std::ostringstream ss;
     const std::string srv = server_ip_.is_any() ? std::string("${next-server}") : server_ip_.ip_string();
     ss << "#!ipxe\n";
-    ss << "echo =========================================================\n";
-    ss << "echo CobDiskless Network Boot Initializing...\n";
-    ss << "echo =========================================================\n";
-    ss << "echo Connecting to CobDiskless SAN Target at " << srv << " (" << target_iqn << ")...\n";
     ss << "dhcp\n";
-    ss << "set keep-san 1\n";
-    ss << "sanboot iscsi:" << srv << "::::" << target_iqn << "\n";
+    ss << "set busloc ${net0/busloc}\n";
+    ss << "set ven ${pci/${busloc}.0.2:hex}\n";
+    ss << "set dev ${pci/${busloc}.2.2:hex}\n";
+    ss << "set rev ${pci/${busloc}.8.1:hex}\n";
+    // Board identity for the enrollment pass: SUBSYS vendor (config 0x2C)
+    // and SUBSYS device (config 0x2E). The server concatenates them into
+    // SUBSYS_<subdev><subven> (Windows order) and zero-pads, so the raw
+    // iPXE hex spelling needs no padding here.
+    ss << "set subven ${pci/${busloc}.2c.2:hex}\n";
+    ss << "set subdev ${pci/${busloc}.2e.2:hex}\n";
+    ss << "chain http://" << srv << ":18080/boot.ipxe?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&platform=${platform}\n";
     return ss.str();
 }
 
@@ -217,17 +219,18 @@ Result<std::vector<uint8_t>> TftpServer::get_file_content(const std::string& fil
         }
     }
 
-    std::vector<std::filesystem::path> search_paths = {
-        root_dir_ / filename,
-        std::filesystem::path("./tftp_boot") / filename,
-        std::filesystem::path("./tftp") / filename,
-        std::filesystem::path("../tftp_boot") / filename,
-        std::filesystem::current_path() / "tftp_boot" / filename,
-        std::filesystem::current_path() / "tftp" / filename
-    };
+    auto search_dirs = Configuration::candidate_tftp_boot_paths(root_dir_);
+    if (!root_dir_.empty()) {
+        bool has_root = false;
+        for (const auto& d : search_dirs) {
+            if (d == root_dir_) { has_root = true; break; }
+        }
+        if (!has_root) search_dirs.insert(search_dirs.begin(), root_dir_);
+    }
 
     std::error_code ec;
-    for (const auto& path : search_paths) {
+    for (const auto& dir : search_dirs) {
+        std::filesystem::path path = dir / filename;
         if (std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec)) {
             std::ifstream in(path, std::ios::binary);
             if (in.is_open()) {
@@ -238,18 +241,18 @@ Result<std::vector<uint8_t>> TftpServer::get_file_content(const std::string& fil
         }
     }
 
-    // Case-insensitive lookup in tftp_boot and root_dir_
+    // Case-insensitive lookup across all candidate boot directories
     auto try_ci_lookup = [&](const std::filesystem::path& dir) -> std::optional<std::vector<uint8_t>> {
         if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) {
             return std::nullopt;
         }
         std::string lower_fn = filename;
-        for (auto& c : lower_fn) c = static_cast<char>(std::tolower(c));
+        for (auto& c : lower_fn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
             if (entry.is_regular_file(ec)) {
                 std::string ename = entry.path().filename().string();
                 std::string lower_en = ename;
-                for (auto& c : lower_en) c = static_cast<char>(std::tolower(c));
+                for (auto& c : lower_en) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (lower_en == lower_fn) {
                     std::ifstream in(entry.path(), std::ios::binary);
                     if (in.is_open()) {
@@ -262,9 +265,11 @@ Result<std::vector<uint8_t>> TftpServer::get_file_content(const std::string& fil
         return std::nullopt;
     };
 
-    if (auto c1 = try_ci_lookup(root_dir_)) return *c1;
-    if (auto c2 = try_ci_lookup("./tftp_boot")) return *c2;
-    if (auto c3 = try_ci_lookup(std::filesystem::current_path() / "tftp_boot")) return *c3;
+    for (const auto& dir : search_dirs) {
+        if (auto ci_match = try_ci_lookup(dir)) {
+            return *ci_match;
+        }
+    }
 
     return Error(ErrorCode::StorageFailure, "File not found: " + filename);
 }
@@ -688,8 +693,10 @@ void TftpServer::run_server_loop() {
                 std::snprintf(dest_ip_buf, sizeof(dest_ip_buf), "%s", "0.0.0.0");
             }
 
-            Logger::default_logger().info("TFTP", "[TFTP] Raw packet received: " + std::to_string(bytes) +
-                                         " bytes from " + src_endpoint + " (local IP " + dest_ip_buf + ")");
+            if (Logger::default_logger().would_log(LogLevel::Trace)) {
+                Logger::default_logger().trace("TFTP", "[TFTP] Raw packet received: " + std::to_string(bytes) +
+                                             " bytes from " + src_endpoint + " (local IP " + dest_ip_buf + ")");
+            }
 
             if (bytes < 4) {
                 Logger::default_logger().warn("TFTP", "[TFTP] Dropping request from " + src_endpoint +
@@ -713,7 +720,95 @@ void TftpServer::run_server_loop() {
                 continue;
             }
 
-            const std::string& filename = fn_res.value().filename;
+            std::string filename = fn_res.value().filename;
+            const std::string raw_filename = filename;
+            std::string client_ip = ip_buf;
+
+            // Option 93 Dynamic Architecture-Based Bootloader Mapping:
+            if (dhcp_server_) {
+                try {
+                    NetworkAddress client_net_ip = NetworkAddress::parse(client_ip);
+                    std::optional<ClientArch> arch_opt = dhcp_server_->find_client_arch_by_ip(client_net_ip);
+                    if (!arch_opt.has_value() && client_net_ip.is_loopback()) {
+                        auto leases = dhcp_server_->list_leases();
+                        if (!leases.empty()) {
+                            arch_opt = leases.back().client_arch;
+                        }
+                    }
+                    if (arch_opt.has_value()) {
+                        ClientArch arch = arch_opt.value();
+                        const bool is_uefi = (arch == ClientArch::Efi_x64 || arch == ClientArch::Efi_x86 ||
+                                              arch == ClientArch::Efi_Ebc || arch == ClientArch::Efi_Arm32 ||
+                                              arch == ClientArch::Efi_Arm64);
+
+                        if (filename == "bootloader" || filename == "default" || filename == "pxelinux.0" || filename == "bootx64.efi") {
+                            filename = is_uefi ? "ipxe.efi" : "undionly.kpxe";
+                            Logger::default_logger().info("TFTP",
+                                "[TFTP] Dynamic architecture mapping: '" + raw_filename + "' -> '" +
+                                filename + "' (" + std::string(to_string(arch)) + ")");
+                        } else if (is_uefi && filename == "undionly.kpxe") {
+                            filename = "ipxe.efi";
+                            Logger::default_logger().info("TFTP",
+                                "[TFTP] Architecture override: client is UEFI (" + std::string(to_string(arch)) +
+                                "), serving 'ipxe.efi' instead of 'undionly.kpxe'");
+                        } else if (!is_uefi && filename == "ipxe.efi") {
+                            filename = "undionly.kpxe";
+                            Logger::default_logger().info("TFTP",
+                                "[TFTP] Architecture override: client is BIOS/CSM (" + std::string(to_string(arch)) +
+                                "), serving 'undionly.kpxe' instead of 'ipxe.efi'");
+                        }
+                    }
+                } catch (...) {}
+            }
+
+            // Enforce reboot grace window and ensure COW overlay is strictly preserved across TFTP delivery:
+            std::string client_mac;
+            if (dhcp_server_) {
+                try {
+                    NetworkAddress client_net_ip = NetworkAddress::parse(client_ip);
+                    if (auto mac_opt = dhcp_server_->find_mac_by_ip(client_net_ip); mac_opt.has_value()) {
+                        client_mac = mac_opt.value();
+                    } else if (client_net_ip.is_loopback()) {
+                        auto leases = dhcp_server_->list_leases();
+                        if (!leases.empty()) {
+                            client_mac = leases.back().mac_address;
+                        }
+                    }
+                } catch (...) {}
+            }
+
+            if (session_manager_) {
+                std::shared_ptr<ClientSession> sess;
+                if (!client_mac.empty()) {
+                    sess = session_manager_->find_session_by_mac(client_mac);
+                    if (!sess) {
+                        sess = session_manager_->find_session(ClientId(client_mac));
+                    }
+                }
+                if (!sess && !client_ip.empty()) {
+                    try {
+                        sess = session_manager_->find_session_by_ip(NetworkAddress::parse(client_ip));
+                    } catch (...) {}
+                    if (!sess) {
+                        sess = session_manager_->find_session(ClientId("ip_" + client_ip));
+                    }
+                }
+
+                if (sess) {
+                    if (sess->state() == ClientState::Online ||
+                        sess->state() == ClientState::Booting ||
+                        sess->is_in_disconnect_grace_period(120)) {
+                        // Ensure storage devices are verified and ready for subsequent iSCSI re-attach
+                        sess->ensure_storage_ready();
+                        Logger::default_logger().info("BOOT",
+                            "[BOOT] [TFTP] Retaining active/grace writeback session for " +
+                            (client_mac.empty() ? client_ip : client_mac) +
+                            " during TFTP RRQ '" + filename + "' (state=" +
+                            std::string(to_string(sess->state())) + ", preserving COW writeback overlay)");
+                    }
+                }
+            }
+
             // Deliberately a *value*, not a reference. The session worker captures it
             // by value and rewrites `tsize` before building the OACK (RFC 2359: the RRQ
             // asks with tsize=0, the OACK must answer with the exact file size). A
@@ -721,7 +816,6 @@ void TftpServer::run_server_loop() {
             // std::remove_reference_t keeps the cv-qualifier -- and no amount of
             // `mutable` on the lambda can un-const it.
             TftpRequestOptions options = fn_res.value().options;
-            std::string client_ip = ip_buf;
 
             // Session tracing: what the client asked for and how the reply will start.
             // PXE-E32 ("TFTP open timeout") is diagnosed entirely from these three lines --

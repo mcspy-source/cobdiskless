@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "CobDisklessCore/image/image_manager.hpp"
-#include "CobDisklessCore/image/pnp_driver_armer.hpp"
 #include "CobDisklessCore/storage/storage_manager.hpp"
+#include "CobDisklessCore/storage/file_attributes.hpp"
 #include "CobDisklessCore/logging/logger.hpp"
 #include "CobDisklessCore/config/simple_json.hpp"
 #include <system_error>
@@ -53,7 +53,45 @@ static std::filesystem::path clean_path_slashes(const std::filesystem::path& p) 
     for (auto& c : s) {
         if (c == '\\') c = '/';
     }
-    return std::filesystem::path(s);
+    std::string norm;
+    norm.reserve(s.size());
+    bool is_unc = (s.size() >= 2 && s[0] == '/' && s[1] == '/' && (s.size() == 2 || s[2] != '/'));
+    size_t start_idx = 0;
+    if (is_unc) {
+        norm.push_back('/');
+        norm.push_back('/');
+        start_idx = 2;
+    }
+    bool last_was_slash = false;
+    for (size_t i = start_idx; i < s.size(); ++i) {
+        if (s[i] == '/') {
+            if (!last_was_slash) {
+                norm.push_back('/');
+                last_was_slash = true;
+            }
+        } else {
+            norm.push_back(s[i]);
+            last_was_slash = false;
+        }
+    }
+    return std::filesystem::path(norm).lexically_normal();
+}
+
+static bool is_writeback_or_swap_disk(const std::filesystem::path& path) {
+    std::string filename = path.filename().string();
+    std::string lower = filename;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    // Ignore differential writeback files & temporary swap disks
+    if (lower.ends_with(".wb.vhd") || lower.ends_with(".diff.vhd") ||
+        lower.ends_with(".cow") || lower.ends_with(".delta") ||
+        lower.ends_with(".swap.vhd") || lower.ends_with(".tmp.vhd")) {
+        return true;
+    }
+    if (lower.starts_with("wb_") || lower.starts_with("tmp_") || lower.starts_with("swap_")) {
+        return true;
+    }
+    return false;
 }
 
 static std::filesystem::path resolve_real_image_path(
@@ -76,20 +114,9 @@ static std::filesystem::path resolve_real_image_path(
         }
     }
 
-    // 3. Search in fallback_dir, "./images", "./images/os", ".", "..", Desktop
-    std::vector<std::filesystem::path> search_dirs;
-    if (!fallback_dir.empty()) search_dirs.push_back(clean_path_slashes(fallback_dir));
-    search_dirs.push_back("./images");
-    search_dirs.push_back("./images/os");
-    search_dirs.push_back(".");
-    search_dirs.push_back("..");
-
-    const char* up = std::getenv("USERPROFILE");
-    if (up && *up) {
-        search_dirs.push_back(clean_path_slashes(std::filesystem::path(up) / "Desktop"));
-    }
-
-    for (const auto& dir : search_dirs) {
+    // 3. Search in fallback_dir (assigned images directory)
+    if (!fallback_dir.empty()) {
+        const std::filesystem::path dir = clean_path_slashes(fallback_dir);
         std::filesystem::path cand = clean_path_slashes(dir / input_path.filename());
         if (std::filesystem::exists(cand, ec) && std::filesystem::is_regular_file(cand, ec)) {
             return cand;
@@ -107,18 +134,19 @@ static std::filesystem::path resolve_real_image_path(
 }
 
 size_t ImageManager::cache_bytes_for_role(ImageRole role) const {
+    constexpr size_t kDefaultCacheBytes = 128ULL * 1024ULL * 1024ULL; // 128 MiB
     if (!storage_manager_) {
-        return 0;
+        return kDefaultCacheBytes;
     }
     const StorageRole s_role = (role == ImageRole::GameDisk) ? StorageRole::Games : StorageRole::OsImages;
     if (!storage_manager_->is_role_assigned(s_role)) {
-        return 0; // Backing storage unassigned: attached cache runtime is strictly inactive
+        return kDefaultCacheBytes; // Default to 128 MiB acceleration for base images
     }
     const auto cfg = storage_manager_->get_cache_config(s_role);
     if (cfg.ram_cache_enabled && cfg.ram_cache_mb > 0) {
         return static_cast<size_t>(cfg.ram_cache_mb) * 1024ULL * 1024ULL;
     }
-    return 0;
+    return kDefaultCacheBytes;
 }
 
 size_t ImageManager::scan_folder_locked(const std::filesystem::path& folder, ImageRole role) {
@@ -130,6 +158,9 @@ size_t ImageManager::scan_folder_locked(const std::filesystem::path& folder, Ima
 
     for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
         if (entry.is_regular_file(ec)) {
+            if (is_writeback_or_swap_disk(entry.path())) {
+                continue;
+            }
             auto ext = entry.path().extension().string();
             for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             if (ext == ".vhd" || ext == ".vhdx" || ext == ".raw" || ext == ".img") {
@@ -183,52 +214,43 @@ Result<void> ImageManager::initialize(const std::filesystem::path& config_path) 
     std::error_code ec;
     config_path_ = config_path;
 
-    // 1. Create a default "./images" directory if it doesn't exist
-    std::filesystem::create_directories("./images", ec);
+    // 1. Sync role paths if storage_manager_ is assigned
+    if (storage_manager_) {
+        if (storage_manager_->is_role_assigned(StorageRole::OsImages)) {
+            auto role_p = storage_manager_->get_role_path(StorageRole::OsImages);
+            if (!role_p.empty()) {
+                os_images_dir_ = role_p;
+            }
+        }
+        // No OsImages role assigned: keep whatever configure() set from
+        // cobdiskless.conf. Clearing here used to discard the operator's
+        // os_images_dir and blind the discovery scan on every fresh
+        // zero-config deployment -- whose storage_roles.conf is empty by
+        // definition -- leaving the image registry with 0 entries and every
+        // iSCSI login to fail with "Image not found in manager".
+        if (storage_manager_->is_role_assigned(StorageRole::Games)) {
+            auto role_g = storage_manager_->get_role_path(StorageRole::Games);
+            if (!role_g.empty()) {
+                games_dir_ = role_g;
+            }
+        }
+    }
+
+    if (!os_images_dir_.empty()) {
+        std::filesystem::create_directories(os_images_dir_, ec);
+    }
 
     // 2. Read config.json, auto-load and register all saved images into images_
     (void)load_images_from_config(config_path);
 
-    // 3. Automatically scan "./images", application root directory, parent directory, and Desktop for any *.vhd or *.vhdx files on startup
+    // 3. Strictly scan os_images_dir_ (non-recursive root-level) and games_dir_
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        scan_folder_locked("./images", ImageRole::OsImage);
-        scan_folder_locked(".", ImageRole::OsImage);
-        scan_folder_locked("..", ImageRole::OsImage);
-
-        const char* up = std::getenv("USERPROFILE");
-        if (up && *up) {
-            scan_folder_locked(std::filesystem::path(up) / "Desktop", ImageRole::OsImage);
-        }
-
-        if (os_images_dir_ != "./images" && os_images_dir_ != "." && os_images_dir_ != "..") {
+        if (!os_images_dir_.empty()) {
             scan_folder_locked(os_images_dir_, ImageRole::OsImage);
         }
-        if (games_dir_ != "./images" && games_dir_ != "." && games_dir_ != "..") {
+        if (!games_dir_.empty()) {
             scan_folder_locked(games_dir_, ImageRole::GameDisk);
-        }
-
-        // Read-only discovery hints (legacy convenience folders). These are ONLY used
-        // to *find* images at startup - they are never emitted to clients. The IQN and
-        // VHD path sent to a client always resolve dynamically through config.json /
-        // ImageManager::default_os_image_id() at connection time.
-        if (std::filesystem::exists("D:/Image", ec)) {
-            scan_folder_locked("D:/Image", ImageRole::OsImage);
-        }
-        if (std::filesystem::exists("G:/", ec)) {
-            scan_folder_locked("G:/", ImageRole::OsImage);
-        }
-
-        if (default_os_image_id_.empty()) {
-            // Dynamic default resolution: fall back to the first valid OS image
-            // discovered from config.json / disk scanning. Never hardcode an image ID
-            // (e.g. "w11") - the active image is whatever config.json declares.
-            for (const auto& [_, info] : managed_images_) {
-                if (info.role == ImageRole::OsImage && info.is_valid) {
-                    default_os_image_id_ = info.id.value();
-                    break;
-                }
-            }
         }
 
         // 4. Update and persist discovered images into config.json
@@ -292,15 +314,7 @@ Result<void> ImageManager::save_images_to_config(const std::filesystem::path& co
 
 std::string ImageManager::default_os_image_id() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!default_os_image_id_.empty()) {
-        return default_os_image_id_;
-    }
-    for (const auto& [_, info] : managed_images_) {
-        if (info.role == ImageRole::OsImage && info.is_valid) {
-            return info.id.value();
-        }
-    }
-    return "";
+    return default_os_image_id_;
 }
 
 void ImageManager::set_default_os_image_id(std::string id, bool persist) {
@@ -315,9 +329,6 @@ void ImageManager::set_default_os_image_id(std::string id, bool persist) {
         if (persist) {
             (void)save_images_to_config_locked();
         }
-    }
-    if (!img_path.empty()) {
-        (void)PnpDriverArmer::ensure_image_armed(img_path);
     }
 }
 
@@ -360,10 +371,56 @@ Result<void> ImageManager::load_images_from_config(const std::filesystem::path& 
         if (role_str == "GameDisk") role = ImageRole::GameDisk;
         else if (role_str == "DataDrive") role = ImageRole::DataDrive;
 
+        if (role == ImageRole::OsImage) {
+            if (storage_manager_) {
+                if (!storage_manager_->is_role_assigned(StorageRole::OsImages) || os_images_dir_.empty()) {
+                    // Backing OS images drive is not assigned: do not load saved OS images
+                    continue;
+                }
+            }
+        } else if (role == ImageRole::GameDisk) {
+            if (storage_manager_) {
+                if (!storage_manager_->is_role_assigned(StorageRole::Games) || games_dir_.empty()) {
+                    continue;
+                }
+            }
+        }
+
         std::filesystem::path p = resolve_real_image_path(p_str, os_images_dir_);
+        if (is_writeback_or_swap_disk(p)) {
+            Logger::default_logger().warn("ImageManager", "Skipping differential writeback or swap disk from config: " + p.string());
+            continue;
+        }
         if (!std::filesystem::exists(p, ec)) {
             Logger::default_logger().warn("ImageManager", "Saved image path from " + config_path.string() + " not found: " + p_str);
             continue;
+        }
+
+        // Verify that the image belongs to the assigned directory:
+        if (storage_manager_ && role == ImageRole::OsImage && !os_images_dir_.empty()) {
+            std::filesystem::path norm_p = clean_path_slashes(p);
+            std::filesystem::path norm_dir = clean_path_slashes(os_images_dir_);
+            auto rel = std::filesystem::relative(norm_p, norm_dir, ec);
+            if (ec || rel.empty() || rel.string().starts_with("..")) {
+                bool matched = false;
+                std::error_code eq_ec;
+                if (std::filesystem::equivalent(norm_p.parent_path(), norm_dir, eq_ec)) {
+                    matched = true;
+                } else {
+                    std::string p_str_lower = norm_p.string();
+                    std::string d_str_lower = norm_dir.string();
+                    for (char& c : p_str_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    for (char& c : d_str_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (!d_str_lower.empty() && d_str_lower.back() != '/') d_str_lower += '/';
+                    if (p_str_lower.starts_with(d_str_lower)) {
+                        matched = true;
+                    }
+                }
+                if (!matched) {
+                    Logger::default_logger().warn("ImageManager", "Skipping image not in assigned OS images directory: " + p.string());
+                    continue;
+                }
+            }
         }
 
         ImageId id = id_str.empty() ? ImageId(p.stem().string()) : ImageId(id_str);
@@ -395,6 +452,19 @@ Result<ManagedImageInfo> ImageManager::import_image(
 
     if (!std::filesystem::exists(real_path, ec)) {
         return Error(ErrorCode::StorageFailure, "Image file not found: " + file_path.string());
+    }
+
+    if (is_writeback_or_swap_disk(real_path)) {
+        return Error(ErrorCode::StorageFailure, "Differential writeback and temporary swap disks cannot be imported as base images: " + real_path.filename().string());
+    }
+
+    if (role == ImageRole::OsImage && storage_manager_ && !os_images_dir_.empty()) {
+        auto canon_target = std::filesystem::weakly_canonical(real_path, ec);
+        auto canon_base = std::filesystem::weakly_canonical(os_images_dir_, ec);
+        auto rel = std::filesystem::relative(canon_target, canon_base, ec);
+        if (ec || rel.empty() || rel.string().starts_with("..")) {
+            return Error(ErrorCode::StorageFailure, "Image path outside os_images_dir is not permitted: " + real_path.string());
+        }
     }
 
     // Verify file can be opened via CreateFile / ifstream before proceeding
@@ -445,9 +515,6 @@ Result<ManagedImageInfo> ImageManager::import_image(
         }
     }
 
-    // Automated inspection and PNP driver arming routine for diskless VHD images
-    (void)PnpDriverArmer::ensure_image_armed(real_path);
-
     auto open_res = GoldenImage::open(real_path, effective_id, ram_cache_bytes);
     if (!open_res.is_ok()) {
         return open_res.error();
@@ -479,7 +546,7 @@ Result<ManagedImageInfo> ImageManager::import_image(
     // Keys in images_:
     // When storing aliases in images_, the KEY can be the stem ("default_os"),
     // but the stored ManagedImageInfo object's file_path MUST remain the full
-    // canonical path with extension (e.g. "C:\Users\Admin\Desktop\default_os.vhd").
+    // canonical path with extension (e.g. "C:\images\default_os.vhd").
     std::string p_fwd = real_path.string();
     std::string p_back = p_fwd;
     std::replace(p_back.begin(), p_back.end(), '/', '\\');
@@ -529,8 +596,14 @@ Result<void> ImageManager::remove_image(const ImageId& id, bool delete_file_on_d
 
     if (delete_file_on_disk) {
         std::error_code ec;
-        if (!std::filesystem::remove(p, ec)) {
-            return Error(ErrorCode::StorageFailure, "Failed to delete image file on disk: " + ec.message());
+        const bool existed = std::filesystem::exists(p, ec) && !ec;
+        // Master images carry FILE_ATTRIBUTE_READONLY; Windows refuses to
+        // delete them until the attribute is cleared.
+        if (!force_remove_file(p) || (existed && std::filesystem::exists(p, ec) && !ec)) {
+            return Error(ErrorCode::StorageFailure, "Failed to delete image file on disk: " + p.string());
+        }
+        if (!existed) {
+            return Error(ErrorCode::StorageFailure, "Failed to delete image file on disk: file not found");
         }
     }
 
@@ -796,6 +869,22 @@ Result<void> ImageManager::release_image(const ImageId& id) {
     return release_image(id.value());
 }
 
+bool ImageManager::has_image(const ImageId& id) const {
+    return has_image(id.value());
+}
+
+bool ImageManager::has_image(const std::string& key) const {
+    if (key.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (managed_images_.find(ImageId(key)) != managed_images_.end()) return true;
+    if (images_.find(key) != images_.end()) return true;
+    std::string fn = std::filesystem::path(key).filename().string();
+    if (images_.find(fn) != images_.end()) return true;
+    std::string st = std::filesystem::path(key).stem().string();
+    if (images_.find(st) != images_.end()) return true;
+    return false;
+}
+
 Result<ManagedImageInfo> ImageManager::get_image_info(const ImageId& id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = managed_images_.find(id);
@@ -857,6 +946,41 @@ StorageUsageReport ImageManager::get_storage_usage() const {
     }
 
     return report;
+}
+
+void ImageManager::set_os_images_dir(const std::filesystem::path& dir) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    os_images_dir_ = dir;
+    clear_role_images_locked(ImageRole::OsImage);
+}
+
+void ImageManager::clear_role_images(ImageRole role) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    clear_role_images_locked(role);
+}
+
+void ImageManager::clear_role_images_locked(ImageRole role) {
+    std::vector<ImageId> to_remove;
+    for (const auto& [id, info] : managed_images_) {
+        if (info.role == role) {
+            to_remove.push_back(id);
+        }
+    }
+    for (const auto& id : to_remove) {
+        auto it = managed_images_.find(id);
+        if (it != managed_images_.end()) {
+            std::string p_str = it->second.file_path.string();
+            images_.erase(p_str);
+            images_.erase(it->second.file_path.filename().string());
+            images_.erase(it->second.file_path.stem().string());
+            images_.erase(id.value());
+            (void)registry_->unregister_image(id);
+            managed_images_.erase(it);
+        }
+    }
+    if (role == ImageRole::OsImage) {
+        default_os_image_id_.clear();
+    }
 }
 
 } // namespace cobdiskless

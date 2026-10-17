@@ -47,6 +47,8 @@ static_assert(sizeof(IscsiBhs) == 48, "IscsiBhs must be exactly 48 bytes");
 enum class ScsiOpcode : uint8_t {
     TestUnitReady = 0x00,
     RequestSense = 0x03,
+    Read6 = 0x08,
+    Write6 = 0x0A,
     Inquiry = 0x12,
     ModeSense6 = 0x1A,
     ReadCapacity10 = 0x25,
@@ -145,11 +147,51 @@ public:
     static Result<std::vector<uint8_t>> handle_read_capacity16(uint64_t total_sectors, uint32_t sector_size);
     static Result<std::vector<uint8_t>> handle_report_luns(const ClientSession* session, uint32_t alloc_len = 16384);
     static Result<std::vector<uint8_t>> handle_mode_sense(const uint8_t* cdb);
-    static Result<std::vector<uint8_t>> handle_request_sense();
+    static Result<std::vector<uint8_t>> handle_request_sense(uint8_t sense_key = 0x00, uint8_t asc = 0x00);
+
+    // RFC 3720 Section 10.12: Extract 6-byte ISID from BHS (bytes 8..13)
+    [[nodiscard]] static uint64_t extract_isid(const IscsiBhs& bhs) noexcept {
+        const auto* p = reinterpret_cast<const uint8_t*>(&bhs.lun);
+        uint64_t isid = 0;
+        for (int i = 0; i < 6; ++i) {
+            isid = (isid << 8) | p[i];
+        }
+        return isid;
+    }
 
     // RFC 3720 Text parameter helpers
     static std::unordered_map<std::string, std::string> parse_text_parameters(std::span<const uint8_t> data);
-    static std::vector<uint8_t> build_login_response_parameters(const std::unordered_map<std::string, std::string>& req_params);
+    /**
+     * @brief Builds the key=value text payload of a Login Response.
+     *
+     * The payload is deliberately narrow, and exactly one key is unconditional:
+     * TargetPortalGroupTag. RFC 3720 5.3.1 / 12.9 require the target to return
+     * it in the first Login Response to a Login Request with the C bit clear
+     * whenever the initiator gave a TargetName -- and Microsoft's initiator
+     * treats its absence as a malformed Login Response.
+     *
+     * The security stage (CSG=0) answers with TargetPortalGroupTag and
+     * AuthMethod and nothing else. TargetName is never echoed from any stage:
+     * RFC 3720 12.4 states "TargetName MUST not be redeclared within the login
+     * phase", Appendix C's login examples never show a target returning it,
+     * and it is the *initiator's* declaration -- the confirmation the RFC
+     * asks for is the portal group tag, not a second copy of the IQN.
+     * InitiatorName is likewise never echoed: it belongs to the initiator.
+     *
+     * @param req_params   the initiator's proposed keys for this PDU.
+     * @param stage        the CSG of the exchange (0 = SecurityNegotiation,
+     *                     1 = LoginOperationalNegotiation). It gates both
+     *                     halves of the payload: the operational key block
+     *                     never appears in stage 0 (RFC 3720 Chapter 12) and
+     *                     AuthMethod never appears in stage 1 (RFC 3720
+     *                     5.3.2/5.3.3 -- it is a Chapter 11 key).
+     * @param final_accept true when the response transits to Full Feature
+     *                     Phase, i.e. it carries the whole negotiated set.
+     */
+    static std::vector<uint8_t> build_login_response_parameters(
+        const std::unordered_map<std::string, std::string>& req_params,
+        uint8_t stage,
+        bool final_accept);
 
     /**
      * @brief Dispatches a block read request to a client's LUN block device (LUN 0 COW OS or LUN 1 Game).
@@ -189,10 +231,16 @@ public:
     // deliberately hands both connections the SAME ClientSession object, so the
     // session may only be torn down once the LAST of those connections goes
     // away. Tearing it down from whichever connection happens to close first
-    // calls CowBlockDevice::close()/purge_overlay() and ImageManager::
+    // calls UnifiedCowDevice::close()/purge_overlay() and ImageManager::
     // release_image() underneath the surviving connection, which then fails
     // every subsequent READ -- INACCESSIBLE_BOOT_DEVICE (0x7B).
     //
+    // Retire the socket a session is being taken away from during a
+    // reinstatement. Wakes the owner so it can release its own handle and its
+    // own connection reference; never closes or unregisters it itself. Returns
+    // true when a live handle was actually woken.
+    [[nodiscard]] bool retire_stale_socket(uintptr_t old_sock, uintptr_t keep_sock);
+
     // Each call returns the connection count for that session after the update.
     [[nodiscard]] int retain_session_connection(const std::shared_ptr<ClientSession>& session);
     [[nodiscard]] int release_session_connection(const std::shared_ptr<ClientSession>& session);
@@ -224,6 +272,13 @@ private:
     mutable std::mutex stage_mutex_;
     std::unordered_set<std::string> logged_lun0_;
     std::unordered_map<std::string, uint32_t> client_boot_stage_;
+    // Per-client "already reported this once" bits, guarded by stage_mutex_
+    // like the two containers above.
+    std::unordered_map<std::string, uint32_t> first_log_flags_;
+
+    // RFC 3720 Section 5.3.5 Session Reinstatement tracking by (InitiatorName, ISID)
+    mutable std::mutex reinstatement_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<ClientSession>> sessions_by_isid_;
 
     // --- Per-connection worker lifecycle -------------------------------------
     // Workers are never std::thread::detach()ed: an accepted connection gets a
@@ -265,6 +320,17 @@ private:
 
     void run_accept_loop();
     void handle_client_connection(uintptr_t client_sock, NetworkAddress client_ip);
+
+    /**
+     * @brief Set @p bit for @p client_id, reporting whether this is the first time.
+     *
+     * Boot stages 13/15/16 describe *every* SCSI command rather than a
+     * one-off transition, so logging them unconditionally emits a line per
+     * sector -- tens of thousands during a single boot. The first command of a
+     * kind is kept at INFO as the stage milestone; every repetition after it
+     * is left for the caller to demote to TRACE.
+     */
+    [[nodiscard]] bool mark_log_once(const std::string& client_id, uint32_t bit);
 };
 
 } // namespace cobdiskless
