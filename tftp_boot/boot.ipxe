@@ -4,4 +4,6 @@ set busloc ${net0/busloc}
 set ven ${pci/${busloc}.0.2:hex}
 set dev ${pci/${busloc}.2.2:hex}
 set rev ${pci/${busloc}.8.1:hex}
-chain http://${next-server}:18080/boot.ipxe?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&platform=${platform} || chain http://192.168.1.99:18080/boot.ipxe?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&platform=${platform}
+set subven ${pci/${busloc}.0x2c.2:hex}
+set subdev ${pci/${busloc}.0x2e.2:hex}
+chain http://${next-server}:18080/boot.ipxe?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&platform=${platform} || chain http://192.168.1.99:18080/boot.ipxe?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&platform=${platform}

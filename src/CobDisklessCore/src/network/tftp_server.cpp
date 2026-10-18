@@ -170,8 +170,14 @@ std::string TftpServer::generate_ipxe_script(const std::string& target_iqn) cons
     // and SUBSYS device (config 0x2E). The server concatenates them into
     // SUBSYS_<subdev><subven> (Windows order) and zero-pads, so the raw
     // iPXE hex spelling needs no padding here.
-    ss << "set subven ${pci/${busloc}.2c.2:hex}\n";
-    ss << "set subdev ${pci/${busloc}.2e.2:hex}\n";
+    // NB: the 0x prefix is REQUIRED. iPXE parses a setting name with
+    // strtoul(..., 0) (settings.c parse_setting_tag), so a bare "2c" is read as
+    // a base-10 number, fails to parse, and the setting silently resolves empty.
+    // Verified on QEMU: "${pci/${busloc}.2c.2:hex}" -> "" while
+    // "${pci/${busloc}.0x2c.2:hex}" -> the real SUBSYS value. The 0x2c form was
+    // in place since this function was written and never once returned data.
+    ss << "set subven ${pci/${busloc}.0x2c.2:hex}\n";
+    ss << "set subdev ${pci/${busloc}.0x2e.2:hex}\n";
     ss << "chain http://" << srv << ":18080/boot.ipxe?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&platform=${platform}\n";
     return ss.str();
 }
