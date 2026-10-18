@@ -9,6 +9,10 @@
 #include "CobDisklessCore/storage/random_access_file.hpp"
 #include "CobDisklessCore/image/image_format.hpp"
 
+extern "C" {
+struct MVHDMeta;
+}
+
 namespace cobdiskless {
 
 /**
@@ -126,6 +130,7 @@ private:
     std::vector<uint32_t> bat_; // Block Allocation Table (sector offsets)
     uint32_t bitmap_sectors_{0};
     bool read_only_{true};
+    ::MVHDMeta* vhdm_{nullptr};
 
     [[nodiscard]] static bool verify_footer_checksum(const uint8_t* footer_bytes);
 };

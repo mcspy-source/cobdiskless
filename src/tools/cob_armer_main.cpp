@@ -129,6 +129,30 @@ std::vector<std::string> unmet_arming(const HiveInspectionReport& report) {
                 break;
             }
         }
+        // Rows the arming pass demotes rather than arms: their ImagePath names
+        // a .sys this image does not carry, so Start = 3 is the correct end
+        // state and a Start = 0 there would be a boot driver the SCM cannot
+        // load. No drivers directory in view means nothing is gated.
+        const std::string image_path = RegBootStart::service_image_path(spec);
+        const std::string binary = image_path.substr(image_path.find_last_of("\\/") + 1);
+        const std::filesystem::path drivers_dir = RegBootStart::staged_drivers_dir(
+            report.volume_path.empty() ? report.hive_path : report.volume_path);
+        const bool staged = drivers_dir.empty() ||
+                            RegBootStart::staged_binary_present(drivers_dir, binary);
+        if (!staged) {
+            if (state != nullptr && state->present) {
+                // Present at a non-zero Start is the demoted end state the
+                // arming pass aims for; present at Start = 0 is the stale one.
+                if (state->has_start && state->start == 0) {
+                    gaps.push_back(std::string(spec.service) + ": Start is 0 but " + binary +
+                                   " is not staged on this image (should be Start = 3)");
+                }
+            } else if (spec.required) {
+                gaps.push_back(std::string(spec.service) + ": required by the boot path but " +
+                               binary + " is not staged on this image");
+            }
+            continue;
+        }
         if (state == nullptr || !state->present) {
             if (spec.required) {
                 gaps.push_back(std::string(spec.service) + ": required by the boot path but not "

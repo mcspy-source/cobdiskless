@@ -2,11 +2,11 @@
   "images": [
     {
       "id": "csmw10",
-      "path": "./images/csmw10.VHD",
+      "path": "G:\\csmw10.VHD",
       "role": "OsImage",
       "format": "VHD (Dynamic)",
       "virtual_size_bytes": 500107862016,
-      "file_size_bytes": 4341023232,
+      "file_size_bytes": 4332632576,
       "boot_mode": "Legacy BIOS",
       "partition_scheme": "MBR"
     }

@@ -12,7 +12,7 @@
 #include <filesystem>
 #include "CobDisklessCore/types/network_address.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
-#include "CobDisklessCore/storage/cow_block_device.hpp"
+#include "CobDisklessCore/storage/unified_cow_device.hpp"
 #include "CobDisklessCore/storage/tiered_storage_engine.hpp"
 #include "CobDisklessCore/errors/result.hpp"
 
@@ -54,16 +54,16 @@ public:
         ClientId id,
         NetworkAddress ip,
         ImageId os_image_id = ImageId("default"),
-        std::shared_ptr<CowBlockDevice> cow_device = nullptr
+        std::shared_ptr<UnifiedCowDevice> cow_device = nullptr
     );
 
     void init_cow_cluster_map(uint64_t total_sectors) {
+        // Historical session-side cluster map. The writeback engine now owns
+        // its own allocation table inside the .cow file, so nothing is bound
+        // into the device any more; the map is kept for diagnostics/tests.
         uint64_t total_clusters = (total_sectors + 127) / 128;
         cow_cluster_map.assign(total_clusters, 0xFFFFFFFF);
         next_free_cluster.store(0);
-        if (cow_device_) {
-            cow_device_->bind_session(&cow_cluster_map, &next_free_cluster);
-        }
     }
 
     [[nodiscard]] const ClientId& id() const noexcept { return id_; }
@@ -72,8 +72,8 @@ public:
     [[nodiscard]] ClientState state() const noexcept { return state_; }
     void set_state(ClientState s) noexcept { state_ = s; }
 
-    [[nodiscard]] std::shared_ptr<CowBlockDevice> cow_device() const noexcept { return cow_device_; }
-    [[nodiscard]] std::shared_ptr<CowBlockDevice> cow_block_device() const noexcept { return cow_device_; }
+    [[nodiscard]] std::shared_ptr<UnifiedCowDevice> cow_device() const noexcept { return cow_device_; }
+    [[nodiscard]] std::shared_ptr<UnifiedCowDevice> cow_block_device() const noexcept { return cow_device_; }
     [[nodiscard]] std::shared_ptr<BlockDevice> game_device() const noexcept { return game_device_; }
     void set_game_device(std::shared_ptr<BlockDevice> dev) noexcept;
 
@@ -119,7 +119,7 @@ public:
 
     /**
      * @brief The shared read-only golden image this session was created from.
-     *        Super Client direct mode temporarily swaps the CowBlockDevice's
+     *        Super Client direct mode temporarily swaps the UnifiedCowDevice's
      *        base for an exclusive read-write backend; terminating the session
      *        re-attaches this handle so the shared read-only pool resumes.
      */
@@ -136,6 +136,20 @@ public:
 
     [[nodiscard]] std::chrono::steady_clock::time_point last_scsi_time() const noexcept { return last_scsi_time_; }
     void set_last_scsi_time(std::chrono::steady_clock::time_point t) noexcept { last_scsi_time_ = t; }
+
+    // Restart this session's idle clock.
+    //
+    // Called at the one moment a TCP connection adopts a session that already
+    // exists: the RFC 3720 5.3.5 reinstatement, the IP-keyed fallback, and
+    // resolve_session(). The silence before that point belongs to the socket
+    // being replaced -- msiscsi logging in ~112s after iPXE went quiet must not
+    // inherit those 112 seconds, or the idle watchdog reads the new connection
+    // as "idle for 112538ms" and closes it a few hundred milliseconds after the
+    // login completed, leaving the initiator spinning on unacknowledged I/O.
+    void note_connection_bound() noexcept {
+        last_scsi_time_ = std::chrono::steady_clock::now();
+        watchdog_warned_ = false;
+    }
 
     [[nodiscard]] uint64_t last_active_lba() const noexcept { return last_lba_; }
     [[nodiscard]] uint32_t last_active_sectors() const noexcept { return last_sectors_; }
@@ -180,6 +194,18 @@ public:
     [[nodiscard]] uintptr_t active_socket() const noexcept { return active_socket_.load(std::memory_order_relaxed); }
     void set_active_socket(uintptr_t sock) noexcept { active_socket_.store(sock, std::memory_order_release); }
 
+    // Drop this connection's claim on `sock`, but only while the claim still
+    // *is* this connection's. Between the read and the write another thread may
+    // have reinstated the session onto a replacement socket; a plain store
+    // would clobber that new claim and the next reinstatement would then
+    // retire (shutdown) a handle belonging to somebody else's connection.
+    bool release_active_socket(uintptr_t sock) noexcept {
+        uintptr_t expected = sock;
+        return active_socket_.compare_exchange_strong(expected, ~static_cast<uintptr_t>(0),
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_relaxed);
+    }
+
     [[nodiscard]] uint32_t exp_cmd_sn() const noexcept { return exp_cmd_sn_.load(std::memory_order_relaxed); }
     void set_exp_cmd_sn(uint32_t sn) noexcept { exp_cmd_sn_.store(sn, std::memory_order_release); }
 
@@ -195,6 +221,16 @@ public:
         return std::chrono::duration_cast<std::chrono::seconds>(now - disconnect_time_).count() < grace_sec;
     }
 
+    Result<void> ensure_storage_ready() noexcept {
+        if (tiered_device_) {
+            (void)tiered_device_->reopen();
+        }
+        if (cow_device_ && !cow_device_->is_open() && !cow_device_->writeback_path().empty()) {
+            (void)cow_device_->open(cow_device_->writeback_path());
+        }
+        return {};
+    }
+
     [[nodiscard]] Result<void> reset() noexcept;
 
 private:
@@ -204,7 +240,7 @@ private:
     std::filesystem::path physical_image_path_;
     std::shared_ptr<GoldenImage> base_image_;
     ClientState state_{ClientState::Booting};
-    std::shared_ptr<CowBlockDevice> cow_device_;
+    std::shared_ptr<UnifiedCowDevice> cow_device_;
     std::shared_ptr<TieredBlockDevice> tiered_device_;
     std::shared_ptr<BlockDevice> game_device_;
     uint64_t bytes_read_{0};

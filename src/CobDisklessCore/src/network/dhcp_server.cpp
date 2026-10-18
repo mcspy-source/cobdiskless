@@ -19,11 +19,54 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #endif
 
 namespace cobdiskless {
 
 namespace {
+
+#if defined(_WIN32)
+void broadcast_packet_all_adapters(const uint8_t* data, size_t size, uint16_t port) {
+    ULONG buf_len = 16384;
+    std::vector<uint8_t> buf(buf_len);
+    auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    ULONG rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr, adapters, &buf_len);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(buf_len);
+        adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr, adapters, &buf_len);
+    }
+    if (rc != NO_ERROR) return;
+
+    for (const IP_ADAPTER_ADDRESSES* a = adapters; a != nullptr; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (const IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
+            if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            const auto* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
+            if (sin->sin_addr.s_addr == 0 || sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) continue;
+
+            SOCKET ts = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (ts != INVALID_SOCKET) {
+                int bcast = 1;
+                setsockopt(ts, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
+                sockaddr_in bind_a{};
+                bind_a.sin_family = AF_INET;
+                bind_a.sin_addr = sin->sin_addr;
+                bind_a.sin_port = 0;
+                if (bind(ts, (sockaddr*)&bind_a, sizeof(bind_a)) == 0) {
+                    sockaddr_in dst{};
+                    dst.sin_family = AF_INET;
+                    dst.sin_port = htons(port);
+                    dst.sin_addr.s_addr = INADDR_BROADCAST;
+                    sendto(ts, reinterpret_cast<const char*>(data), static_cast<int>(size), 0, (sockaddr*)&dst, sizeof(dst));
+                }
+                closesocket(ts);
+            }
+        }
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Wire telemetry.
@@ -700,13 +743,13 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
         // client does not report a recognized architecture (ClientArch::Unknown).
         //
         // Mapping:
-        //   Arch 0  (Bios_x86)     -> undionly.kpxe
-        //   Arch 6  (Efi_x86)      -> ipxe32.efi (or ipxe.efi fallback)
-        //   Arch 7  (Efi_x64)      -> ipxe.efi
-        //   Arch 9  (Efi_Ebc)      -> ipxe.efi
-        //   Arch 10 (Efi_Arm32)    -> ipxe.efi (no ARM32 build typically available)
-        //   Arch 11 (Efi_Arm64)    -> ipxe-arm64.efi (or ipxe.efi fallback)
-        //   Unknown                 -> station config or UEFI default (ipxe.efi)
+        //   Arch 0  (Bios_x86)     -> cobpxe.kpxe
+        //   Arch 6  (Efi_x86)      -> ipxe32.efi (or cobpxe.efi fallback)
+        //   Arch 7  (Efi_x64)      -> cobpxe.efi
+        //   Arch 9  (Efi_Ebc)      -> cobpxe.efi
+        //   Arch 10 (Efi_Arm32)    -> cobpxe.efi (no ARM32 build typically available)
+        //   Arch 11 (Efi_Arm64)    -> ipxe-arm64.efi (or cobpxe.efi fallback)
+        //   Unknown                -> station config or UEFI default (cobpxe.efi)
 
         std::string station_mode;
         std::string uefi_override;
@@ -732,27 +775,27 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
         // For UEFI architectures, allow station uefi_bootloader override if configured.
         switch (options.client_arch) {
             case ClientArch::Bios_x86: { // ARCH 0 - BIOS x86 / CSM
-                bootfile = "undionly.kpxe";
+                bootfile = file_exists("cobpxe.kpxe") ? "cobpxe.kpxe" : (file_exists("undionly.kpxe") ? "undionly.kpxe" : "cobpxe.kpxe");
                 break;
             }
             case ClientArch::Efi_x86: { // ARCH 6 - IA32 UEFI
-                bootfile = file_exists("ipxe32.efi") ? "ipxe32.efi" : "ipxe.efi";
+                bootfile = file_exists("ipxe32.efi") ? "ipxe32.efi" : "cobpxe.efi";
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
             case ClientArch::Efi_x64: // ARCH 7 - x64 UEFI
             case ClientArch::Efi_Ebc: { // ARCH 9 - EBC UEFI
-                bootfile = "ipxe.efi";
+                bootfile = file_exists("cobpxe.efi") ? "cobpxe.efi" : (file_exists("ipxe.efi") ? "ipxe.efi" : "cobpxe.efi");
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
             case ClientArch::Efi_Arm32: { // ARCH 10 - ARM32 UEFI
-                bootfile = "ipxe.efi"; // No standard ARM32 iPXE build; fallback to x64 EFI
+                bootfile = "cobpxe.efi"; // No standard ARM32 iPXE build; fallback to x64 EFI
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
             case ClientArch::Efi_Arm64: { // ARCH 11 - ARM64 UEFI
-                bootfile = file_exists("ipxe-arm64.efi") ? "ipxe-arm64.efi" : "ipxe.efi";
+                bootfile = file_exists("ipxe-arm64.efi") ? "ipxe-arm64.efi" : "cobpxe.efi";
                 if (!uefi_override.empty()) bootfile = uefi_override;
                 break;
             }
@@ -773,11 +816,11 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
                                                                 : arch_is_uefi;
 
                 if (!is_uefi) {
-                    bootfile = "undionly.kpxe";
+                    bootfile = file_exists("cobpxe.kpxe") ? "cobpxe.kpxe" : (file_exists("undionly.kpxe") ? "undionly.kpxe" : "cobpxe.kpxe");
                 } else if (!uefi_override.empty()) {
                     bootfile = uefi_override;
                 } else {
-                    bootfile = "ipxe.efi";
+                    bootfile = file_exists("cobpxe.efi") ? "cobpxe.efi" : (file_exists("ipxe.efi") ? "ipxe.efi" : "cobpxe.efi");
                 }
                 break;
             }
@@ -984,6 +1027,16 @@ Result<std::vector<uint8_t>> DhcpServer::build_reply(
         } else {
             lease.first_seen = it_l->second.first_seen;
         }
+        if (options.client_arch != ClientArch::Unknown) {
+            lease.client_arch = options.client_arch;
+        } else if (it_l != leases_by_mac_.end() && it_l->second.client_arch != ClientArch::Unknown) {
+            lease.client_arch = it_l->second.client_arch;
+        }
+        if (!bootfile.empty()) {
+            lease.bootfile_name = bootfile;
+        } else if (it_l != leases_by_mac_.end() && !it_l->second.bootfile_name.empty()) {
+            lease.bootfile_name = it_l->second.bootfile_name;
+        }
         leases_by_mac_[options.client_mac] = lease;
         mac_to_ip_leases_[options.client_mac] = assigned_ip;
     }
@@ -1021,6 +1074,32 @@ std::optional<std::string> DhcpServer::find_mac_by_ip(const NetworkAddress& ip) 
     for (const auto& [mac, leased_ip] : mac_to_ip_leases_) {
         if (leased_ip == ip) {
             return mac;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ClientArch> DhcpServer::find_client_arch_by_ip(const NetworkAddress& ip) const noexcept {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    for (const auto& [mac, leased_ip] : mac_to_ip_leases_) {
+        if (leased_ip == ip) {
+            auto it = leases_by_mac_.find(mac);
+            if (it != leases_by_mac_.end() && it->second.client_arch != ClientArch::Unknown) {
+                return it->second.client_arch;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> DhcpServer::find_bootfile_by_ip(const NetworkAddress& ip) const noexcept {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    for (const auto& [mac, leased_ip] : mac_to_ip_leases_) {
+        if (leased_ip == ip) {
+            auto it = leases_by_mac_.find(mac);
+            if (it != leases_by_mac_.end() && !it->second.bootfile_name.empty()) {
+                return it->second.bootfile_name;
+            }
         }
     }
     return std::nullopt;
@@ -1656,6 +1735,9 @@ void DhcpServer::run_packet_loop() {
                             subnet_addr.sin_addr.s_addr = htonl(subnet_bcast_u32);
                             sendto(s, reinterpret_cast<const char*>(nak_bytes.data()), nak_bytes.size(), 0,
                                    (sockaddr*)&subnet_addr, sizeof(subnet_addr));
+#if defined(_WIN32)
+                            broadcast_packet_all_adapters(nak_bytes.data(), nak_bytes.size(), 68);
+#endif
                         }
                         Logger::default_logger().info("BOOT", "[BOOT STAGE 3.5] DHCP NAK sent: MAC=" + opts.client_mac +
                                                      " Rejected-IP=" + candidate_ip.ip_string() +
@@ -1775,6 +1857,10 @@ void DhcpServer::run_packet_loop() {
                     pc_name = st_opt->name;
                     have_ip = true;
                     static_bound = true;
+                    {
+                        std::lock_guard<std::mutex> lock(lease_mutex_);
+                        mac_to_ip_leases_[opts.client_mac] = lease_ip;
+                    }
                     Logger::default_logger().info(
                         "DHCP",
                         "[DHCP] Static station binding: MAC=" + opts.client_mac + " (" + st_opt->name +
@@ -2006,6 +2092,14 @@ void DhcpServer::run_packet_loop() {
                             lease.pc_name = it_l->second.pc_name;
                         }
                     }
+                    if (opts.client_arch != ClientArch::Unknown) {
+                        lease.client_arch = opts.client_arch;
+                    } else if (it_l != leases_by_mac_.end() && it_l->second.client_arch != ClientArch::Unknown) {
+                        lease.client_arch = it_l->second.client_arch;
+                    }
+                    if (it_l != leases_by_mac_.end() && !it_l->second.bootfile_name.empty()) {
+                        lease.bootfile_name = it_l->second.bootfile_name;
+                    }
                     leases_by_mac_[opts.client_mac] = lease;
                     mac_to_ip_leases_[opts.client_mac] = lease_ip;
                 }
@@ -2086,6 +2180,9 @@ void DhcpServer::run_packet_loop() {
                             int err = WSAGetLastError();
                             Logger::default_logger().error("DhcpServer", "sendto(subnet_bcast:68) failed (WSA: " + std::to_string(err) + ")");
                         }
+#if defined(_WIN32)
+                        broadcast_packet_all_adapters(reply_bytes.data(), reply_bytes.size(), 68);
+#endif
 
                         // 3. Unicast to client lease IP on port 68 (for DHCPACK)
                         if (reply_type == 5) {

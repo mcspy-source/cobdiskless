@@ -12,7 +12,8 @@
 #include <cstring>
 
 #include "CobDisklessCore/storage/block_device.hpp"
-#include "CobDisklessCore/storage/cow_block_device.hpp"
+#include "CobDisklessCore/storage/unified_cow_device.hpp"
+#include "CobDisklessCore/storage/l1l2_cow_device.hpp"
 #include "CobDisklessCore/storage/vhdx_image_backend.hpp"
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
 #include "CobDisklessCore/errors/result.hpp"
@@ -36,7 +37,7 @@ public:
     TieredBlockDevice(
         std::shared_ptr<BlockDevice> layer0_base,
         std::shared_ptr<BlockDevice> layer1_hardware = nullptr,
-        std::shared_ptr<CowBlockDevice> layer2_session = nullptr
+        std::shared_ptr<BlockDevice> layer2_session = nullptr
     );
     ~TieredBlockDevice() override = default;
 
@@ -47,18 +48,23 @@ public:
     [[nodiscard]] Result<size_t> write(uint64_t offset, std::span<const std::byte> source) override;
     [[nodiscard]] Result<size_t> write_blocks(uint64_t start_block, uint32_t count, std::span<const std::byte> source);
     [[nodiscard]] Result<void> flush() override;
+    void close() noexcept;
+    void open() noexcept { is_open_.store(true, std::memory_order_release); }
+    [[nodiscard]] Result<void> reopen() noexcept;
+    [[nodiscard]] bool is_open() const noexcept { return is_open_.load(std::memory_order_acquire); }
 
     [[nodiscard]] uint64_t size() const noexcept override;
     [[nodiscard]] uint32_t block_size() const noexcept override;
     [[nodiscard]] bool is_read_only() const noexcept override { return false; }
 
+
     // Layer Accessors
     [[nodiscard]] std::shared_ptr<BlockDevice> layer0_base() const noexcept;
     [[nodiscard]] std::shared_ptr<BlockDevice> layer1_hardware() const noexcept;
-    [[nodiscard]] std::shared_ptr<CowBlockDevice> layer2_session() const noexcept;
+    [[nodiscard]] std::shared_ptr<BlockDevice> layer2_session() const noexcept;
 
     void set_layer1_hardware(std::shared_ptr<BlockDevice> dev) noexcept;
-    void set_layer2_session(std::shared_ptr<CowBlockDevice> dev) noexcept;
+    void set_layer2_session(std::shared_ptr<BlockDevice> dev) noexcept;
 
     // Admin Hardware Capture Mode
     void set_admin_capture_mode(bool capture) noexcept { admin_capture_mode_.store(capture, std::memory_order_release); }
@@ -78,8 +84,9 @@ public:
 private:
     std::shared_ptr<BlockDevice> layer0_base_;
     std::shared_ptr<BlockDevice> layer1_hardware_;
-    std::shared_ptr<CowBlockDevice> layer2_session_;
+    std::shared_ptr<BlockDevice> layer2_session_;
 
+    std::atomic<bool> is_open_{true};
     std::atomic<bool> admin_capture_mode_{false};
     mutable std::shared_mutex mutex_;
 

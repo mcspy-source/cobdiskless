@@ -70,7 +70,7 @@ ClientSession::ClientSession(
     ClientId id,
     NetworkAddress ip,
     ImageId os_image_id,
-    std::shared_ptr<CowBlockDevice> cow_device
+    std::shared_ptr<UnifiedCowDevice> cow_device
 ) : id_(std::move(id)),
     ip_(ip),
     os_image_id_(std::move(os_image_id)),
@@ -80,9 +80,6 @@ ClientSession::ClientSession(
     if (total_clusters == 0) total_clusters = 1024;
     cow_cluster_map.assign(total_clusters, 0xFFFFFFFF);
     next_free_cluster.store(0);
-    if (cow_device_) {
-        cow_device_->bind_session(&cow_cluster_map, &next_free_cluster);
-    }
 }
 
 void ClientSession::set_game_device(std::shared_ptr<BlockDevice> dev) noexcept {
@@ -367,13 +364,42 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
     auto wb_path = overlay_naming::resolve_writeback_overlay(effective_wb_dir,
                                                              client_id.value());
 
-    auto cow_res = CowBlockDevice::create(golden_img->device(), wb_path, 4096, client_id.value());
+    // For anonymous IP sessions or stale IP-keyed overlays from previous crashes,
+    // unconditionally purge the IP overlay to prevent dirty chunk reloading.
+    if (!is_super) {
+        std::error_code ec_rem;
+        if (client_id.value().rfind("ip_", 0) == 0) {
+            if (std::filesystem::exists(wb_path, ec_rem)) {
+                std::filesystem::remove(wb_path, ec_rem);
+                Logger::default_logger().info("SESSION",
+                    "[COW] Purged stale anonymous IP writeback overlay: " + wb_path.string());
+            }
+        }
+        if (!client_ip.is_any()) {
+            std::vector<std::filesystem::path> alt_dirs = {
+                effective_wb_dir,
+                "E:\\writeback",
+                "E:\\",
+                "./writeback"
+            };
+            for (const auto& ad : alt_dirs) {
+                std::filesystem::path ip_cow = ad / ("wb_ip_" + client_ip.ip_string() + ".cow");
+                if (ip_cow != wb_path && std::filesystem::exists(ip_cow, ec_rem)) {
+                    std::filesystem::remove(ip_cow, ec_rem);
+                    Logger::default_logger().info("SESSION",
+                        "[COW] Purged stale IP writeback overlay: " + ip_cow.string());
+                }
+            }
+        }
+    }
+
+    auto cow_res = UnifiedCowDevice::create(golden_img->device(), wb_path, 4096, client_id.value());
     if (!cow_res.is_ok()) {
         // Crash / corruption recovery: quarantine corrupted file and retry with a clean one
         Logger::default_logger().warn("SESSION",
             "[COW] Overlay open failed (" + cow_res.error().to_string() + "), attempting quarantine recovery for " + wb_path.string());
-        (void)CowBlockDevice::quarantine_corrupted_overlay(wb_path);
-        cow_res = CowBlockDevice::create(golden_img->device(), wb_path, 4096, client_id.value());
+        (void)UnifiedCowDevice::quarantine_corrupted_overlay(wb_path);
+        cow_res = UnifiedCowDevice::create(golden_img->device(), wb_path, 4096, client_id.value());
         if (!cow_res.is_ok()) {
             // Fail closed: without a writable overlay the boot must stop here.
             // There is deliberately no fallback to writing the base image --
@@ -387,7 +413,7 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
         }
     }
 
-    std::shared_ptr<CowBlockDevice> cow = cow_res.value();
+    std::shared_ptr<UnifiedCowDevice> cow = cow_res.value();
     if (writeback_quota_bytes_ > 0) {
         cow->set_writeback_quota(writeback_quota_bytes_);
     }
@@ -404,48 +430,15 @@ Result<std::shared_ptr<ClientSession>> ClientSessionManager::get_or_create_sessi
     session->set_physical_image_path(golden_img->path());
     session->set_base_image(golden_img);
 
-    // Multi-Tier Storage Engine: Layer 1 (Machine Hardware Profile) resolution
-    std::shared_ptr<BlockDevice> hw_device = nullptr;
-    std::filesystem::path hw_path;
-    std::string safe_cid = overlay_naming::sanitize_mac(client_id.value());
-
-    std::vector<std::filesystem::path> hw_candidates = {
-        effective_wb_dir / ("hw_" + safe_cid + ".vhdx"),
-        effective_wb_dir / ("hw_" + safe_cid + ".vhd"),
-        effective_wb_dir / ("hw_" + safe_cid + ".cow"),
-        effective_wb_dir / "hardware_profiles" / ("hw_" + safe_cid + ".vhdx"),
-        effective_wb_dir / "hardware_profiles" / ("hw_" + safe_cid + ".vhd"),
-        effective_wb_dir / "hardware_profiles" / ("hw_" + safe_cid + ".cow")
-    };
-    for (const auto& cand : hw_candidates) {
-        std::error_code ec_hw;
-        if (std::filesystem::exists(cand, ec_hw) && !std::filesystem::is_directory(cand, ec_hw)) {
-            hw_path = cand;
-            break;
-        }
-    }
-
-    if (!hw_path.empty()) {
-        std::string ext = hw_path.extension().string();
-        for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (ext == ".vhdx") {
-            auto r = VhdxImageBackend::open(hw_path, false);
-            if (r.is_ok()) hw_device = r.value();
-        } else if (ext == ".vhd") {
-            auto r = VhdImageBackend::open(hw_path, true);
-            if (r.is_ok()) hw_device = r.value();
-        } else if (ext == ".cow") {
-            auto r = CowBlockDevice::create(golden_img->device(), hw_path, 4096, client_id.value() + "_hw");
-            if (r.is_ok()) hw_device = r.value();
-        }
-        if (hw_device) {
-            Logger::default_logger().info("TIERED_STORAGE",
-                "[STORAGE] Layer 1 (Machine Hardware Profile) attached for client [" + client_id.value() +
-                "] from: " + hw_path.string());
-        }
-    }
-
-    auto tiered = std::make_shared<TieredBlockDevice>(golden_img->device(), hw_device, cow);
+    // Strict 2-Tier storage:
+    //   Tier 0 -- csmw10.vhd, the master, opened read-only and never written.
+    //   Tier 1 -- wb_<mac>.cow, the only writable layer, discarded at boot.
+    //
+    // There is deliberately no hardware-profile layer between them. NIC
+    // bindings live inside the master image itself (hardware_manifest.json
+    // records which ones have been baked in), so a per-MAC middle layer would
+    // only be a second place for the same fact to drift out of sync.
+    auto tiered = std::make_shared<TieredBlockDevice>(golden_img->device(), nullptr, cow);
     session->set_tiered_device(tiered);
 
     if (!initiator_iqn.empty()) {
@@ -686,29 +679,96 @@ Result<void> ClientSessionManager::reset_client(const ClientId& client_id) {
             it = sessions_.find(ClientId(m_it->second));
         }
     }
-    if (it != sessions_.end()) {
-        return it->second->reset();
-    }
-    // If no in-memory session exists, check if an on-disk writeback overlay exists and reset/remove it
-    if (overlay_naming::looks_like_mac(client_id.value())) {
-        std::filesystem::path effective_wb_dir = writeback_dir_;
-        if (storage_manager_ && storage_manager_->is_role_assigned(StorageRole::Writeback)) {
-            auto assigned_wb = storage_manager_->get_role_path(StorageRole::Writeback);
-            if (!assigned_wb.empty()) {
-                effective_wb_dir = assigned_wb;
-            }
+    if (it == sessions_.end()) {
+        auto ip_it = sessions_by_ip_.find(client_id.value());
+        if (ip_it == sessions_by_ip_.end() && client_id.value().rfind("ip_", 0) == 0) {
+            ip_it = sessions_by_ip_.find(client_id.value().substr(3));
         }
-        auto wb_file = overlay_naming::resolve_writeback_overlay(effective_wb_dir, client_id.value());
-        std::error_code ec;
-        if (std::filesystem::exists(wb_file, ec)) {
-            std::filesystem::remove(wb_file, ec);
-            Logger::default_logger().info("SESSION",
-                "[SESSION] Purged on-disk writeback overlay for client " + client_id.value() +
-                " at: " + wb_file.string());
+        if (ip_it != sessions_by_ip_.end()) {
+            it = sessions_.find(ClientId(ip_it->second));
+        }
+    }
+
+    Result<void> reset_res = {};
+    if (it != sessions_.end()) {
+        reset_res = it->second->reset();
+    }
+
+    // Super Client retention: a super client's overlay is uncommitted work.
+    // reset() is invoked on every cold /boot (and on shutdown paths), so an
+    // unconditional purge here would silently destroy updates the operator
+    // has not committed yet. Retain the files; the explicit commit path
+    // (CLI `commit`, API, console) is what consumes them.
+    bool retain_overlay = (it != sessions_.end() && it->second &&
+                           it->second->is_super_client());
+    if (!retain_overlay && station_manager_) {
+        std::string mac_probe = client_id.value();
+        if (mac_probe.rfind("ip_", 0) == 0) {
+            mac_probe = mac_probe.substr(3);
+        }
+        if (auto st = station_manager_->find_by_mac(mac_probe);
+            st.has_value() && st->super_client) {
+            retain_overlay = true;
+        }
+    }
+    if (retain_overlay) {
+        Logger::default_logger().warn("SESSION",
+            "[SESSION] Retaining writeback overlay for Super Client " +
+                client_id.value() +
+                " (reset does not purge; commit it explicitly)");
+        if (it != sessions_.end()) {
+            return reset_res;
         }
         return {};
     }
-    return Error(ErrorCode::StorageFailure, "Client session not found: " + client_id.value());
+
+    // Always check and remove on-disk writeback overlays to prevent dirty chunk reloading
+    std::filesystem::path effective_wb_dir = writeback_dir_;
+    if (storage_manager_ && storage_manager_->is_role_assigned(StorageRole::Writeback)) {
+        auto assigned_wb = storage_manager_->get_role_path(StorageRole::Writeback);
+        if (!assigned_wb.empty()) {
+            effective_wb_dir = assigned_wb;
+        }
+    }
+
+    std::vector<std::filesystem::path> check_dirs = {
+        effective_wb_dir,
+        writeback_dir_,
+        "E:\\writeback",
+        "E:\\",
+        "./writeback"
+    };
+
+    std::vector<std::string> target_names;
+    const std::string raw_id = client_id.value();
+    target_names.push_back(overlay_naming::overlay_file_name(raw_id));
+    target_names.push_back("wb_" + raw_id + ".cow");
+    target_names.push_back("wb_ip_" + raw_id + ".cow");
+    if (raw_id.rfind("ip_", 0) == 0) {
+        target_names.push_back("wb_" + raw_id.substr(3) + ".cow");
+        target_names.push_back("wb_ip_" + raw_id.substr(3) + ".cow");
+    }
+    if (overlay_naming::looks_like_mac(raw_id)) {
+        target_names.push_back("wb_" + overlay_naming::sanitize_mac(raw_id) + ".cow");
+    }
+
+    for (const auto& d : check_dirs) {
+        if (d.empty()) continue;
+        for (const auto& name : target_names) {
+            std::filesystem::path cow_path = d / name;
+            std::error_code ec;
+            if (std::filesystem::exists(cow_path, ec)) {
+                std::filesystem::remove(cow_path, ec);
+                Logger::default_logger().info("SESSION",
+                    "[SESSION] Purged on-disk writeback overlay: " + cow_path.string());
+            }
+        }
+    }
+
+    if (it != sessions_.end()) {
+        return reset_res;
+    }
+    return {};
 }
 
 Result<void> ClientSessionManager::commit_super_client_session_locked(std::shared_ptr<ClientSession> session) {
@@ -859,11 +919,16 @@ Result<void> ClientSessionManager::terminate_session_locked(const ClientId& clie
     }
 
     // Clean teardown: close handles, then purge overlay files.
+    if (session->tiered_device()) {
+        session->tiered_device()->close();
+        session->set_tiered_device(nullptr);
+    }
     if (cow) {
         (void)cow->flush();
         cow->close();
         (void)cow->purge_overlay();
     }
+
 
     if (image_manager_) {
         (void)image_manager_->release_image(img_id);

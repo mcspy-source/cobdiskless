@@ -9,6 +9,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <unordered_set>
 #include <iostream>
 
 #include "CobDisklessCore/logging/logger.hpp"
@@ -20,6 +21,13 @@
 #include "CobDisklessCore/types/common_types.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/client/client_session.hpp"
+#include "CobDisklessCore/storage/l1l2_cow_device.hpp"
+#include "CobDisklessCore/storage/vhd_image_backend.hpp"
+#include "CobDisklessCore/storage/tiered_storage_engine.hpp"
+#include "CobDisklessCore/storage/overlay_naming.hpp"
+#include "CobDisklessCore/image/reg_bootstart.hpp"
+#include "CobDisklessCore/image/hardware_manifest.hpp"
+#include "CobDisklessCore/image/cob_armer.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -381,6 +389,10 @@ std::string HttpResponse::serialize() const {
 HttpDaemon::HttpDaemon(NetworkAddress listen_address)
     : listen_address_(listen_address) {
     http_port_.store(listen_address.port());
+    // Hand the default manifest path to RegBootStart as well, so the
+    // already-recorded shortcut inside arm_vhd_pci_hardware() reads the same
+    // file this class's /boot handler does without needing a second setter.
+    RegBootStart::set_hardware_manifest_path(hardware_manifest_path_);
 }
 
 HttpDaemon::~HttpDaemon() {
@@ -480,6 +492,25 @@ void HttpDaemon::set_hive_arming_function(HiveArmingFunction fn) {
     hive_arming_fn_ = std::move(fn);
 }
 
+void HttpDaemon::set_hardware_enrollment_function(HardwareEnrollmentFunction fn) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    hardware_enrollment_fn_ = std::move(fn);
+}
+
+void HttpDaemon::set_hardware_manifest_path(std::filesystem::path path) {
+    // Forwarded so RegBootStart::arm_vhd_pci_hardware() -- the default
+    // enrollment function -- consults the same file this request handler does
+    // and can skip opening the master for an id that is already recorded.
+    RegBootStart::set_hardware_manifest_path(path);
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    hardware_manifest_path_ = std::move(path);
+}
+
+std::filesystem::path HttpDaemon::hardware_manifest_path() const {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    return hardware_manifest_path_;
+}
+
 std::shared_ptr<ClientManager> HttpDaemon::client_manager_copy() const {
     std::lock_guard<std::mutex> lock(config_mutex_);
     return client_mgr_;
@@ -557,6 +588,133 @@ void HttpDaemon::set_http_port(uint16_t port) noexcept {
 // Script builders
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Parses a Windows hardware-id string ("PCI\VEN_10EC&DEV_8168&SUBSYS_307C17AA
+// &REV_06", case-insensitive, SUBSYS_/REV_ halves optional) into full
+// cobsniffer identity. VEN_/DEV_ are required; without them this is not an
+// identity at all.
+bool pci_identity_from_hw_string(const std::string& text, PciHardwareId& out) {
+    std::string upper;
+    upper.reserve(text.size());
+    for (char c : text) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    auto take = [&](const char* tag, size_t digits, unsigned* val) -> bool {
+        const std::string t(tag);
+        const size_t at = upper.find(t);
+        if (at == std::string::npos) return false;
+        if (at + t.size() + digits > upper.size()) return false;
+        for (size_t i = 0; i < digits; ++i) {
+            if (!std::isxdigit(static_cast<unsigned char>(upper[at + t.size() + i]))) return false;
+        }
+        try {
+            *val = static_cast<unsigned>(std::stoul(upper.substr(at + t.size(), digits), nullptr, 16));
+        } catch (...) { return false; }
+        return true;
+    };
+    unsigned ven = 0, dev = 0;
+    if (!take("VEN_", 4, &ven) || !take("DEV_", 4, &dev)) return false;
+    out.ven = static_cast<uint16_t>(ven);
+    out.dev = static_cast<uint16_t>(dev);
+    unsigned subsys = 0;
+    if (take("SUBSYS_", 8, &subsys) && subsys != 0) {
+        out.subsys_device = static_cast<uint16_t>((subsys >> 16) & 0xFFFF);
+        out.subsys_vendor = static_cast<uint16_t>(subsys & 0xFFFF);
+        out.has_subsys = true;
+    }
+    unsigned rev = 0;
+    if (take("REV_", 2, &rev)) {
+        out.revision = static_cast<uint8_t>(rev & 0xFF);
+        out.has_revision = true;
+    }
+    return true;
+}
+
+} // namespace
+
+// -----------------------------------------------------------------------------
+// Strict per-MAC boot-route gate (Realtek 8168 bare metal).
+//
+// A station may take the iSCSI SAN path only when ALL of the following hold
+// for its own MAC: the exact board id is enrolled (specific SUBSYS/REV
+// manifest hit -- never a generic VEN/DEV row), exact telemetry is resolved,
+// and no operator force_sniff pin is set. Anything else detours into
+// cobsniffer telemetry collection. Generic VEN_10EC&DEV_8168 matching must
+// never decide the boot: Phase 1 has no setupapi to correct a wrong guess.
+//
+// Non-8168 ids (and unknown ids without force_sniff) return kLegacy: those
+// flows keep today's behavior byte for byte (QEMU/Intel stages included).
+// -----------------------------------------------------------------------------
+enum class BootRouteTarget { kLegacy, kSan, kDetour, kEnroll };
+
+struct BootRoute {
+    BootRouteTarget target = BootRouteTarget::kLegacy;
+    bool enrolled = false;      // specific manifest hit for the resolved id
+    std::string subsys_hex;     // 8 lower hex chars, "" when unknown
+    std::string rev_hex;        // 2 lower hex chars, "" when unknown
+    bool force_sniff = false;
+};
+
+namespace {
+
+std::string hex_lower(unsigned v, int width) {
+    constexpr char kDigits[] = "0123456789abcdef";
+    std::string out(static_cast<size_t>(width), '0');
+    for (int i = width - 1; i >= 0 && v != 0; --i) {
+        out[static_cast<size_t>(i)] = kDigits[v & 0xF];
+        v >>= 4;
+    }
+    return out;
+}
+
+BootRoute evaluate_boot_route(const PciHardwareId& id, bool force_sniff,
+                              const std::filesystem::path& manifest_path) {
+    BootRoute route;
+    route.force_sniff = force_sniff;
+    const bool strict = force_sniff || (id.ven == 0x10EC && id.dev == 0x8168);
+    if (!strict) {
+        return route;
+    }
+    if (id.has_subsys) {
+        route.subsys_hex =
+            hex_lower(id.subsys_device, 4) + hex_lower(id.subsys_vendor, 4);
+    }
+    if (id.has_revision) {
+        route.rev_hex = hex_lower(id.revision, 2);
+    }
+    if (!manifest_path.empty()) {
+        HardwareManifest manifest(manifest_path);
+        if (manifest.load().is_ok() &&
+            manifest.is_enrolled(HardwareManifest::hardware_id(id))) {
+            route.enrolled = true;
+        }
+    }
+    if (force_sniff) {
+        route.target = BootRouteTarget::kDetour;
+    } else if (!id.has_subsys || !id.has_revision) {
+        route.target = BootRouteTarget::kDetour;
+    } else if (!route.enrolled) {
+        route.target = BootRouteTarget::kEnroll;
+    } else {
+        route.target = BootRouteTarget::kSan;
+    }
+    return route;
+}
+
+// Single real-time routing verdict, identical on both boot routes. "SAN" is
+// printed only when a SAN script is actually served; anything else (detour
+// sniff, enroll-then-holding) prints DETOUR.
+void log_boot_route(const std::string& mac, const BootRoute& route) {
+    Logger::default_logger().info("BOOT",
+        "[BOOT ROUTE] MAC: " + mac +
+        " | Enrolled: " + std::string(route.enrolled ? "true" : "false") +
+        " | Subsys: " + (route.subsys_hex.empty() ? "none" : route.subsys_hex) +
+        " | Rev: " + (route.rev_hex.empty() ? "none" : route.rev_hex) +
+        " -> Routing to: " +
+        std::string(route.target == BootRouteTarget::kSan ? "SAN" : "DETOUR"));
+}
+
+} // namespace
+
 std::string HttpDaemon::sanboot_script_body() const {
     ipxe::SanbootOptions options;
     {
@@ -606,7 +764,7 @@ std::optional<std::string> HttpDaemon::station_boot_script_body(const std::strin
         script += "#!ipxe\n";
         script += "colour --rgb 0xffaa00 0 ||\n";
         script += "colour --rgb 0x000000 7 ||\n";
-        script += "clear\n";
+        script += "console ||\n";
         script += "echo ===============================================================================\n";
         script += "echo   CobDiskless Diskless Boot Engine\n";
         script += "echo ===============================================================================\n";
@@ -682,12 +840,115 @@ std::optional<std::string> HttpDaemon::station_boot_script_body(const std::strin
         }
     }
 
+    // --- Subsystem B2: strict route gate for the station flow --------------
+    // A station record proves the MAC is known, not that its NIC was ever
+    // exactly enrolled. Resolve the board identity (station pin, then the
+    // unified machine record) and run the same strict gate as /boot: SAN
+    // only on an enrolled, complete, unpinned id; a resolved-but-unenrolled
+    // board replays its known identity straight into enrollment (no sniff
+    // round trip needed); anything else takes the PCI probe, whose second
+    // hop reports live telemetry. Generic VEN/DEV rows never satisfy this
+    // gate -- only the exact SUBSYS/REV manifest hit counts. Serving silent
+    // sanboot here is what sent stock-iPXE bare-metal stations straight
+    // into 0x7B with no enrollment attempt in the log.
+    //
+    // Only platform-less requests from decidable images probe: the probe hop
+    // already exists to serve the firmware guard, so PCI telemetry rides
+    // along for zero extra round trips. Hybrid/undecidable/unassigned images
+    // never probe (their suites pin the no-extra-hop behavior), daemons
+    // without a client database cannot record anything (so probing could
+    // never resolve), and the probe's own second hop always carries
+    // `platform`, so re-probing it would loop forever. A client that cannot
+    // sniff answers platform-only and takes the legacy SAN below.
+    std::shared_ptr<ClientDatabase> hw_db;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        hw_db = client_db_;
+    }
+    if (!query_platform.has_value() && decidable && hw_db) {
+        PciHardwareId rid{0, 0};
+        bool force = st->force_sniff;
+        auto take_tokens = [&](const std::string& subsys_tok, const std::string& rev_tok) {
+            if (subsys_tok.size() == 8) {
+                unsigned v = 0;
+                try { v = std::stoul(subsys_tok, nullptr, 16); } catch (...) { v = 0; }
+                if (v != 0) {
+                    rid.subsys_device = static_cast<uint16_t>((v >> 16) & 0xFFFF);
+                    rid.subsys_vendor = static_cast<uint16_t>(v & 0xFFFF);
+                    rid.has_subsys = true;
+                }
+            }
+            if (rev_tok.size() == 2) {
+                unsigned v = 0;
+                try { v = std::stoul(rev_tok, nullptr, 16); } catch (...) {}
+                rid.revision = static_cast<uint8_t>(v & 0xFF);
+                rid.has_revision = true;
+            }
+        };
+        take_tokens(st->subsystem_id, st->revision_id);
+        if (auto opt_rec = hw_db->store()->find(st->mac)) {
+            force = force || opt_rec->force_sniff;
+            PciHardwareId rec_id{0, 0};
+            if (pci_identity_from_hw_string(opt_rec->hardware_id, rec_id)) {
+                if (rec_id.ven != 0) {
+                    rid.ven = rec_id.ven;
+                    rid.dev = rec_id.dev;
+                }
+                if (rec_id.has_subsys) {
+                    rid.subsys_device = rec_id.subsys_device;
+                    rid.subsys_vendor = rec_id.subsys_vendor;
+                    rid.has_subsys = true;
+                }
+                if (rec_id.has_revision) {
+                    rid.revision = rec_id.revision;
+                    rid.has_revision = true;
+                }
+            } else {
+                take_tokens(opt_rec->subsystem_id, opt_rec->revision);
+            }
+        }
+        BootRoute route = evaluate_boot_route(rid, force, hardware_manifest_path());
+        if (route.target == BootRouteTarget::kSan) {
+            log_boot_route(st->mac, route);
+        } else {
+            log_boot_route(st->mac, route);
+            if (rid.has_subsys && rid.ven != 0 && !force) {
+                Logger::default_logger().info("BOOT",
+                    "[BOOT] Station [" + st->name + " | " + st->mac +
+                        "] replays recorded board identity into enrollment (no sniff round trip)");
+                std::ostringstream replay;
+                replay << "#!ipxe\n";
+                replay << "chain http://";
+                {
+                    std::lock_guard<std::mutex> lock(config_mutex_);
+                    replay << ((server_ip_.is_any() || server_ip_.is_loopback())
+                                   ? std::string("${next-server}")
+                                   : server_ip_.ip_string());
+                }
+                replay << ":" << ((bound_port_.load() != 0) ? bound_port_.load() : http_port_.load());
+                replay << "/boot?mac=" << ipxe::sanitize_script_value(ClientDatabase::normalize_mac(st->mac), 32);
+                replay << "&ven=" << hex_lower(rid.ven, 4) << "&dev=" << hex_lower(rid.dev, 4);
+                replay << "&rev=" << hex_lower(rid.revision, 2);
+                replay << "&subsys=" << hex_lower(rid.subsys_device, 4) << hex_lower(rid.subsys_vendor, 4);
+                replay << " || goto hw_failed\n";
+                replay << "goto hw_done\n";
+                replay << ":hw_failed\n";
+                replay << "echo CobDiskless enrollment unreachable. Rebooting.\n";
+                replay << "prompt --timeout 15000 || echo Timed out. Rebooting now.\n";
+                replay << "reboot\n";
+                replay << ":hw_done\n";
+                return replay.str();
+            }
+            return platform_probe_script_body(st->mac);
+        }
+    }
+
     NetworkAddress srv;
     {
         std::lock_guard<std::mutex> lock(config_mutex_);
         srv = server_ip_;
     }
-    const std::string server = srv.is_any() ? std::string("${next-server}") : srv.ip_string();
+    const std::string server = (srv.is_any() || srv.is_loopback()) ? std::string("${next-server}") : srv.ip_string();
 
     // The station's dedicated target IQN. The iSCSI target resolves this suffix
     // back to the station's own assigned VHD, so a CSM image and a UEFI image
@@ -696,6 +957,24 @@ std::optional<std::string> HttpDaemon::station_boot_script_body(const std::strin
 
     std::string mode = normalize_boot_mode(st->boot_mode);
 
+    // Base-image protection: if a DIFFERENT station holds this image as an
+    // active Super Client, its uncommitted overlay may be merged into the
+    // base at any moment. Booting from it now can serve a torn image, so say
+    // so loudly in the log instead of failing later with a confusing 0x7B.
+    if (smgr && !st->image.empty() && !st->super_client) {
+        for (const auto& other : smgr->list_stations()) {
+            if (other.super_client && other.mac != st->mac && other.image == st->image) {
+                Logger::default_logger().warn(
+                    "BOOT",
+                    "[BOOT] WARNING: station [" + st->name + " | " + st->mac +
+                        "] is booting base image '" + st->image + "' while Super Client [" +
+                        other.name + " | " + other.mac + "] holds it for updates. " +
+                        "Expect a torn image until that client commits.");
+                break;
+            }
+        }
+    }
+
     std::string boot_mode_str = mode.empty() ? "auto" : mode;
     std::string img_desc = facts.has_value() ? facts->describe() : "Raw/Unknown";
     Logger::default_logger().info(
@@ -703,8 +982,10 @@ std::optional<std::string> HttpDaemon::station_boot_script_body(const std::strin
         "[BOOT] Station [" + st->name + " | " + st->mac + "] BootMode: " +
         boot_mode_str + " | Image: '" + st->image + "' (" + img_desc + ") | Verdict: PERMITTED");
 
-    // Cold physical reboot detected via /boot.ipxe: reset the station's writeback overlay
-    // so this fresh boot starts from a clean baseline.
+    // Retain writeback overlay across Option ROM -> winload.exe -> msiscsi.sys handover.
+    // Do NOT reset the station's writeback overlay on /boot.ipxe fetch, as winload.exe writes
+    // phase 0 sectors to the overlay before the OS connects via msiscsi.sys.
+    /*
     if (auto smgr_sess = session_manager_copy()) {
         (void)smgr_sess->reset_client(ClientId(st->mac));
         Logger::default_logger().info(
@@ -712,33 +993,39 @@ std::optional<std::string> HttpDaemon::station_boot_script_body(const std::strin
             "[BOOT] Station [" + st->name + " | " + st->mac +
             "] writeback overlay reset for cold physical reboot.");
     }
+    */
 
     const std::string iscsi_target = "iscsi:" + server + "::::" + iqn;
 
     std::string script;
     script += "#!ipxe\n";
-    script += "dhcp net0\n";
+    script += "isset ${net0/ip} || dhcp net0\n";
     script += "set net0/gateway 0.0.0.0\n";
     script += "set keep-san 1\n";
     script += "set initiator-iqn iqn.1991-05.com.microsoft:${net0/mac:hexhyp}\n";
     if (mode == "bios") {
-        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
-        script += "sanboot --drive 0x80\n";
+        script += "sanhook --drive 0x80 " + iscsi_target + " || goto san_fail\n";
+        script += "sanboot --drive 0x80 || goto san_fail\n";
     } else if (mode == "uefi") {
-        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
-        script += "sanboot --drive 0x80\n";
+        script += "sanhook --drive 0x80 " + iscsi_target + " || goto san_fail\n";
+        script += "sanboot --drive 0x80 || goto san_fail\n";
     } else {
         script += "# boot_mode=auto: the running firmware decides BIOS vs UEFI\n";
         script += "iseq ${platform} pcbios && goto boot_bios || goto boot_uefi\n";
         script += ":boot_uefi\n";
-        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
-        script += "sanboot --drive 0x80\n";
+        script += "sanhook --drive 0x80 " + iscsi_target + " || goto san_fail\n";
+        script += "sanboot --drive 0x80 || goto san_fail\n";
         script += "goto boot_done\n";
         script += ":boot_bios\n";
-        script += "sanhook --drive 0x80 " + iscsi_target + "\n";
-        script += "sanboot --drive 0x80\n";
+        script += "sanhook --drive 0x80 " + iscsi_target + " || goto san_fail\n";
+        script += "sanboot --drive 0x80 || goto san_fail\n";
         script += ":boot_done\n";
     }
+    script += "\n:san_fail\n";
+    script += "echo [ERROR] Failed to attach or boot from SAN target!\n";
+    script += "echo Dropping to iPXE recovery shell in 5s...\n";
+    script += "sleep 5\n";
+    script += "shell\n";
     return script;
 }
 
@@ -1154,8 +1441,19 @@ HttpResponse HttpDaemon::staged_response(std::string_view body) const {
     // 1. Mount-or-locate the offline SYSTEM hive behind the assigned target.
     std::filesystem::path arm_target;
     bool via_vhd_image = false;
+    bool via_mounted_volume = false;
     if (const auto hive = locate_system_hive(state->target_vhd_path)) {
         arm_target = *hive;
+        // The assignment shape decides the route: a regf file handed over
+        // directly is a loose hive and may go through the in-process writer,
+        // while a directory (a mounted volume root, an image laid out like a
+        // Windows install) -- or a hive already sitting in an image's own
+        // Windows\System32\config layout -- owns a file the boot loader reads
+        // back, and that one only through RegLoadKeyW / reg.exe load.
+        std::error_code ec;
+        via_mounted_volume =
+            (std::filesystem::is_directory(state->target_vhd_path, ec) && !ec) ||
+            RegBootStart::hive_sits_on_an_image(arm_target);
     } else if (is_virtual_disk(state->target_vhd_path)) {
         arm_target = state->target_vhd_path;
         via_vhd_image = true;
@@ -1166,8 +1464,10 @@ HttpResponse HttpDaemon::staged_response(std::string_view body) const {
     }
 
     // 2. Arm the hive. This enforces Start=0 for the boot services, BootFlags=0x1
-    //    on the network-facing ones, and Group (SCSI Miniport / NDIS / PNP_TDI)
-    //    wherever the image has none yet. Anything PnP-shaped lives in
+    //    on the network-facing ones, and Group (CCiSCSI / iSCSI / NDIS Wrapper /
+    //    NDIS / PNP_TDI) -- the table's value, not only where the image has
+    //    none yet -- plus ImagePath wherever the table names one and the image
+    //    reads a .sys Windows does not carry. Anything PnP-shaped lives in
     //    archive/pnp_dccb/ and is no longer reachable from here.
     HiveArmingFunction arming;
     {
@@ -1175,10 +1475,12 @@ HttpResponse HttpDaemon::staged_response(std::string_view body) const {
         arming = hive_arming_fn_;
     }
 
-    Result<BootStartArmReport> armed =
-        arming ? arming(arm_target)
-               : (via_vhd_image ? RegBootStart::arm_vhd_image(arm_target)
-                                : RegBootStart::arm_offline_system_hive(arm_target));
+    Result<BootStartArmReport> armed = [&]() -> Result<BootStartArmReport> {
+        if (arming) return arming(arm_target);
+        if (via_vhd_image) return RegBootStart::arm_vhd_image(arm_target);
+        if (via_mounted_volume) return RegBootStart::arm_mounted_volume_hive(arm_target);
+        return RegBootStart::arm_offline_system_hive(arm_target);
+    }();
 
     if (armed.is_err()) {
         return fail_json(500, state->status,
@@ -1441,6 +1743,15 @@ std::pair<std::string, std::string> HttpDaemon::split_target(std::string_view ta
         target = target.substr(0, hash);
     }
 
+    // Handle absolute URIs (e.g. "http://server:8080/boot?mac=...")
+    if (target.rfind("http://", 0) == 0) {
+        const size_t slash = target.find('/', 7);
+        target = (slash != std::string_view::npos) ? target.substr(slash) : "/";
+    } else if (target.rfind("https://", 0) == 0) {
+        const size_t slash = target.find('/', 8);
+        target = (slash != std::string_view::npos) ? target.substr(slash) : "/";
+    }
+
     const size_t query = target.find('?');
     if (query == std::string_view::npos) {
         return {std::string(target), std::string{}};
@@ -1449,6 +1760,9 @@ std::pair<std::string, std::string> HttpDaemon::split_target(std::string_view ta
 }
 
 std::map<std::string, std::string> HttpDaemon::parse_query(std::string_view query) {
+    if (!query.empty() && query.front() == '?') {
+        query.remove_prefix(1);
+    }
     std::map<std::string, std::string> params;
 
     size_t begin = 0;
@@ -1482,6 +1796,226 @@ std::map<std::string, std::string> HttpDaemon::parse_query(std::string_view quer
 HttpResponse HttpDaemon::handle_request(std::string_view method,
                                         std::string_view target) const {
     return handle_request(method, target, std::string_view{}, std::string_view{});
+}
+
+std::string generate_clean_sanboot_script(const std::string& server_ip,
+                                          const std::string& target_iqn) {
+    const std::string host = server_ip.empty() ? std::string("${next-server}") : server_ip;
+    const std::string iqn = target_iqn.empty()
+        ? std::string("iqn.2026-09.com.cobdiskless:storage")
+        : target_iqn;
+
+    std::ostringstream script;
+    script << "#!ipxe\n"
+           << "set keep-san 1\n"
+           << "sanboot iscsi:" << host << "::::" << iqn << "\n";
+    return script.str();
+}
+
+std::string generate_standard_san_boot_script(const std::string& server_ip,
+                                              const std::string& target_iqn) {
+    const std::string host = server_ip.empty() ? std::string("${next-server}") : server_ip;
+    const std::string iqn = target_iqn.empty()
+        ? std::string("iqn.2026-09.com.cobdiskless:storage")
+        : target_iqn;
+
+    std::ostringstream script;
+    script << "#!ipxe\n"
+           << "set net0/gateway 0.0.0.0\n"
+           << "set keep-san 1\n"
+           << "echo [CobDiskless] Attaching SAN volume for ${net0/mac}...\n"
+           << "sanhook --drive 0x80 --keep iscsi:" << host << "::::" << iqn << " || goto san_fail\n"
+           << "sanboot --drive 0x80 || goto san_fail\n\n"
+           << ":san_fail\n"
+           << "echo [ERROR] Failed to attach or boot from SAN target!\n"
+           << "echo Dropping to iPXE recovery shell in 5s...\n"
+           << "sleep 5\n"
+           << "shell\n";
+    return script.str();
+}
+
+// The holding screen the station shows while the server injects its NIC into
+// the master VHD. It is a *screen*, not a workflow: the station sits here for
+// the few seconds the synchronous enrollment takes and then reboots into a
+// machine whose hardware the master already knows.
+//
+// The two required payload lines are, verbatim:
+//     echo [+] Enrolling new hardware PCI\VEN_<ven>&DEV_<dev> to Master VHD...
+//     sleep 5
+//     reboot
+std::string generate_enrollment_holding_screen(const std::string& ven,
+                                               const std::string& dev,
+                                               const std::string& failure_detail) {
+    // The detail string comes from an injected Result error and lands in an
+    // iPXE echo. A newline would break out of the echo and a control character
+    // would corrupt the console, so both are scrubbed and the result is capped.
+    std::string detail;
+    detail.reserve(failure_detail.size());
+    for (char c : failure_detail) {
+        if (c == '\r' || c == '\n' || c == '\t') {
+            detail.push_back(' ');
+        } else if (static_cast<unsigned char>(c) >= 0x20) {
+            detail.push_back(c);
+        }
+    }
+    if (detail.size() > 120) {
+        detail.resize(120);
+        detail += "...";
+    }
+
+    std::ostringstream script;
+    script << "#!ipxe\n"
+           << "clear || console ||\n"
+           << "colour --rgb 0x00e5ff 1 ||\n"
+           << "cpair --foreground 1 0 ||\n"
+           << "echo +==============================================================+\n"
+           << "echo |          COBDISKLESS HARDWARE ENROLLMENT ENGINE              |\n"
+           << "echo +==============================================================+\n"
+           << "echo\n"
+           << "echo [+] Enrolling new hardware PCI\\VEN_" << ven << "&DEV_" << dev
+           << " to Master VHD...\n"
+           << "echo\n";
+
+    if (failure_detail.empty()) {
+        script << "echo [*] The master image carries no binding for this NIC yet.\n"
+               << "echo [*] It is being added now. The station reboots when done.\n";
+    } else {
+        script << "colour --rgb 0xff3333 3 ||\n"
+               << "cpair --foreground 3 0 ||\n"
+               << "echo [!] Enrollment failed: " << detail << "\n"
+               << "echo [!] Retrying in 5 seconds...\n"
+               << "colour --rgb 0xffffff 0 ||\n"
+               << "cpair --foreground 0 0 ||\n";
+    }
+
+    script << "sleep 5\n"
+           << "reboot\n";
+    return script.str();
+}
+
+// Auto-provisions an unregistered or unprofiled station with sequential hostname (PC-01, PC-02...),
+// pool IP address, default master image, and marked active/ready.
+inline void run_zero_touch_provisioning(const std::string& norm_mac,
+                                       std::string_view peer_ip,
+                                       const std::shared_ptr<ClientDatabase>& db,
+                                       const std::shared_ptr<StationManager>& smgr,
+                                       const std::string& default_master_fallback = "master.vhd") {
+    if (norm_mac.empty() || !db) {
+        return;
+    }
+
+    // Determine default master image
+    std::string base_img = db->default_base_image();
+    if (base_img.empty() && smgr) {
+        base_img = smgr->default_image();
+    }
+    if (base_img.empty()) {
+        base_img = default_master_fallback;
+    }
+
+    // Check if client is already known in DB
+    auto existing_client = db->find_client_by_mac(norm_mac);
+    if (!existing_client.has_value()) {
+        // Collect all taken hostnames across DB, MachineStore, and StationManager
+        std::unordered_set<std::string> taken_names;
+        for (const auto& c : db->list_clients()) {
+            std::string u = c.hostname;
+            std::transform(u.begin(), u.end(), u.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+            taken_names.insert(u);
+        }
+        if (db->store()) {
+            for (const auto& m : db->store()->list()) {
+                std::string u = m.name;
+                std::transform(u.begin(), u.end(), u.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+                taken_names.insert(u);
+            }
+        }
+        if (smgr) {
+            for (const auto& st : smgr->list_stations()) {
+                std::string u = st.name;
+                std::transform(u.begin(), u.end(), u.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+                taken_names.insert(u);
+            }
+        }
+
+        // Allocate the next sequential hostname: PC-01, PC-02, ...
+        std::string station_name;
+        for (int i = 1; i <= 9999; ++i) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "PC-%02d", i);
+            std::string cand(buf);
+            std::string u = cand;
+            std::transform(u.begin(), u.end(), u.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+            if (taken_names.find(u) == taken_names.end() && !db->is_hostname_taken(cand)) {
+                station_name = cand;
+                break;
+            }
+        }
+        if (station_name.empty()) {
+            station_name = "PC-9999";
+        }
+
+        // Enroll client into database
+        auto enroll_res = db->enroll_client(norm_mac, station_name, base_img);
+        std::string ip_str;
+        if (enroll_res.is_ok()) {
+            ip_str = enroll_res.value().ip_address.ip_string();
+        } else if (!peer_ip.empty()) {
+            ip_str = std::string(peer_ip);
+        }
+
+        // Update MachineRecord with active / ready status
+        if (db->store()) {
+            if (auto opt_rec = db->store()->find(norm_mac)) {
+                MachineRecord rec = *opt_rec;
+                rec.status = "active";
+                rec.provisioning = "READY";
+                rec.is_validated = true;
+                rec.enabled = true;
+                if (rec.image.empty()) {
+                    rec.image = base_img;
+                }
+                db->store()->put(rec);
+            }
+        }
+
+        // Sync with StationManager if present
+        if (smgr) {
+            StationEntry st;
+            st.mac = norm_mac;
+            st.name = station_name;
+            if (enroll_res.is_ok() && !enroll_res.value().ip_address.is_any()) {
+                st.ip = enroll_res.value().ip_address;
+            } else if (!peer_ip.empty()) {
+                try { st.ip = NetworkAddress::parse(std::string(peer_ip)); } catch (...) {}
+            }
+            st.image = base_img;
+            st.boot_mode = "auto";
+            st.status = "active";
+            (void)smgr->add_or_update_station(st);
+            (void)smgr->save();
+        }
+
+        (void)db->save();
+
+        Logger::default_logger().info("Provision",
+            "[Provision] Auto-enrolled new station " + norm_mac + " as " + station_name + " (" + ip_str + ")");
+    } else {
+        // Client already enrolled; ensure active/ready validation status
+        if (db->store()) {
+            if (auto opt_rec = db->store()->find(norm_mac)) {
+                if (opt_rec->provisioning != "READY" || !opt_rec->is_validated) {
+                    MachineRecord rec = *opt_rec;
+                    rec.status = "active";
+                    rec.provisioning = "READY";
+                    rec.is_validated = true;
+                    rec.enabled = true;
+                    db->store()->put(rec);
+                    (void)db->save();
+                }
+            }
+        }
+    }
 }
 
 HttpResponse HttpDaemon::handle_request(std::string_view method,
@@ -1533,6 +2067,14 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
     // the second hop and loop forever.
     const bool mac_param_present = params.find("mac") != params.end();
 
+    // Wire visibility for bare-metal diagnosis: log every boot-script hop
+    // with its full query string. HTTP fetches are the only unlogged leg of
+    // the boot -- ven/dev/subsys presence here is what decides enrollment.
+    if (path == "/boot" || path == "/boot/" || path == "/boot.ipxe" || path == "/boot.ipxe/") {
+        Logger::default_logger().info("BOOT", "[BOOT] HTTP " + std::string(method) + " " +
+                                                std::string(target) + " from " + std::string(peer_ip));
+    }
+
     if (path == kStagedPath) {
         return staged_response(body);
     }
@@ -1556,7 +2098,546 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         return static_file_response(path.substr(std::string_view("/static/").size()));
     }
 
-    if (path.rfind("/boot/", 0) == 0) {
+    if (path == "/boot" || path == "/boot/" ||
+        ((path == "/boot.ipxe" || path == "/boot.ipxe/") && (!param("ven").empty() || !param("dev").empty()))) {
+        std::string ven = param("ven");
+        ven.erase(std::remove(ven.begin(), ven.end(), ':'), ven.end());
+        std::string dev = param("dev");
+        dev.erase(std::remove(dev.begin(), dev.end(), ':'), dev.end());
+        std::string norm_mac = req_mac.empty() ? "" : ClientDatabase::normalize_mac(req_mac);
+
+        std::string session_id = norm_mac.empty() ? "default" : norm_mac;
+
+        // Auto-provision unregistered station in client database with Zero-Touch
+        std::shared_ptr<ClientDatabase> db;
+        std::shared_ptr<StationManager> smgr;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            db = client_db_;
+            smgr = station_mgr_;
+        }
+        if (db && !norm_mac.empty()) {
+            run_zero_touch_provisioning(norm_mac, peer_ip, db, smgr);
+        }
+
+        uint16_t ven_val = 0;
+        uint16_t dev_val = 0;
+        // Full board identity from PCI config space (cobsniffer/iPXE):
+        // subsys = SUBSYS_<subdev><subven> (8 hex, offsets 0x2E/0x2C),
+        // rev = revision ID (offsets 0x08, already sent by the chainloader).
+        // Absent telemetry falls back to the client-database record below,
+        // then to the legacy generic binding.
+        std::string subsys_raw = param("subsys");
+        std::string rev_raw = param("rev");
+        try {
+            if (!ven.empty()) ven_val = static_cast<uint16_t>(std::stoul(ven, nullptr, 16));
+            if (!dev.empty()) dev_val = static_cast<uint16_t>(std::stoul(dev, nullptr, 16));
+        } catch (...) {}
+
+        PciHardwareId pci{ven_val, dev_val};
+        {
+            auto parse_hex = [](const std::string& s, unsigned* out) -> bool {
+                if (s.empty()) return false;
+                try {
+                    size_t pos = 0;
+                    unsigned v = std::stoul(s, &pos, 16);
+                    if (pos != s.size()) return false;
+                    *out = v;
+                    return true;
+                } catch (...) { return false; }
+            };
+            unsigned subsys = 0;
+            // Accept SUBSYS_XXXXXXXX as well as a bare 8-digit value.
+            std::string subsys_hex = subsys_raw;
+            {
+                std::string upper;
+                for (char c : subsys_hex) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+                const std::string tag = "SUBSYS_";
+                auto at = upper.find(tag);
+                if (at != std::string::npos) subsys_hex = subsys_hex.substr(at + tag.size());
+            }
+            if (subsys_hex.size() == 8 && parse_hex(subsys_hex, &subsys)) {
+                pci.subsys_device = static_cast<uint16_t>((subsys >> 16) & 0xFFFF);
+                pci.subsys_vendor = static_cast<uint16_t>(subsys & 0xFFFF);
+                pci.has_subsys = (pci.subsys_device != 0 || pci.subsys_vendor != 0);
+            }
+            // Same identity as two half-words (chainloader spelling):
+            // subven = config 0x2C, subdev = config 0x2E.
+            if (!pci.has_subsys) {
+                unsigned subven = 0, subdev = 0;
+                if (parse_hex(param("subven"), &subven) &&
+                    parse_hex(param("subdev"), &subdev)) {
+                    pci.subsys_vendor = static_cast<uint16_t>(subven & 0xFFFF);
+                    pci.subsys_device = static_cast<uint16_t>(subdev & 0xFFFF);
+                    pci.has_subsys = (pci.subsys_device != 0 || pci.subsys_vendor != 0);
+                }
+            }
+            unsigned rev = 0;
+            if (parse_hex(rev_raw, &rev) && rev <= 0xFF) {
+                pci.revision = static_cast<uint8_t>(rev);
+                pci.has_revision = true;
+            }
+            // cobsniffer JSON enrollment lands in the client record
+            // (hardware_id / subsystem_id / revision); reuse it when the
+            // iPXE query arrived without telemetry.
+            if (ven_val == 0 && dev_val == 0 && db && !norm_mac.empty()) {
+                if (auto opt_rec = db->store()->find(norm_mac)) {
+                    auto pull_tokens = [&](const std::string& text) {
+                        std::string upper;
+                        for (char c : text) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+                        // Record-replay: a query without ven/dev (UNDI stage-1
+                        // with no PCI busloc) reuses the recorded VEN/DEV so a
+                        // known board is gated on its real identity instead of
+                        // falling into the legacy empty-id SAN.
+                        if (ven_val == 0 && dev_val == 0) {
+                            auto vat = upper.find("VEN_");
+                            auto dat = upper.find("DEV_");
+                            if (vat != std::string::npos && dat != std::string::npos) {
+                                unsigned vv = 0, dd = 0;
+                                try { vv = std::stoul(upper.substr(vat + 4, 4), nullptr, 16); }
+                                catch (...) { vv = 0; }
+                                try { dd = std::stoul(upper.substr(dat + 4, 4), nullptr, 16); }
+                                catch (...) { dd = 0; }
+                                if (vv != 0 && dd != 0) {
+                                    ven_val = static_cast<uint16_t>(vv);
+                                    dev_val = static_cast<uint16_t>(dd);
+                                    pci.ven = ven_val;
+                                    pci.dev = dev_val;
+                                }
+                            }
+                        }
+                        if (!pci.has_subsys) {
+                            auto at = upper.find("SUBSYS_");
+                            if (at != std::string::npos) {
+                                unsigned v = 0;
+                                try { v = std::stoul(upper.substr(at + 7, 8), nullptr, 16); }
+                                catch (...) { v = 0; }
+                                if (v != 0) {
+                                    pci.subsys_device = static_cast<uint16_t>((v >> 16) & 0xFFFF);
+                                    pci.subsys_vendor = static_cast<uint16_t>(v & 0xFFFF);
+                                    pci.has_subsys = true;
+                                }
+                            }
+                        }
+                        if (!pci.has_revision) {
+                            auto at = upper.find("REV_");
+                            if (at != std::string::npos) {
+                                unsigned v = 0;
+                                try { v = std::stoul(upper.substr(at + 4, 2), nullptr, 16); }
+                                catch (...) { v = 0; }
+                                pci.revision = static_cast<uint8_t>(v & 0xFF);
+                                pci.has_revision = true;
+                            }
+                        }
+                    };
+                    pull_tokens(opt_rec->hardware_id);
+                    pull_tokens(opt_rec->subsystem_id);
+                    pull_tokens(opt_rec->revision);
+                }
+            }
+        }
+
+        std::string host;
+        std::string target_iqn_str;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            host = (server_ip_.is_any() || server_ip_.is_loopback())
+                ? std::string("${next-server}")
+                : server_ip_.ip_string();
+            if (station_mgr_) {
+                if (auto st = station_mgr_->find_by_mac(norm_mac)) {
+                    target_iqn_str = "iqn.2026-09.com.cobdiskless:" + st->name;
+                }
+            }
+            if (target_iqn_str.empty()) {
+                target_iqn_str = target_iqn_.empty()
+                    ? std::string("iqn.2026-09.com.cobdiskless:storage")
+                    : target_iqn_;
+            }
+        }
+        const std::string san_script = generate_standard_san_boot_script(host, target_iqn_str);
+
+        // Strict per-MAC route gate (8168 bare metal): generic VEN/DEV
+        // matching must never decide the boot. kLegacy (other ids, no pin)
+        // keeps today's behavior byte for byte; strict outcomes divert below
+        // while the enroll-or-SAN mechanism underneath is unchanged.
+        bool force_sniff = false;
+        if (db && !norm_mac.empty()) {
+            if (auto opt_rec = db->store()->find(norm_mac)) {
+                force_sniff = opt_rec->force_sniff;
+            }
+        }
+        const bool sniffed = !param("sniffed").empty();
+        BootRoute route = evaluate_boot_route(pci, force_sniff, hardware_manifest_path());
+        if (route.target == BootRouteTarget::kDetour) {
+            log_boot_route(session_id, route);
+            if (sniffed) {
+                // Sniff pass completed or SUBSYS/REV telemetry absent:
+                // Do not trap the client in a retry loop. Master VHD is pre-armed
+                // with driver carpet-bombing, so immediately dispatch SAN boot.
+                Logger::default_logger().info("BOOT",
+                    "[BOOT] Sniff pass complete or telemetry absent for [" + session_id +
+                    "] -> Immediate SAN boot dispatch (pre-armed master VHD)");
+                return HttpResponse::ok(san_script, ipxe::kScriptContentType);
+            }
+            uint16_t port = 0;
+            {
+                std::lock_guard<std::mutex> lock(config_mutex_);
+                port = (bound_port_.load() != 0) ? bound_port_.load() : http_port_.load();
+            }
+            const std::string safe_mac = ipxe::sanitize_script_value(norm_mac, 32);
+            std::string script;
+            script += "#!ipxe\n";
+            script += ipxe::pci_sniff_script_lines();
+            script += "chain http://" + host + ":" + std::to_string(port) +
+                      "/boot?mac=" + safe_mac +
+                      "&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&sniffed=1"
+                      " || goto hw_failed\n";
+            script += "goto hw_done\n";
+            script += ":hw_failed\n";
+            script += "echo CobDiskless could not enroll this hardware. Rebooting.\n";
+            script += "prompt --timeout 15000 || echo Timed out. Rebooting now.\n";
+            script += "reboot\n";
+            script += ":hw_done\n";
+            return HttpResponse::ok(script, ipxe::kScriptContentType);
+        }
+        // Exact telemetry present but board not yet enrolled: this hop will
+        // enroll below. Log DETOUR now (only SAN logs SAN) so the real-time
+        // verdict is visible even before the holding screen.
+        if (route.target == BootRouteTarget::kEnroll) {
+            log_boot_route(session_id, route);
+        }
+
+        std::error_code ec;
+
+        // Master image resolution: one master for every station. This is the
+        // file the enrollment pass writes into and the file the iSCSI target
+        // serves read-only -- there is no per-MAC copy of it anywhere.
+        // Check whether this MAC or IP has an active session or is within a recent
+        // warm-reboot disconnect grace window (60-120 seconds).
+        // During Windows PnP driver installation, the OS commits the new driver stack
+        // to the COW writeback overlay and issues a warm reboot. If we delete the COW
+        // overlay upon receiving GET /boot.ipxe, we wipe out the newly installed
+        // drivers and leave the client in an infinite hardware setup / reboot stall!
+        std::filesystem::path master_path;
+        bool in_warm_reboot_grace = false;
+        if (auto smgr_sess = session_manager_copy(); smgr_sess) {
+            std::shared_ptr<ClientSession> sess = nullptr;
+            if (!norm_mac.empty()) {
+                sess = smgr_sess->find_session_by_mac(norm_mac);
+                if (!sess) {
+                    sess = smgr_sess->find_session(ClientId(norm_mac));
+                }
+            }
+            if (!sess && !peer_ip.empty()) {
+                try {
+                    sess = smgr_sess->find_session_by_ip(NetworkAddress::parse(std::string(peer_ip)));
+                } catch (...) {}
+                if (!sess) {
+                    sess = smgr_sess->find_session(ClientId("ip_" + std::string(peer_ip)));
+                }
+            }
+
+            if (sess) {
+                // Check if session is actively online/booting or in disconnect grace period (120 seconds)
+                if (sess->state() == ClientState::Online ||
+                    sess->state() == ClientState::Booting ||
+                    sess->is_in_disconnect_grace_period(120)) {
+                    in_warm_reboot_grace = true;
+                    Logger::default_logger().info("BOOT",
+                        "[BOOT] Retaining active/grace writeback session for " +
+                        (norm_mac.empty() ? std::string(peer_ip) : norm_mac) +
+                        " across iPXE chainload (state=" + std::string(to_string(sess->state())) + ")");
+                }
+            }
+
+            if (!in_warm_reboot_grace) {
+                // True cold boot: reset the session and wipe any stale overlays
+                if (!norm_mac.empty()) {
+                    (void)smgr_sess->reset_client(ClientId(norm_mac));
+                }
+                if (!peer_ip.empty()) {
+                    const std::string peer_ip_str(peer_ip);
+                    (void)smgr_sess->reset_client(ClientId("ip_" + peer_ip_str));
+                    (void)smgr_sess->reset_client(ClientId(peer_ip_str));
+                    if (auto existing = smgr_sess->find_session_by_ip(NetworkAddress::parse(peer_ip_str))) {
+                        (void)smgr_sess->reset_client(existing->id());
+                    }
+                }
+            }
+        }
+
+        // Only purge writeback overlays on disk if this is a true cold boot
+        // of a NON-super client. A super client's overlay is uncommitted
+        // work: purging it here would destroy updates between the client's
+        // own reboots (reset_client() above already retains them too).
+        bool super_retain = false;
+        if (db && !norm_mac.empty()) {
+            if (auto opt_rec = db->store()->find(norm_mac)) {
+                super_retain = opt_rec->super_client;
+            }
+        }
+        if (super_retain) {
+            Logger::default_logger().warn("BOOT",
+                "[BOOT] Retaining writeback overlay for Super Client [" + session_id +
+                "] (uncommitted updates survive reboots until an explicit commit)");
+        }
+        if (!in_warm_reboot_grace && !super_retain) {
+            std::vector<std::filesystem::path> wb_dirs = {
+                "E:\\writeback",
+                "E:\\",
+                "./writeback",
+                "writeback"
+            };
+            std::vector<std::string> cow_names;
+            std::string clean_mac = overlay_naming::sanitize_mac(norm_mac);
+            if (!clean_mac.empty()) {
+                cow_names.push_back("wb_" + clean_mac + ".cow");
+            }
+            if (!norm_mac.empty()) {
+                std::string alt = norm_mac;
+                for (char& c : alt) if (c == ':' || c == '-') c = '_';
+                cow_names.push_back("wb_" + alt + ".cow");
+            }
+            if (!peer_ip.empty()) {
+                const std::string peer_ip_str(peer_ip);
+                cow_names.push_back("wb_ip_" + peer_ip_str + ".cow");
+                cow_names.push_back("wb_" + peer_ip_str + ".cow");
+            }
+            for (const auto& d : wb_dirs) {
+                for (const auto& fname : cow_names) {
+                    std::filesystem::path cow_path = d / fname;
+                    std::error_code ec_purge;
+                    if (std::filesystem::exists(cow_path, ec_purge)) {
+                        std::filesystem::remove(cow_path, ec_purge);
+                        Logger::default_logger().info("BOOT",
+                            "[BOOT] Auto-purged stale COW writeback overlay: " + cow_path.string());
+                    }
+                }
+            }
+        }
+
+        {
+            std::vector<std::filesystem::path> search_dirs;
+            std::vector<std::pair<std::string, std::filesystem::path>> aliases;
+            {
+                std::lock_guard<std::mutex> lock(config_mutex_);
+                search_dirs = image_search_dirs_;
+                aliases = image_path_aliases_;
+            }
+            if (auto p = resolve_image_path("default", search_dirs, aliases)) {
+                master_path = *p;
+            } else if (auto p2 = resolve_image_path("csmw10", search_dirs, aliases)) {
+                master_path = *p2;
+            } else if (!aliases.empty()) {
+                master_path = aliases.front().second;
+            } else {
+                std::vector<std::filesystem::path> candidates = {
+                    "G:\\G\\csmw10.VHD",
+                    "G:\\os\\csmw10.vhd",
+                    "G:\\csmw10.vhd",
+                    "E:\\csmw10.vhd",
+                    "./images/os/csmw10.vhd"
+                };
+                for (const auto& cand : candidates) {
+                    if (std::filesystem::exists(cand, ec)) {
+                        master_path = cand;
+                        break;
+                    }
+                }
+            }
+
+            if (master_path.empty() || !std::filesystem::exists(master_path, ec)) {
+                Logger::default_logger().error("BOOT",
+                    "[BOOT] No master image on disk (" + master_path.string() +
+                        "): enrollment and boot are both impossible until an image is configured");
+            }
+        }
+
+        // Telemetry visibility: the query string itself is never logged
+        // anywhere else, so a station that "never enrolls" is otherwise
+        // indistinguishable from one whose iPXE never reported PCI ids.
+        {
+            std::ostringstream tele;
+            tele << std::hex << std::setw(4) << std::setfill('0') << ven_val << "/"
+                 << std::hex << std::setw(4) << std::setfill('0') << dev_val;
+            Logger::default_logger().info("BOOT",
+                "[BOOT] /boot telemetry [" + session_id + "]: ven/dev=" + tele.str() +
+                    " subsys=" + (pci.has_subsys ? "present" : "absent") +
+                    " rev=" + (pci.has_revision ? "present" : "absent") +
+                    " -> " + HardwareManifest::hardware_id(pci));
+        }
+
+        // Cumulative master VHD hardware enrollment.
+        //
+        // The manifest -- not a per-MAC file -- answers the only question this
+        // route asks: is this NIC's binding already inside the master? A yes is
+        // a plain sanboot. A no makes the server bake the binding in now, while
+        // the station sits on the holding screen, and the station then reboots
+        // back through this same route.
+        std::string hw_id = HardwareManifest::hardware_id(pci);
+        const std::string generic_hw_id = HardwareManifest::hardware_id(ven_val, dev_val);
+        HardwareManifest manifest(hardware_manifest_path());
+        if (auto load_res = manifest.load(); !load_res.is_ok()) {
+            Logger::default_logger().error("BOOT",
+                "[BOOT] Hardware manifest unreadable (" + manifest.path().string() + "): " +
+                    std::string(load_res.error().message()));
+        }
+
+        // Pass 2: the master already carries this NIC -> straight to the SAN,
+        // but ONLY when the strict gate agrees. For 8168 / force-pinned
+        // requests a generic VEN/DEV manifest hit must never serve SAN:
+        // without exact SUBSYS/REV the board is not enrolled, and serving
+        // SAN here is the 0x7B path. Fall through to exact enrollment below.
+        if (manifest.is_enrolled(hw_id)) {
+            const bool strict_pass2 = force_sniff || (ven_val == 0x10EC && dev_val == 0x8168);
+            if (strict_pass2 && route.target != BootRouteTarget::kSan) {
+                log_boot_route(session_id, route);
+            } else {
+                if (route.target == BootRouteTarget::kSan) {
+                    log_boot_route(session_id, route);
+                }
+            Logger::default_logger().info("BOOT",
+                "[BOOT] " + hw_id + " is baked into the master; serving the standard SAN boot script to [" +
+                    session_id + "]");
+            if (auto st_script = station_boot_script_body(std::string(peer_ip), req_mac, req_platform); st_script.has_value()) {
+                return HttpResponse::ok(*st_script, ipxe::kScriptContentType);
+            }
+            return HttpResponse::ok(san_script, ipxe::kScriptContentType);
+            }
+        }
+
+        // A /boot without a usable PCI id cannot be enrolled and must not
+        // pretend to have been: the station gets the explicit refusal screen
+        // (no staged driver for ven_0000) instead of a blind SAN -- and a
+        // known-8168 board never reaches here anyway (record-replay fills its
+        // VEN/DEV above, and the strict gate detours it into sniffing).
+        if (hw_id.empty()) {
+            Logger::default_logger().error("BOOT",
+                "[BOOT] /boot request from [" + session_id +
+                    "] carries no usable ven/dev pair; enrollment skipped");
+            return HttpResponse::ok(san_script, ipxe::kScriptContentType);
+        }
+
+        // A NIC this project stages no driver for cannot be enrolled. The
+        // binding would resolve to a service whose ImagePath names a file the
+        // image does not carry, and the station would die in Phase 0 with
+        // nothing in the log saying which decision produced it. Refuse here,
+        // with the id on the screen, instead of falling back to whatever
+        // miniport happens to be on disk.
+        if (CobArmer::resolve_driver_name(ven_val, dev_val).empty()) {
+            const std::string unknown_hw =
+                "no staged boot driver for PCI\\VEN_" + ven + "&DEV_" + dev +
+                "; this image stages Realtek and Intel NICs only";
+            Logger::default_logger().error("BOOT",
+                "[BOOT] " + hw_id + " requested by [" + session_id +
+                    "] resolves to no staged driver; enrollment refused");
+            return HttpResponse::ok(generate_enrollment_holding_screen(
+                                         ven.empty() ? "0000" : ven,
+                                         dev.empty() ? "0000" : dev,
+                                         unknown_hw),
+                                     ipxe::kScriptContentType);
+        }
+
+        // Pass 1: synchronous enrollment into the master image. The default
+        // implementation mounts the image and writes the CriticalDeviceDatabase
+        // row; tests inject a fake to exercise the flow without admin rights.
+        HardwareEnrollmentFunction enroll_fn;
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            enroll_fn = hardware_enrollment_fn_;
+        }
+        if (!enroll_fn) {
+            enroll_fn = [](const std::filesystem::path& image,
+                           const PciHardwareId& pci_v) -> Result<void> {
+                auto report = RegBootStart::arm_vhd_pci_hardware(image, pci_v);
+                if (!report.is_ok()) {
+                    return report.error();
+                }
+                return {};
+            };
+        }
+
+        Logger::default_logger().info("BOOT",
+            "[BOOT] " + hw_id + " is not in the master yet; enrolling it into " +
+                master_path.string() + " for [" + session_id + "]");
+
+        std::string failure_detail;
+        Result<void> enroll_res = enroll_fn(master_path, pci);
+        if (!enroll_res.is_ok()) {
+            failure_detail = std::string(enroll_res.error().message());
+            Logger::default_logger().error("BOOT",
+                "[BOOT] Enrollment of " + hw_id + " failed: " + failure_detail);
+        } else if (!manifest.enroll(hw_id) && !manifest.is_enrolled(hw_id)) {
+            // The bytes are in the image but the record did not persist, so
+            // every later boot would look unenrolled. That is a failure the
+            // operator must see, not a silent loop.
+            failure_detail = "could not record " + hw_id + " in " + manifest.path().string();
+            Logger::default_logger().error("BOOT",
+                "[BOOT] Enrollment of " + hw_id + " was applied but not recorded: " + failure_detail);
+        } else {
+            // A specific enrollment also records the generic id -- EXCEPT for
+            // 8168 bare metal, where the generic row is the 0x7B bypass: a
+            // later boot without telemetry must detour into sniffing, never
+            // take SAN on a generic hit. Other NIC families keep the old
+            // telemetry-less shortcut.
+            const bool is_8168 = (ven_val == 0x10EC && dev_val == 0x8168);
+            if (pci.specific() && !generic_hw_id.empty() && !is_8168) {
+                manifest.enroll(generic_hw_id);
+            }
+            // Stamp the NIC's full hardware id into the client record: the
+            // station flow consults it (via the manifest) to decide between
+            // the silent SAN shortcut and the PCI probe. Without this stamp
+            // every platform-less boot would re-probe forever.
+            {
+                std::ostringstream full;
+                full << "PCI\\VEN_" << std::hex << std::uppercase << std::setw(4)
+                     << std::setfill('0') << ven_val << "&DEV_" << std::setw(4)
+                     << std::setfill('0') << dev_val;
+                std::string subsys_tok, rev_tok;
+                if (pci.has_subsys) {
+                    std::ostringstream ss;
+                    ss << std::hex << std::uppercase << std::setw(4) << std::setfill('0')
+                       << pci.subsys_device << std::setw(4) << std::setfill('0') << pci.subsys_vendor;
+                    subsys_tok = ss.str();
+                    full << "&SUBSYS_" << subsys_tok;
+                }
+                if (pci.has_revision) {
+                    std::ostringstream rs;
+                    rs << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
+                       << static_cast<unsigned>(pci.revision);
+                    rev_tok = rs.str();
+                    full << "&REV_" << rev_tok;
+                }
+                std::shared_ptr<ClientDatabase> rec_db;
+                {
+                    std::lock_guard<std::mutex> lock(config_mutex_);
+                    rec_db = client_db_;
+                }
+                if (rec_db) {
+                    if (auto opt_rec = rec_db->store()->find(norm_mac)) {
+                        MachineRecord rec = *opt_rec;
+                        rec.hardware_id = full.str();
+                        rec.subsystem_id = subsys_tok;
+                        rec.revision = rev_tok;
+                        rec.is_validated = true;
+                        rec.provisioning = "READY";
+                        rec_db->store()->put(rec);
+                    }
+                }
+            }
+            Logger::default_logger().info("BOOT",
+                "[BOOT] Enrollment of " + hw_id +
+                    " complete; the next boot of this NIC takes the SAN path directly");
+        }
+
+        return HttpResponse::ok(generate_enrollment_holding_screen(ven.empty() ? "0000" : ven,
+                                                                   dev.empty() ? "0000" : dev,
+                                                                   failure_detail),
+                                ipxe::kScriptContentType);
+    }
+
+    if (path.rfind("/boot/", 0) == 0 && path.size() > 6) {
         std::string asset_name = std::string(path.substr(6));
         while (!asset_name.empty() && (asset_name.front() == '/' || asset_name.front() == '\\')) {
             asset_name.erase(asset_name.begin());
@@ -1620,7 +2701,40 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         // 3. If no uuid is present in the request (legacy interactive enrollment flow)
         if (params.find("uuid") == params.end()) {
             if (db && db->find_client_by_mac(norm_mac).has_value()) {
-                return HttpResponse::ok(sanboot_script_body(), ipxe::kScriptContentType);
+                // No silent SAN: a DB-known MAC is no proof its NIC was ever
+                // enrolled (ven/dev-only manifest rows predate per-board
+                // bindings). Detour through PCI sniffing + the enrollment
+                // route instead -- an enrolled board answers SAN on the very
+                // next hop, an unenrolled one enrolls and reboots. Serving
+                // sanboot here is how stock-iPXE bare-metal stations boot
+                // straight into 0x7B with no enrollment attempt in the log.
+                std::string host;
+                uint16_t port = 0;
+                {
+                    std::lock_guard<std::mutex> lock(config_mutex_);
+                    host = (server_ip_.is_any() || server_ip_.is_loopback())
+                        ? std::string("${next-server}")
+                        : server_ip_.ip_string();
+                    port = (bound_port_.load() != 0) ? bound_port_.load() : http_port_.load();
+                }
+                const std::string safe_mac = ipxe::sanitize_script_value(norm_mac, 32);
+                Logger::default_logger().info("BOOT",
+                    "[BOOT] Station [" + norm_mac +
+                        "] takes the legacy path with no hardware telemetry; detouring via PCI sniffing + enrollment");
+                std::string script;
+                script += "#!ipxe\n";
+                script += ipxe::pci_sniff_script_lines();
+                script += "chain http://" + host + ":" + std::to_string(port) +
+                          "/boot?mac=" + safe_mac +
+                          "&ven=${ven}&dev=${dev}&rev=${rev}&subven=${subven}&subdev=${subdev}&sniffed=1"
+                          " || goto hw_failed\n";
+                script += "goto hw_done\n";
+                script += ":hw_failed\n";
+                script += "echo CobDiskless could not enroll this hardware. Rebooting.\n";
+                script += "prompt --timeout 15000 || echo Timed out. Rebooting now.\n";
+                script += "reboot\n";
+                script += ":hw_done\n";
+                return HttpResponse::ok(script, ipxe::kScriptContentType);
             }
             return HttpResponse::ok(enrollment_script_body(), ipxe::kScriptContentType);
         }
@@ -1958,6 +3072,7 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
                 obj["boot_mode"] = st.boot_mode;
                 obj["status"] = st.status;
                 obj["registered_at"] = st.registered_at;
+                obj["super_client"] = st.super_client;
                 if (!st.last_seen.empty()) obj["last_seen"] = st.last_seen;
                 if (!st.uefi_bootloader.empty()) obj["uefi_bootloader"] = st.uefi_bootloader;
                 arr.push_back(std::move(obj));
@@ -1971,7 +3086,7 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
     // -----------------------------------------------------------------------
     // PUT /api/v1/station — update an existing station entry
     // Body: JSON object with any subset of: name, image, boot_mode,
-    //       uefi_bootloader, status.
+    //       uefi_bootloader, status, force_sniff.
     // Required query param: mac=
     // -----------------------------------------------------------------------
     if (method == "PUT" && path == "/api/v1/station") {
@@ -2014,18 +3129,28 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
             if (const JsonValue* v = parsed->find("status"))         updated.status = v->as_string();
         }
 
-        // Check for duplicate station name assigned to a different MAC
+        // Check for duplicate station name assigned to a different MAC.
+        // MACs compare normalized: records keep the spelling they were born
+        // with (lowercase iPXE queries included), so a raw comparison false-
+        // positives on the station's own row and every PUT that keeps its
+        // name fails with 400.
         if (!updated.name.empty()) {
-            if (auto other_st = smgr->find_by_name(updated.name); other_st.has_value() && other_st->mac != norm_mac) {
+            if (auto other_st = smgr->find_by_name(updated.name);
+                other_st.has_value() &&
+                StationManager::normalize_mac(other_st->mac) != norm_mac) {
                 return HttpResponse::fail(400, "PC Name '" + updated.name + "' is already assigned to MAC " + other_st->mac);
             }
             if (cmgr) {
-                if (auto other_cm = cmgr->find_by_name(updated.name); other_cm.has_value() && other_cm->mac_address != norm_mac) {
+                if (auto other_cm = cmgr->find_by_name(updated.name);
+                    other_cm.has_value() &&
+                    StationManager::normalize_mac(other_cm->mac_address) != norm_mac) {
                     return HttpResponse::fail(400, "PC Name '" + updated.name + "' is already assigned to MAC " + other_cm->mac_address);
                 }
             }
             if (db) {
-                if (auto other_db = db->find_client_by_hostname(updated.name); other_db.has_value() && other_db->mac_address != norm_mac) {
+                if (auto other_db = db->find_client_by_hostname(updated.name);
+                    other_db.has_value() &&
+                    ClientDatabase::normalize_mac(other_db->mac_address) != norm_mac) {
                     return HttpResponse::fail(400, "PC Name '" + updated.name + "' is already assigned to MAC " + other_db->mac_address);
                 }
             }
@@ -2073,7 +3198,9 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         }
         (void)smgr->save();
 
-        // Synchronize with client_database_ and client_manager_
+        // Synchronize with client_database_ and client_manager_ FIRST: the
+        // enroll below preserves operator row state, but a freshly-created
+        // row would otherwise clobber a pin written a line earlier.
         if (db) {
             (void)db->enroll_client(norm_mac, updated.name, updated.image);
             (void)db->save();
@@ -2085,6 +3212,31 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
                 cr.os_image_id = updated.image;
                 (void)cmgr->add_or_update_client(cr);
                 (void)cmgr->save_to_file();
+            }
+        }
+
+        // force_sniff is operator-pinned row state (see MachineRecord): the
+        // boot-route gate honors it, and routine station updates must never
+        // clear it behind the operator's back -- so apply_station() above
+        // deliberately never touches it, and the pin is written straight to
+        // the unified row here, AFTER the enroll sync above. Absent key =
+        // leave the pin alone.
+        if (parsed.has_value() && parsed->is_object()) {
+            if (const JsonValue* fv = parsed->find("force_sniff")) {
+                const bool pin = fv->as_bool(false);
+                if (db) {
+                    if (auto opt_rec = db->store()->find(norm_mac)) {
+                        MachineRecord upd = *opt_rec;
+                        upd.force_sniff = pin;
+                        db->store()->put(upd);
+                        Logger::default_logger().info("HTTP",
+                            "[PUT /station] force_sniff=" + std::string(pin ? "true" : "false") +
+                                " pinned for " + norm_mac);
+                    } else {
+                        Logger::default_logger().warn("HTTP",
+                            "[PUT /station] force_sniff ignored: no unified row for " + norm_mac);
+                    }
+                }
             }
         }
 
@@ -2136,6 +3288,26 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         JsonValue payload = JsonValue::make_object();
         payload["deleted"] = norm_mac;
         return HttpResponse::ok(payload.dump(0), "application/json; charset=utf-8");
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /api/hardware/manifest & /api/v1/hardware/manifest — return hardware manifest
+    // -----------------------------------------------------------------------
+    if ((method == "GET" || method == "HEAD") &&
+        (path == "/api/hardware/manifest" || path == "/api/v1/hardware/manifest")) {
+        const std::filesystem::path mf_path = hardware_manifest_path();
+        HardwareManifest manifest(mf_path);
+        auto load_res = manifest.load();
+        JsonValue payload = JsonValue::make_object();
+        JsonValue baked_arr = JsonValue::make_array();
+        for (const auto& hw : manifest.entries()) {
+            baked_arr.push_back(hw);
+        }
+        payload["baked_hardware"] = std::move(baked_arr);
+        payload["manifest_path"] = mf_path.string();
+        payload["enrolled_count"] = static_cast<int64_t>(manifest.size());
+        payload["status"] = load_res.is_ok() ? "ok" : "empty_or_new";
+        return HttpResponse::ok(payload.dump(2), "application/json; charset=utf-8");
     }
 
     return HttpResponse::fail(404, "Not Found: " + path);

@@ -1,6 +1,23 @@
 #!ipxe
 dhcp
-echo ========================================================
-echo CobDiskless Auto-Chain: Connecting to ${next-server}...
-echo ========================================================
-chain tftp://${next-server}/boot.ipxe || shell
+
+# 1. Probe PCI bus location from native driver
+set busloc ${net0/busloc}
+
+# 2. Extract bare-metal PCI IDs (Vendor, Device, Revision)
+set ven ${pci/${busloc}.0.2:hex}
+set dev ${pci/${busloc}.2.2:hex}
+set rev ${pci/${busloc}.8.1:hex}
+
+# 3. Read SMBIOS hardware strings (guarded against missing/corrupt SMBIOS tables)
+set board ${smbios/baseboard.product} || set board Generic
+set uuid ${smbios/uuid} || set uuid 00000000-0000-0000-0000-000000000000
+
+# 4. Chain directly to CobDiskless HTTP backend (Port 18080, fallback to 8080)
+chain http://${next-server}:18080/boot?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&board=${board}&uuid=${uuid} || chain http://${next-server}:8080/boot?mac=${net0/mac}&ven=${ven}&dev=${dev}&rev=${rev}&board=${board}&uuid=${uuid} || goto fail
+
+:fail
+echo [FATAL] CobDiskless server unreachable or SAN attachment failed (error: ${errno})!
+echo Dropping to iPXE recovery shell in 5s...
+sleep 5
+shell

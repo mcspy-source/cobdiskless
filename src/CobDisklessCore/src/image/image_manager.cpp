@@ -221,16 +221,18 @@ Result<void> ImageManager::initialize(const std::filesystem::path& config_path) 
             if (!role_p.empty()) {
                 os_images_dir_ = role_p;
             }
-        } else {
-            os_images_dir_.clear();
         }
+        // No OsImages role assigned: keep whatever configure() set from
+        // cobdiskless.conf. Clearing here used to discard the operator's
+        // os_images_dir and blind the discovery scan on every fresh
+        // zero-config deployment -- whose storage_roles.conf is empty by
+        // definition -- leaving the image registry with 0 entries and every
+        // iSCSI login to fail with "Image not found in manager".
         if (storage_manager_->is_role_assigned(StorageRole::Games)) {
             auto role_g = storage_manager_->get_role_path(StorageRole::Games);
             if (!role_g.empty()) {
                 games_dir_ = role_g;
             }
-        } else {
-            games_dir_.clear();
         }
     }
 

@@ -111,6 +111,7 @@ Result<void> Configuration::save_to_file(const std::filesystem::path& file_path)
     out << "ip_start=" << ip_start_.ip_string() << "\n";
     out << "default_master_vhd=" << default_master_vhd_ << "\n";
     out << "station_ttl_days=" << station_ttl_days_ << "\n";
+    out << "dhcp_mode=" << dhcp_mode_ << "\n";
     for (size_t i = 0; i < super_client_identities_.size(); ++i) {
         out << "super_client_identity=" << super_client_identities_[i] << "\n";
     }
@@ -219,6 +220,8 @@ Result<void> Configuration::load_from_file(const std::filesystem::path& file_pat
             default_master_vhd_ = val;
         } else if (key == "station_ttl_days") {
             station_ttl_days_ = std::stoi(val);
+        } else if (key == "dhcp_mode") {
+            dhcp_mode_ = val;
         } else if (key == "super_client_identity") {
             super_client_identities_.push_back(val);
         }

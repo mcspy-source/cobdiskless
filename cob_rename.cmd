@@ -17,7 +17,7 @@ REM  inside the golden image.
 REM ===========================================================================
 
 set "SERVER=%COBDISKLESS_SERVER%"
-if "%SERVER%"=="" set "SERVER=192.168.1.100"
+if "%SERVER%"=="" set "SERVER=192.168.1.99"
 set "PORT=%COBDISKLESS_HTTP_PORT%"
 if "%PORT%"=="" set "PORT=18080"
 

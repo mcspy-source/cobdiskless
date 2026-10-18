@@ -164,21 +164,32 @@ public:
     /**
      * @brief Builds the key=value text payload of a Login Response.
      *
-     * @param req_params      the initiator's proposed keys for this PDU.
-     * @param resolved_target the target IQN this connection was bound to; used
-     *                        when the PDU itself carries no TargetName (the
-     *                        operational PDU of a two-PDU login never does).
-     * @param stage           the CSG of the exchange (0 = SecurityNegotiation,
-     *                        1 = LoginOperationalNegotiation). Only the
-     *                        operational key block below is gated on it: it may
-     *                        not be sent while the exchange is still in stage 0
-     *                        -- RFC 3720 5.3 / Chapter 12.
-     * @param final_accept    true when the response transits to Full Feature
-     *                        Phase, i.e. it carries the whole negotiated set.
+     * The payload is deliberately narrow, and exactly one key is unconditional:
+     * TargetPortalGroupTag. RFC 3720 5.3.1 / 12.9 require the target to return
+     * it in the first Login Response to a Login Request with the C bit clear
+     * whenever the initiator gave a TargetName -- and Microsoft's initiator
+     * treats its absence as a malformed Login Response.
+     *
+     * The security stage (CSG=0) answers with TargetPortalGroupTag and
+     * AuthMethod and nothing else. TargetName is never echoed from any stage:
+     * RFC 3720 12.4 states "TargetName MUST not be redeclared within the login
+     * phase", Appendix C's login examples never show a target returning it,
+     * and it is the *initiator's* declaration -- the confirmation the RFC
+     * asks for is the portal group tag, not a second copy of the IQN.
+     * InitiatorName is likewise never echoed: it belongs to the initiator.
+     *
+     * @param req_params   the initiator's proposed keys for this PDU.
+     * @param stage        the CSG of the exchange (0 = SecurityNegotiation,
+     *                     1 = LoginOperationalNegotiation). It gates both
+     *                     halves of the payload: the operational key block
+     *                     never appears in stage 0 (RFC 3720 Chapter 12) and
+     *                     AuthMethod never appears in stage 1 (RFC 3720
+     *                     5.3.2/5.3.3 -- it is a Chapter 11 key).
+     * @param final_accept true when the response transits to Full Feature
+     *                     Phase, i.e. it carries the whole negotiated set.
      */
     static std::vector<uint8_t> build_login_response_parameters(
         const std::unordered_map<std::string, std::string>& req_params,
-        const std::string& resolved_target,
         uint8_t stage,
         bool final_accept);
 
@@ -220,10 +231,16 @@ public:
     // deliberately hands both connections the SAME ClientSession object, so the
     // session may only be torn down once the LAST of those connections goes
     // away. Tearing it down from whichever connection happens to close first
-    // calls CowBlockDevice::close()/purge_overlay() and ImageManager::
+    // calls UnifiedCowDevice::close()/purge_overlay() and ImageManager::
     // release_image() underneath the surviving connection, which then fails
     // every subsequent READ -- INACCESSIBLE_BOOT_DEVICE (0x7B).
     //
+    // Retire the socket a session is being taken away from during a
+    // reinstatement. Wakes the owner so it can release its own handle and its
+    // own connection reference; never closes or unregisters it itself. Returns
+    // true when a live handle was actually woken.
+    [[nodiscard]] bool retire_stale_socket(uintptr_t old_sock, uintptr_t keep_sock);
+
     // Each call returns the connection count for that session after the update.
     [[nodiscard]] int retain_session_connection(const std::shared_ptr<ClientSession>& session);
     [[nodiscard]] int release_session_connection(const std::shared_ptr<ClientSession>& session);

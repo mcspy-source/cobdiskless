@@ -723,6 +723,7 @@ Result<void> MachineStore::load_file_locked(const std::filesystem::path& path) {
             if (const JsonValue* v = item.find("gateway")) rec.gateway = NetworkAddress::parse(v->as_string());
             if (const JsonValue* v = item.find("dns")) rec.dns = NetworkAddress::parse(v->as_string());
             if (const JsonValue* v = item.find("super_client")) rec.super_client = v->as_bool(false);
+            if (const JsonValue* v = item.find("force_sniff")) rec.force_sniff = v->as_bool(false);
             if (const JsonValue* v = item.find("writeback_dir")) rec.writeback_dir = v->as_string();
             if (const JsonValue* v = item.find("game_dir")) rec.game_dir = v->as_string();
             if (const JsonValue* v = item.find("cache_dir")) rec.cache_dir = v->as_string();
@@ -798,6 +799,7 @@ Result<void> MachineStore::save_locked() const {
         obj["gateway"] = rec.gateway.ip_string();
         obj["dns"] = rec.dns.ip_string();
         obj["super_client"] = rec.super_client;
+        obj["force_sniff"] = rec.force_sniff;
         obj["writeback_dir"] = rec.writeback_dir.string();
         obj["game_dir"] = rec.game_dir.string();
         obj["cache_dir"] = rec.cache_dir.string();

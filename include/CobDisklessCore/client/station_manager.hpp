@@ -33,6 +33,19 @@ struct StationEntry {
     std::string uefi_bootloader;   // Optional override (e.g. "snponly.efi")
     std::string status{"active"};  // "active", "offline", etc.
     std::string last_arch;         // "bios" or "uefi" (detected via DHCP Option 93)
+    // --- super client (projected to/from MachineRecord.super_client) --------
+    // Operator-pinned via CLI `superclient enable`, POST
+    // /api/station/superclient, or the management console. Unlike
+    // force_sniff this flag round-trips through apply_station: every in-tree
+    // writer either read-modify-writes (DHCP adoption, HTTP PUT) or creates
+    // a fresh row (default false, correct for a new station).
+    bool super_client{false};
+    // --- strict hardware gate (projected to/from MachineRecord) ------------
+    // subsystem_id / revision_id name the exactly-enrolled board; force_sniff
+    // pins the station to the cobsniffer detour (see force_sniff on the record).
+    std::string subsystem_id;
+    std::string revision_id;
+    bool force_sniff{false};
 };
 
 /**

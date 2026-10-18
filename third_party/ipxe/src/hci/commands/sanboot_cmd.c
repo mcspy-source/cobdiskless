@@ -62,8 +62,8 @@ struct sanboot_options {
 static union {
 	/* "sanboot" takes all options */
 	struct option_descriptor sanboot[7];
-	/* "sanhook" takes only --drive and --no-describe */
-	struct option_descriptor sanhook[2];
+	/* "sanhook" takes --drive, --no-describe, and --keep */
+	struct option_descriptor sanhook[3];
 	/* "sanunhook" takes only --drive */
 	struct option_descriptor sanunhook[1];
 } opts = {

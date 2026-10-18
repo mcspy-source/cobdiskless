@@ -160,6 +160,9 @@ public:
     [[nodiscard]] const std::filesystem::path& tftp_boot_dir() const noexcept { return tftp_boot_dir_; }
     void set_tftp_boot_dir(std::filesystem::path dir) noexcept { tftp_boot_dir_ = std::move(dir); }
 
+    [[nodiscard]] const std::string& dhcp_mode() const noexcept { return dhcp_mode_; }
+    void set_dhcp_mode(std::string mode) { dhcp_mode_ = std::move(mode); }
+
     /**
      * @brief Validates configuration sanity.
      * @return Result<void> with ErrorCode::InvalidConfiguration if any parameter is malformed.
@@ -265,6 +268,7 @@ private:
     NetworkAddress ip_start_{192, 168, 1, 101};
     std::string default_master_vhd_{""};
     int station_ttl_days_{0}; // 0 = GC disabled
+    std::string dhcp_mode_{"auto"};
 };
 
 } // namespace cobdiskless

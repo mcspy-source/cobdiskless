@@ -106,6 +106,8 @@ struct DhcpLease {
     std::string lease_status{"Active"}; // "Active", "Reserved", "Expired"
     std::string first_seen;
     std::string last_seen;
+    ClientArch client_arch{ClientArch::Unknown};
+    std::string bootfile_name;
 };
 
 /**
@@ -252,6 +254,16 @@ public:
      * Used by iSCSI target to resolve client identity when connection comes from dynamic IP.
      */
     [[nodiscard]] std::optional<std::string> find_mac_by_ip(const NetworkAddress& ip) const noexcept;
+
+    /**
+     * @brief Find the client architecture associated with a leased IP address (RFC 4578 Option 93).
+     */
+    [[nodiscard]] std::optional<ClientArch> find_client_arch_by_ip(const NetworkAddress& ip) const noexcept;
+
+    /**
+     * @brief Find the negotiated or provisioned bootfile for a leased IP address.
+     */
+    [[nodiscard]] std::optional<std::string> find_bootfile_by_ip(const NetworkAddress& ip) const noexcept;
 
     void set_mode(DhcpServerMode mode) noexcept { mode_ = mode; }
     [[nodiscard]] DhcpServerMode mode() const noexcept { return mode_; }

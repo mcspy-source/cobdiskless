@@ -29,6 +29,10 @@ StationEntry to_station(const MachineRecord& rec) {
     st.uefi_bootloader = rec.uefi_bootloader;
     st.status = rec.status;
     st.last_arch = rec.last_arch;
+    st.super_client = rec.super_client;
+    st.subsystem_id = rec.subsystem_id;
+    st.revision_id = rec.revision;
+    st.force_sniff = rec.force_sniff;
     return st;
 }
 
@@ -50,6 +54,22 @@ void apply_station(MachineRecord& rec, const StationEntry& st) {
     }
     if (!st.last_arch.empty()) {
         rec.last_arch = st.last_arch;
+    }
+    // super_client round-trips: in-tree writers either read-modify-write
+    // (DHCP adoption, HTTP PUT carry the projected flag back) or create a
+    // fresh row (default false, correct for a new station). Dedicated
+    // togglers (CLI/API/console) write explicit values.
+    rec.super_client = st.super_client;
+    // Station-owned hardware gate state; empty means "not machine-reported".
+    // Never cleared here: only a fresh enrollment writes these. force_sniff
+    // is deliberately NOT synced here -- it is operator state managed only
+    // through PUT /api/v1/station, so routine station updates can never
+    // silently clear (or set) it.
+    if (!st.subsystem_id.empty()) {
+        rec.subsystem_id = st.subsystem_id;
+    }
+    if (!st.revision_id.empty()) {
+        rec.revision = st.revision_id;
     }
     rec.registered_at = st.registered_at;
     rec.last_seen = st.last_seen;

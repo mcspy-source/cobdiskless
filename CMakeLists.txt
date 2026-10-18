@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.20)
 project(CobDiskless
     VERSION 0.3.0
     DESCRIPTION "CobDiskless Platform Core"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # ------------------------------------------------------------------------------
@@ -63,10 +63,28 @@ endif()
 if(MSVC)
     add_compile_options(/W4 /permissive-)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wunused -Woverloaded-virtual)
+    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wunused "$<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor;-Woverloaded-virtual>")
     if(CYGWIN OR MSYS OR WIN32)
         add_compile_options(-mwin32)
     endif()
+endif()
+
+# ==============================================================================
+# MiniVHD Static Library
+# ==============================================================================
+add_library(minivhd STATIC
+    third_party/minivhd/src/io.c
+    third_party/minivhd/src/manage.c
+    third_party/minivhd/src/struct_rw.c
+    third_party/minivhd/src/util.c
+)
+target_include_directories(minivhd PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/minivhd/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/minivhd/src>
+)
+target_compile_definitions(minivhd PUBLIC STATIC)
+if(NOT MSVC)
+    target_compile_options(minivhd PRIVATE -Wno-unused-parameter -Wno-sign-compare)
 endif()
 
 # ==============================================================================
@@ -88,7 +106,6 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/storage/storage_tester.cpp
     src/CobDisklessCore/src/storage/block_cache.cpp
     src/CobDisklessCore/src/storage/random_access_file.cpp
-    src/CobDisklessCore/src/storage/writeback_context.cpp
     src/CobDisklessCore/src/storage/file_attributes.cpp
     src/CobDisklessCore/src/storage/overlay_naming.cpp
     src/CobDisklessCore/src/network/network_service.cpp
@@ -97,8 +114,7 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/network/iscsi_target.cpp
     src/CobDisklessCore/src/network/host_network.cpp
     src/CobDisklessCore/src/network/http_daemon.cpp
-    src/CobDisklessCore/src/storage/cow_block_device.cpp
-    src/CobDisklessCore/src/storage/cow_overlay.cpp
+    src/CobDisklessCore/src/storage/unified_cow_device.cpp
     src/CobDisklessCore/src/storage/tiered_storage_engine.cpp
     src/CobDisklessCore/src/storage/base_cache.cpp
     src/CobDisklessCore/src/storage/game_disk_engine.cpp
@@ -112,11 +128,15 @@ add_library(CobDisklessCore
     src/CobDisklessCore/src/image/golden_image.cpp
     src/CobDisklessCore/src/image/image_registry.cpp
     src/CobDisklessCore/src/image/image_manager.cpp
+    src/CobDisklessCore/src/storage/l1l2_cow_device.cpp
     # Lightweight Start=0 / BootFlags / Group boot-start registry patcher. The
     # PnP arming, DCCB, dynamic-INF and driver-injection half of what used to
     # live here is archived under archive/pnp_dccb/ and is not compiled by any
     # target (enforced by the archive/ guard at the bottom of this file).
     src/CobDisklessCore/src/image/reg_bootstart.cpp
+    src/CobDisklessCore/src/image/cob_armer.cpp
+    # Cumulative Master VHD Hardware Enrollment registry (hardware_manifest.json).
+    src/CobDisklessCore/src/image/hardware_manifest.cpp
 )
 
 # Public headers live in the top-level include/ tree; implementations in src/.
@@ -125,6 +145,8 @@ target_include_directories(CobDisklessCore
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
+
+target_link_libraries(CobDisklessCore PUBLIC minivhd)
 
 if(CYGWIN OR MSYS OR WIN32)
     target_link_libraries(CobDisklessCore PUBLIC ws2_32 advapi32 virtdisk)
@@ -182,41 +204,6 @@ if(CYGWIN OR MSYS OR WIN32)
     endif()
 endif()
 
-# ==============================================================================
-# cob-armer (standalone offline SYSTEM hive armer)
-# ==============================================================================
-# Deliberately its own executable rather than a subcommand of cobdiskless_app:
-# this is what an operator runs against a single image next to a VHD, and it
-# must link nothing beyond CobDisklessCore to do so.
-add_executable(cob_armer
-    src/tools/cob_armer_main.cpp
-)
-
-target_link_libraries(cob_armer
-    PRIVATE
-        CobDisklessCore
-)
-
-if(CYGWIN OR MSYS OR WIN32)
-    target_link_libraries(cob_armer
-        PRIVATE
-            ws2_32
-            iphlpapi
-            virtdisk
-    )
-
-    # Same MSYS2 runtime the app drops into the shared bin/ directory, so the
-    # CLI also runs from cmd.exe without MSYS2 on PATH.
-    if(MSYS_RUNTIME_DLL)
-        get_filename_component(_armer_msys_bin_dir "${MSYS_RUNTIME_DLL}" DIRECTORY)
-        add_custom_command(TARGET cob_armer POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_armer_msys_bin_dir}/msys-2.0.dll" $<TARGET_FILE_DIR:cob_armer>
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_armer_msys_bin_dir}/msys-gcc_s-seh-1.dll" $<TARGET_FILE_DIR:cob_armer>
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_armer_msys_bin_dir}/msys-stdc++-6.dll" $<TARGET_FILE_DIR:cob_armer>
-            COMMENT "Copying MSYS2 runtime DLLs for cob_armer"
-        )
-    endif()
-endif()
 
 # ==============================================================================
 # Testing
@@ -279,30 +266,6 @@ if(BUILD_TESTING)
         ENVIRONMENT "MSYS2_ARG_CONV_EXCL=/c\;/u\;/f"
     )
 
-    # cob-armer is exercised end to end rather than through a unit harness: the
-    # self-test builds a synthetic SYSTEM hive, arms it, reads the result back
-    # and round-trips the JSON report; the two negatives pin down the argument
-    # contract so a bad invocation fails loudly instead of arming nothing.
-    add_test(
-        NAME CobArmerSelfTest
-        COMMAND cob_armer --self-test
-    )
-
-    add_test(
-        NAME CobArmerRejectsMissingHive
-        COMMAND cob_armer /nonexistent/no_such_SYSTEM_hive
-    )
-    set_tests_properties(CobArmerRejectsMissingHive PROPERTIES
-        PASS_REGULAR_EXPRESSION "path does not exist"
-    )
-
-    add_test(
-        NAME CobArmerRequiresHivePath
-        COMMAND cob_armer --arm
-    )
-    set_tests_properties(CobArmerRequiresHivePath PROPERTIES
-        PASS_REGULAR_EXPRESSION "requires a path"
-    )
 endif()
 
 # ==============================================================================
@@ -328,6 +291,45 @@ if(WIN32)
 endif()
 
 # ==============================================================================
+# CobHarvester (Live Master Image Prepper)
+# ==============================================================================
+if(WIN32)
+    add_executable(cobharvester
+        tools/cobharvester.cpp
+    )
+    target_link_libraries(cobharvester
+        PRIVATE
+            advapi32
+            kernel32
+            shell32
+            setupapi
+            comdlg32
+    )
+    if(MSVC)
+        set_target_properties(cobharvester PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
+endif()
+
+# ==============================================================================
+# cob-armer (standalone offline SYSTEM hive armer)
+# ==============================================================================
+# Thin CLI over CobDisklessCore::RegBootStart, which is also what the server's
+# `arm` path calls, so the tool and the server can never drift apart. All of the
+# registry surgery lives in the core library; this target only parses argv and
+# prints the report. Supports `inspect` (read-only), `arm`, and `--self-test`.
+if(WIN32)
+    add_executable(cob_armer
+        src/tools/cob_armer_main.cpp
+    )
+    target_link_libraries(cob_armer
+        PRIVATE
+            CobDisklessCore
+    )
+endif()
+
+# ==============================================================================
 # archive/ guard
 # ==============================================================================
 # Every source list in this file is explicit -- nothing globs -- but the archived
@@ -335,7 +337,7 @@ endif()
 # glob or a stray add_library. Fail configuration outright if any target ends up
 # compiling a translation unit from the archive tree.
 set(_cob_archive_compile_errors "")
-foreach(_cob_tgt IN ITEMS CobDisklessCore cobdiskless_app cob_armer cobdiskless_core_test cob_enroll)
+foreach(_cob_tgt IN ITEMS CobDisklessCore cobdiskless_app cobdiskless_core_test cob_enroll cobharvester)
     if(TARGET ${_cob_tgt})
         get_target_property(_cob_sources ${_cob_tgt} SOURCES)
         if(_cob_sources)

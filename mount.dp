@@ -1,0 +1,2 @@
+select vdisk file="G:\G\csmw10.vhd"
+detach vdisk

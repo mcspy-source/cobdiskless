@@ -21,6 +21,8 @@ namespace cobdiskless {
 
 class ImageManager;
 class ClientManager;
+class ClientSessionManager;
+class DhcpServer;
 
 #pragma pack(push, 1)
 struct TftpPacketHeader {
@@ -121,6 +123,18 @@ public:
     void set_target_iqn(std::string iqn) {
         base_target_iqn_ = std::move(iqn);
     }
+    void set_session_manager(std::shared_ptr<ClientSessionManager> mgr) noexcept {
+        session_manager_ = std::move(mgr);
+    }
+    [[nodiscard]] std::shared_ptr<ClientSessionManager> session_manager() const noexcept {
+        return session_manager_;
+    }
+    void set_dhcp_server(std::shared_ptr<DhcpServer> dhcp) noexcept {
+        dhcp_server_ = std::move(dhcp);
+    }
+    [[nodiscard]] std::shared_ptr<DhcpServer> dhcp_server() const noexcept {
+        return dhcp_server_;
+    }
 
     /**
      * @brief Generates standard iPXE boot script directing client to SAN target.
@@ -179,13 +193,10 @@ public:
      */
     [[nodiscard]] static Result<TftpReadRequest> parse_rrq(std::span<const uint8_t> packet);
 
-    /// RFC 2348 blksize ceiling that keeps 1432 DATA + 4 TFTP + 8 UDP + 20 IP = 1464 bytes
-    /// inside one 1500-byte frame, leaving 36 bytes of headroom -- enough for an 802.1Q tag
-    /// plus Ethernet padding. Anything larger is fragmented by the network and silently
-    /// dropped on paths that filter fragments -- which is exactly the "TFTP open timeout"
-    /// this server must not reproduce. The value matches iPXE's own TFTP_MAX_BLKSIZE, so a
-    /// client asking for 1432 is answered in full instead of being clamped downward.
-    static constexpr uint16_t kMaxBlockSize = 1432;
+    /// RFC 2348 blksize ceiling: 1468 DATA + 4 TFTP + 8 UDP + 20 IP = 1500 bytes (standard Ethernet MTU).
+    /// Physical NIC PXE ROMs asking for 1456 or 1468 bytes are answered in full, enabling sub-second
+    /// transfers of stage-1/stage-2 bootloaders (undionly.kpxe / ipxe.efi).
+    static constexpr uint16_t kMaxBlockSize = 1468;
     /// RFC 2348 minimum block size enforced by this server.
     /// Clients requesting smaller blocks receive 512 (the default) per RFC 2347 §4.
     static constexpr uint16_t kMinBlockSize = 512;
@@ -208,6 +219,8 @@ private:
     std::unordered_map<std::string, std::vector<uint8_t>> virtual_files_;
     std::shared_ptr<ImageManager> image_manager_;
     std::shared_ptr<ClientManager> client_manager_;
+    std::shared_ptr<ClientSessionManager> session_manager_;
+    std::shared_ptr<DhcpServer> dhcp_server_;
     std::string base_target_iqn_{"iqn.2026-09.com.cobdiskless:storage"};
 
     std::atomic<bool> running_{false};

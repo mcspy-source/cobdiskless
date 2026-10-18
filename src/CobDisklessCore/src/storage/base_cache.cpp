@@ -100,12 +100,18 @@ std::shared_ptr<BaseBlock> BaseCache::get_or_load_block(uint64_t chunk_index) {
     {
         std::shared_lock<std::shared_mutex> glock(g_base_read_cache_mutex);
         auto git = g_base_read_cache.find(chunk_index);
-        if (git != g_base_read_cache.end()) {
+        if (git != g_base_read_cache.end() && git->second) {
             hits_++;
             std::lock_guard<std::mutex> lock(cache_mutex_);
             auto it = base_cache_.find(chunk_index);
             if (it != base_cache_.end()) {
                 it->second->last_access = ++access_counter_;
+                if (!it->second->ready.load()) {
+                    std::memcpy(it->second->buffer.data(), git->second->data(), kBaseBlockSize);
+                    it->second->ready = true;
+                    it->second->loading = false;
+                    cv_loading_.notify_all();
+                }
                 return it->second;
             }
             auto blk = std::make_shared<BaseBlock>();
@@ -131,7 +137,7 @@ std::shared_ptr<BaseBlock> BaseCache::get_or_load_block(uint64_t chunk_index) {
 
             if (!block->ready.load()) {
                 cv_loading_.wait(lock, [&] {
-                    return block->ready.load() || stop_prefetch_worker_.load();
+                    return block->ready.load();
                 });
             }
             return block;
@@ -167,6 +173,10 @@ std::shared_ptr<BaseBlock> BaseCache::get_or_load_block(uint64_t chunk_index) {
                 if (!res.is_ok()) {
                     Logger::default_logger().error("BASE_CACHE",
                         "[BASE_CACHE] Read error for 256 KiB aligned chunk " + std::to_string(aligned_start_chunk) + ": " + res.error().to_string());
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    base_cache_.erase(chunk_index);
+                    cv_loading_.notify_all();
+                    return nullptr;
                 }
             }
 
@@ -292,6 +302,16 @@ Result<size_t> BaseCache::read(uint64_t offset, std::span<std::byte> destination
 
         auto block = get_or_load_block(chunk_index);
         if (!block || !block->ready.load()) {
+            if (underlying_device_) {
+                auto fb_res = underlying_device_->read(
+                    current_offset,
+                    std::span<std::byte>(reinterpret_cast<std::byte*>(dst_ptr + bytes_copied), to_copy));
+                if (fb_res.is_ok() && fb_res.value() == to_copy) {
+                    bytes_copied += to_copy;
+                    current_offset += to_copy;
+                    continue;
+                }
+            }
             return Error(ErrorCode::IoFailure, "Failed to read block " + std::to_string(chunk_index));
         }
 

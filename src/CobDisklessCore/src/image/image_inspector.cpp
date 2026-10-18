@@ -310,13 +310,19 @@ void ImageInspector::inspect_gpt(
     uint32_t num_entries = read_le32(gpt_header + 80);
     uint32_t entry_size = read_le32(gpt_header + 84);
 
-    if (entry_size < 128 || num_entries == 0) {
+    if (entry_size < 128 || entry_size > 4096 || num_entries == 0) {
         return;
     }
 
     // Cap parsed entries to 128 for safety
     uint32_t max_scan = std::min(num_entries, 128U);
-    std::vector<uint8_t> entries_buf(max_scan * entry_size);
+    // In size_t, not uint32: entry_size comes off disk, and max_scan *
+    // entry_size wraps at 4 GiB. A wrapped product allocates far fewer bytes
+    // than the entry walk below then performs -- an out-of-bounds read over
+    // however much heap follows the vector.
+    const size_t entries_bytes =
+        static_cast<size_t>(max_scan) * static_cast<size_t>(entry_size);
+    std::vector<uint8_t> entries_buf(entries_bytes);
 
     auto entries_read = device.read(
         entry_lba * 512,

@@ -125,6 +125,25 @@ public:
     using ImageBootModeResolver =
         std::function<std::optional<ImageBootFacts>(const std::string& image_name)>;
 
+    /**
+     * @brief Bakes one NIC's binding into the master VHD.
+     *
+     * Defaults to RegBootStart::arm_vhd_pci_hardware() -- mount csmw10.vhd,
+     * inject ControlSet001\Control\CriticalDeviceDatabase\pci#ven_<ven>&dev_<dev>,
+     * write it back and detach. Tests swap it out to exercise the cumulative
+     * manifest without touching a real image, and to count invocations.
+     *
+     * The master image path is passed in so the default implementation has to
+     * resolve nothing itself; an empty path is an error, never a silent
+     * success, because "enrolled" must mean the bytes are in the image.
+     *
+     * The full cobsniffer identity (SUBSYS/REV) rides in `pci`; a ven/dev-only
+     * caller gets the legacy generic binding.
+     */
+    using HardwareEnrollmentFunction =
+        std::function<Result<void>(const std::filesystem::path& master_image,
+                                   const PciHardwareId& pci)>;
+
     explicit HttpDaemon(NetworkAddress listen_address = NetworkAddress(0, 0, 0, 0, 18080));
     ~HttpDaemon() override;
 
@@ -162,6 +181,21 @@ public:
     void set_static_root(std::filesystem::path root);
     /** @brief Overrides the default arm_offline_system_hive() implementation. */
     void set_hive_arming_function(HiveArmingFunction fn);
+    /**
+     * @brief Overrides the default cumulative-enrollment implementation.
+     *
+     * Passing an empty function restores RegBootStart::arm_vhd_pci_hardware().
+     */
+    void set_hardware_enrollment_function(HardwareEnrollmentFunction fn);
+    /**
+     * @brief Where hardware_manifest.json lives.
+     *
+     * Defaults to "hardware_manifest.json" in the server's working directory;
+     * tests point it inside their scratch directory so suites cannot enrol each
+     * other's PCI ids.
+     */
+    void set_hardware_manifest_path(std::filesystem::path path);
+    [[nodiscard]] std::filesystem::path hardware_manifest_path() const;
     void set_server_ip(NetworkAddress ip);
     void set_gateway(NetworkAddress gateway);
     void set_target_iqn(std::string iqn);
@@ -328,6 +362,8 @@ private:
     std::shared_ptr<ClientSessionManager> session_mgr_;
     std::filesystem::path static_root_;
     HiveArmingFunction hive_arming_fn_;
+    HardwareEnrollmentFunction hardware_enrollment_fn_;
+    std::filesystem::path hardware_manifest_path_{"hardware_manifest.json"};
     std::string target_iqn_;
     std::string initiator_prefix_;
 
@@ -350,5 +386,39 @@ private:
 
     mutable std::mutex config_mutex_;
 };
+
+/**
+ * @brief Clean SAN boot script emitting strictly the target with keep-san 1.
+ *
+ * Windows kernel msiscsi requires the ACPI iBFT table in memory to locate \Device\Harddisk0.
+ * NEVER include --no-describe on sanboot or sanhook.
+ */
+std::string generate_clean_sanboot_script(const std::string& server_ip,
+                                          const std::string& target_iqn);
+
+/**
+ * @brief The standard SAN boot script an already-enrolled station receives.
+ *
+ * Deliberately the minimal iPXE sequence -- keep the SAN attachment across the
+ * hand-off and boot it -- with no pretence on screen about registry state that
+ * this server did not just verify.
+ */
+std::string generate_standard_san_boot_script(const std::string& server_ip,
+                                              const std::string& target_iqn);
+
+/**
+ * @brief Pass 1 of the cumulative enrollment flow.
+ *
+ * A five-second holding screen naming the PCI id being baked into the master
+ * VHD, then a reboot back through /boot, which will find the id in
+ * hardware_manifest.json and dispatch generate_standard_san_boot_script().
+ *
+ * @param failure_detail empty on the success path; otherwise the reason the
+ *      enrollment task failed, shown to the operator before the station
+ *      retries. A silent reboot loop would be undiagnosable.
+ */
+std::string generate_enrollment_holding_screen(const std::string& ven,
+                                               const std::string& dev,
+                                               const std::string& failure_detail);
 
 } // namespace cobdiskless

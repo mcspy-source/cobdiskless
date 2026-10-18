@@ -85,6 +85,13 @@ struct MachineRecord {
     // --- enrollment (clients.json / clients.conf agree on one flag) -------
     bool super_client{false};
 
+    // --- strict hardware gate ------------------------------------------------
+    // force_sniff pins a station to the cobsniffer detour regardless of image
+    // assignment or cached state. Operator-set (management console / PUT
+    // /api/v1/station); default false. Used to force a fresh telemetry cycle
+    // on bare-metal stations whose NIC was never exactly enrolled.
+    bool force_sniff{false};
+
     // --- hardware validation & zero-touch enrollment ----------------------
     std::string uuid;
     bool is_validated{false};

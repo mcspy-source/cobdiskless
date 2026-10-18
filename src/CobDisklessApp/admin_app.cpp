@@ -3,6 +3,7 @@
 #include "admin_app.hpp"
 #include "CobDisklessCore/config/simple_json.hpp"
 #include "CobDisklessCore/image/reg_bootstart.hpp"
+#include "CobDisklessCore/image/hardware_manifest.hpp"
 #include "CobDisklessCore/image/image_inspector.hpp"
 #include "CobDisklessCore/image/golden_image.hpp"
 #include "CobDisklessCore/image/image_manager.hpp"
@@ -16,7 +17,7 @@
 #include "CobDisklessCore/client/client_database.hpp"
 #include "CobDisklessCore/client/station_manager.hpp"
 #include "CobDisklessCore/storage/block_cache.hpp"
-#include "CobDisklessCore/storage/cow_block_device.hpp"
+#include "CobDisklessCore/storage/unified_cow_device.hpp"
 #include "CobDisklessCore/storage/overlay_naming.hpp"
 #include "CobDisklessCore/storage/vhd_image_backend.hpp"
 #include "CobDisklessCore/storage/raw_image_backend.hpp"
@@ -26,6 +27,7 @@
 #include <sstream>
 #include <fstream>
 #include <csignal>
+#include <chrono>
 #include <thread>
 #include <vector>
 #include <string>
@@ -54,6 +56,7 @@ static std::atomic<bool> g_cli_stop_requested{false};
 #if defined(_WIN32)
 static BOOL WINAPI ConsoleCtrlHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT) {
+        Logger::default_logger().warn("CORE", "[CORE] ConsoleCtrlHandler received signal: " + std::to_string(signal));
         g_cli_stop_requested.store(true);
         return TRUE;
     }
@@ -227,8 +230,61 @@ int AdminApp::cli_list_clients() {
     return 0;
 }
 
-int AdminApp::cli_list_drives() {
-    std::cout << "=========================================================\n";
+int AdminApp::cli_superclient(bool enable, const std::string& mac_or_station) {
+    if (!client_manager_) {
+        std::cerr << "ERROR: Client manager not initialized\n";
+        return 1;
+    }
+    if (mac_or_station.empty()) {
+        std::cerr << "Usage: cobdiskless_app superclient <enable|disable> --mac <mac> [--station <name>]\n";
+        return 1;
+    }
+    std::optional<ClientRecord> rec = client_manager_->find_by_mac(mac_or_station);
+    if (!rec.has_value()) {
+        rec = client_manager_->find_by_name(mac_or_station);
+    }
+    if (!rec.has_value()) {
+        std::cerr << "ERROR: No client with MAC or station name '" << mac_or_station << "' found\n";
+        return 1;
+    }
+    const std::string mac = rec->mac_address;
+    auto res = client_manager_->set_super_client(mac, enable);
+    if (!res.is_ok()) {
+        std::cerr << "ERROR: " << res.error().message() << "\n";
+        return 1;
+    }
+    if (session_manager_) {
+        if (auto sess = session_manager_->find_session(ClientId(mac))) {
+            sess->set_super_client(enable);
+        } else if (auto by_mac = session_manager_->find_session_by_mac(mac)) {
+            by_mac->set_super_client(enable);
+        }
+    }
+    auto_save();
+    std::cout << "Super Client " << (enable ? "ENABLED" : "DISABLED")
+              << " for " << rec->pc_name << " (" << mac << ")\n";
+    if (enable) {
+        std::cout << "Writeback for this station will be retained across reboots. "
+                     "Other stations booting '" << rec->os_image_id
+                  << "' will log a torn-image warning until you commit.\n";
+    }
+    return 0;
+}
+
+int AdminApp::cli_commit(const std::string& mac_or_station, bool backup) {
+    if (mac_or_station.empty()) {
+        std::cerr << "Usage: cobdiskless_app commit --mac <mac> [--station <name>] [--backup]\n";
+        return 1;
+    }
+    auto res = CommitWritebackToBase(mac_or_station, backup);
+    if (!res.is_ok()) {
+        std::cerr << "ERROR: commit failed: " << res.error().message() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+int AdminApp::cli_list_drives() {    std::cout << "=========================================================\n";
     std::cout << " CobDiskless Physical Drive Roles\n";
     std::cout << "=========================================================\n";
     (void)storage_manager_->scan_drives();
@@ -343,13 +399,44 @@ int AdminApp::cli_inspect_image(const std::filesystem::path& image_path) {
     return 0;
 }
 
-int AdminApp::cli_arm_image(const std::filesystem::path& vhd_path) {
+int AdminApp::cli_arm_image(const std::filesystem::path& vhd_path, uint16_t ven, uint16_t dev,
+                      const std::string& subsys_hex, const std::string& rev_hex) {
     std::cout << "=========================================================\n";
     std::cout << " CobDiskless Offline Image Armer & Driver Sanitization\n";
     std::cout << " Target: " << vhd_path.string() << "\n";
+    if (ven != 0 && dev != 0) {
+        std::cout << " Enrolling PCI: VEN_" << std::hex << ven << " DEV_" << dev << std::dec << "\n";
+    }
     std::cout << "=========================================================\n";
 
-    auto res = RegBootStart::arm_image_offline_pipeline(vhd_path);
+    PciHardwareId pci{ven, dev};
+    {
+        // SUBSYS_XXXXXXXX (sub-device first, Windows order) + REV_XX, as
+        // harvested from PCI config space offsets 0x2E/0x2C/0x08.
+        auto take_hex = [](const std::string& s, size_t digits, unsigned* out) -> bool {
+            if (s.size() != digits) return false;
+            try {
+                size_t pos = 0;
+                unsigned v = std::stoul(s, &pos, 16);
+                if (pos != s.size()) return false;
+                *out = v;
+                return true;
+            } catch (...) { return false; }
+        };
+        unsigned subsys = 0, rev = 0;
+        if (take_hex(subsys_hex, 8, &subsys)) {
+            pci.subsys_device = static_cast<uint16_t>((subsys >> 16) & 0xFFFF);
+            pci.subsys_vendor = static_cast<uint16_t>(subsys & 0xFFFF);
+            pci.has_subsys = (pci.subsys_device != 0 || pci.subsys_vendor != 0);
+        }
+        if (take_hex(rev_hex, 2, &rev)) {
+            pci.revision = static_cast<uint8_t>(rev & 0xFF);
+            pci.has_revision = true;
+        }
+    }
+    auto res = (ven != 0 && dev != 0)
+        ? RegBootStart::arm_image_offline_pipeline(vhd_path, &pci)
+        : RegBootStart::arm_image_offline_pipeline(vhd_path);
     if (!res.is_ok()) {
         std::cerr << "[ERROR] Arming pipeline failed: " << res.error().message() << "\n";
         return 1;
@@ -357,6 +444,29 @@ int AdminApp::cli_arm_image(const std::filesystem::path& vhd_path) {
 
     const auto& report = res.value();
     std::cout << report.summary() << "\n";
+
+    if (ven != 0 && dev != 0) {
+        const std::string hw_id = HardwareManifest::hardware_id(pci);
+        std::filesystem::path manifest_paths[] = {
+            "hardware_manifest.json",
+            "build/bin/hardware_manifest.json",
+            "C:/Windows/System32/hardware_manifest.json"
+        };
+        for (const auto& mp : manifest_paths) {
+            HardwareManifest manifest(mp);
+            (void)manifest.load();
+            if (manifest.enroll(hw_id)) {
+                std::cout << "[MANIFEST] Recorded " << hw_id << " in " << mp.string() << "\n";
+            }
+            if (pci.specific()) {
+                const std::string generic = HardwareManifest::hardware_id(ven, dev);
+                if (manifest.enroll(generic)) {
+                    std::cout << "[MANIFEST] Recorded " << generic << " in " << mp.string() << "\n";
+                }
+            }
+        }
+    }
+
     std::cout << "=========================================================\n";
     std::cout << "[SUCCESS] Offline image armed, sanitized, and stamped READ-ONLY.\n";
     std::cout << "=========================================================\n";
@@ -534,39 +644,87 @@ void AdminApp::stop_config_watcher() {
 }
 
 Result<void> AdminApp::commit_super_client(const std::string& mac) {
+    auto r = CommitWritebackToBase(mac, /*backup=*/false);
+    if (!r.is_ok()) {
+        return r.error();
+    }
+    return {};
+}
+
+Result<AdminApp::CommitSummary> AdminApp::CommitWritebackToBase(
+    const std::string& mac_or_station, bool backup) {
     if (!client_manager_) {
         return Error(ErrorCode::InitializationFailure, "Client manager not initialized");
     }
 
-    auto rec = client_manager_->get_client_by_mac(mac);
-    if (!rec) {
-        return Error(ErrorCode::StorageFailure, "Client with MAC " + mac + " not found");
+    // 1. Resolve a MAC (any spelling) or a station/PC name to a record.
+    std::optional<ClientRecord> rec = client_manager_->find_by_mac(mac_or_station);
+    if (!rec.has_value()) {
+        rec = client_manager_->find_by_name(mac_or_station);
     }
+    if (!rec.has_value()) {
+        return Error(ErrorCode::StorageFailure,
+                     "No client with MAC or station name '" + mac_or_station + "' found");
+    }
+    const std::string mac = rec->mac_address;
 
     if (!rec->is_super_client) {
-        return Error(ErrorCode::InvalidConfiguration, "Client " + rec->pc_name + " is not in Super Client mode");
+        return Error(ErrorCode::InvalidConfiguration,
+                     "Client " + rec->pc_name + " is not in Super Client mode");
     }
 
-    // Try committing active session first
+    // 2. Safety pre-check: the station's iSCSI session must be closed and no
+    //    live TCP connection may reference it. Merging under a live writer
+    //    would race winload/msiscsi and corrupt the base image.
+    std::shared_ptr<ClientSession> live_session;
     if (session_manager_) {
-        auto active_sess = session_manager_->find_session(ClientId(mac));
-        if (active_sess) {
-            auto res = session_manager_->commit_super_client(ClientId(mac));
-            if (!res.is_ok()) {
-                return res;
-            }
-            auto_save();
-            return {};
+        live_session = session_manager_->find_session(ClientId(mac));
+        if (!live_session) {
+            live_session = session_manager_->find_session_by_mac(mac);
+        }
+    }
+    if (live_session) {
+        const bool quiet =
+            (live_session->state() == ClientState::Offline ||
+             live_session->state() == ClientState::Disconnected) &&
+            live_session->live_connections() == 0;
+        if (!quiet) {
+            return Error(ErrorCode::InvalidConfiguration,
+                         "Station " + rec->pc_name + " still has a live iSCSI session (state=" +
+                             std::string(to_string(live_session->state())) + ", live TCP=" +
+                             std::to_string(live_session->live_connections()) +
+                             "); disconnect it before committing");
         }
     }
 
-    // If no active session in memory, check if writeback overlay exists on disk
+    // 3. Locate the overlay; refuse if another process (the running daemon)
+    //    holds it open -- an exclusive probe fails on a sharing violation.
     std::filesystem::path wb_path =
         overlay_naming::resolve_writeback_overlay(rec->writeback_dir, mac);
-
     if (!std::filesystem::exists(wb_path)) {
-        return Error(ErrorCode::StorageFailure, "No active session or writeback overlay file found for client " + rec->pc_name);
+        return Error(ErrorCode::StorageFailure,
+                     "No writeback overlay file found for client " + rec->pc_name +
+                         " (" + wb_path.string() + ")");
     }
+#if defined(_WIN32)
+    {
+        HANDLE probe = CreateFileW(wb_path.c_str(), GENERIC_READ, 0, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (probe == INVALID_HANDLE_VALUE) {
+            const DWORD gle = GetLastError();
+            if (gle == ERROR_SHARING_VIOLATION) {
+                return Error(ErrorCode::InvalidConfiguration,
+                             "Writeback overlay " + wb_path.string() +
+                                 " is open by a live session; disconnect " +
+                                 rec->pc_name + " before committing");
+            }
+        } else {
+            CloseHandle(probe);
+        }
+    }
+#endif
+
+    const auto t0 = std::chrono::steady_clock::now();
 
     if (!image_manager_) {
         image_manager_ = std::make_shared<ImageManager>(registry_);
@@ -580,79 +738,137 @@ Result<void> AdminApp::commit_super_client(const std::string& mac) {
     }
     auto golden_img = img_res.value();
 
-    auto cow_res = CowBlockDevice::create(golden_img->device(), wb_path);
-    if (!cow_res.is_ok()) {
-        (void)image_manager_->release_image(golden_img->id());
-        return cow_res.error();
-    }
-    auto cow = cow_res.value();
-
-    // Open target base image read-write
     auto info_res = image_manager_->get_image_info(golden_img->id());
     if (!info_res.is_ok()) {
         (void)image_manager_->release_image(golden_img->id());
         return info_res.error();
     }
-    const auto& file_path = info_res.value().file_path;
-    std::shared_ptr<BlockDevice> target_backend;
-    ImageFormat fmt = info_res.value().format;
+    const std::filesystem::path base_path = info_res.value().file_path;
 
-    // Drop the cached read-only handle first so the offline exclusive commit
-    // starts from a clean sharing state.
-    (void)image_manager_->evict_cached_image(golden_img->id());
+    // 4. Optional pre-commit backup of the base image.
+    std::string backup_path;
+    if (backup) {
+        backup_path = base_path.string() + ".bak";
+        std::error_code ec;
+        (void)std::filesystem::copy_file(
+            base_path, backup_path,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            (void)image_manager_->release_image(golden_img->id());
+            return Error(ErrorCode::StorageFailure,
+                         "Backup copy failed (" + base_path.string() + " -> " +
+                             backup_path + "): " + ec.message());
+        }
+        Logger::default_logger().info("SUPER_CLIENT",
+            "Base image backed up to " + backup_path + " before commit.");
+    }
 
-    // Offline Super Client commit: the three opens below are the sanctioned
-    // master-image writers, so they carry the explicit ReadOnlyAttributePolicy
-    // that lifts FILE_ATTRIBUTE_READONLY and re-applies it when the writer
-    // closes (VHDX: the backend never writes, so there is nothing to lift).
-    if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic || fmt == ImageFormat::VhdDifferencing) {
-        auto vhd_res = VhdImageBackend::open(file_path, /*read_only=*/false,
-                                             ReadOnlyAttributePolicy::Lift);
-        if (!vhd_res.is_ok()) {
-            (void)image_manager_->reload_image(golden_img->id());
-            (void)image_manager_->release_image(golden_img->id());
-            return vhd_res.error();
+    UnifiedCowDevice::CowMergeStats stats;
+    if (live_session && live_session->cow_device()) {
+        // Quiesced in-memory session: account from pre-merge dirty bytes,
+        // then use the existing session commit path verbatim.
+        const uint64_t dirty = live_session->cow_device()->dirty_bytes();
+        auto res = session_manager_->commit_super_client(ClientId(mac));
+        if (!res.is_ok()) {
+            return res.error();
         }
-        target_backend = vhd_res.value();
-    } else if (fmt == ImageFormat::Vhdx) {
-        auto vhdx_res = VhdxImageBackend::open(file_path, /*read_only=*/false);
-        if (!vhdx_res.is_ok()) {
-            (void)image_manager_->reload_image(golden_img->id());
-            (void)image_manager_->release_image(golden_img->id());
-            return vhdx_res.error();
-        }
-        target_backend = vhdx_res.value();
+        stats.bytes_written = dirty;
+        stats.chunks_merged =
+            static_cast<size_t>((dirty + 65535) / 65536);
     } else {
-        auto raw_res = RawImageBackend::open(file_path, /*read_only=*/false,
-                                             ReadOnlyAttributePolicy::Lift);
-        if (!raw_res.is_ok()) {
+        auto cow_res = UnifiedCowDevice::create(golden_img->device(), wb_path);
+        if (!cow_res.is_ok()) {
+            (void)image_manager_->release_image(golden_img->id());
+            return cow_res.error();
+        }
+        auto cow = cow_res.value();
+
+        // Open target base image read-write (sanctioned master writer).
+        const auto& file_path = base_path;
+        ImageFormat fmt = info_res.value().format;
+        std::shared_ptr<BlockDevice> target_backend;
+
+        // Drop the cached read-only handle first so the offline exclusive
+        // commit starts from a clean sharing state.
+        (void)image_manager_->evict_cached_image(golden_img->id());
+
+        // Offline Super Client commit: the three opens below are the
+        // sanctioned master-image writers, so they carry the explicit
+        // ReadOnlyAttributePolicy that lifts FILE_ATTRIBUTE_READONLY and
+        // re-applies it when the writer closes (VHDX: the backend never
+        // writes, so there is nothing to lift).
+        if (fmt == ImageFormat::VhdFixed || fmt == ImageFormat::VhdDynamic ||
+            fmt == ImageFormat::VhdDifferencing) {
+            auto vhd_res = VhdImageBackend::open(file_path, /*read_only=*/false,
+                                                 ReadOnlyAttributePolicy::Lift);
+            if (!vhd_res.is_ok()) {
+                (void)image_manager_->reload_image(golden_img->id());
+                (void)image_manager_->release_image(golden_img->id());
+                return vhd_res.error();
+            }
+            target_backend = vhd_res.value();
+        } else if (fmt == ImageFormat::Vhdx) {
+            auto vhdx_res = VhdxImageBackend::open(file_path, /*read_only=*/false);
+            if (!vhdx_res.is_ok()) {
+                (void)image_manager_->reload_image(golden_img->id());
+                (void)image_manager_->release_image(golden_img->id());
+                return vhdx_res.error();
+            }
+            target_backend = vhdx_res.value();
+        } else {
+            auto raw_res = RawImageBackend::open(file_path, /*read_only=*/false,
+                                                 ReadOnlyAttributePolicy::Lift);
+            if (!raw_res.is_ok()) {
+                (void)image_manager_->reload_image(golden_img->id());
+                (void)image_manager_->release_image(golden_img->id());
+                return raw_res.error();
+            }
+            target_backend = raw_res.value();
+        }
+
+        auto merge_res = cow->merge_into(target_backend, &stats);
+        (void)target_backend->flush();
+        target_backend.reset();
+
+        if (!merge_res.is_ok()) {
             (void)image_manager_->reload_image(golden_img->id());
             (void)image_manager_->release_image(golden_img->id());
-            return raw_res.error();
+            return merge_res.error();
         }
-        target_backend = raw_res.value();
-    }
 
-    auto merge_res = cow->merge_into(target_backend);
-    (void)target_backend->flush();
-    target_backend.reset();
-
-    if (!merge_res.is_ok()) {
-        (void)image_manager_->reload_image(golden_img->id());
+        (void)cow->reset();
+        cow->close();
         (void)image_manager_->release_image(golden_img->id());
-        return merge_res.error();
+        (void)image_manager_->reload_image(golden_img->id());
     }
 
-    (void)cow->reset();
-    cow->close();
-    (void)image_manager_->release_image(golden_img->id());
-    (void)image_manager_->reload_image(golden_img->id());
-
-    Logger::default_logger().info("SUPER_CLIENT",
-        "Client " + mac + " changes successfully committed to " + rec->os_image_id + ".");
-
+    // 5. Clear the flag so the next boot is a normal client boot, then save.
+    (void)client_manager_->set_super_client(mac, false);
     auto_save();
-    return {};
+
+    CommitSummary summary;
+    summary.chunks_merged = stats.chunks_merged;
+    summary.bytes_written = stats.bytes_written;
+    summary.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    summary.base_path = base_path.string();
+    summary.backup_path = backup_path;
+
+    const double mb =
+        static_cast<double>(summary.bytes_written) / (1024.0 * 1024.0);
+    std::ostringstream msg;
+    msg << "Commit complete for " << rec->pc_name << " (" << mac << "): "
+        << summary.chunks_merged << " blocks merged, "
+        << std::fixed << std::setprecision(1) << mb << " MB written to "
+        << summary.base_path << " in "
+        << std::setprecision(1) << summary.seconds << "s";
+    if (!summary.backup_path.empty()) {
+        msg << " [backup: " << summary.backup_path << "]";
+    }
+    Logger::default_logger().info("SUPER_CLIENT", msg.str());
+    std::cout << msg.str() << "\n";
+
+    return summary;
 }
 
 // ---------------------------------------------------------------------------
@@ -852,14 +1068,22 @@ Result<void> AdminApp::start_server_services() {
         }
     }
 
-    // Resolve effective server IP (prefer detected adapter over loopback/unspecified)
+    // Resolve effective server IP (prefer detected adapter over loopback/unspecified or stale mismatch)
     NetworkAddress effective_srv = config_.server_address();
     const bool needs_server_ip = effective_srv.is_loopback() ||
-                                 (effective_srv.octet(0) == 0 && effective_srv.octet(3) == 0);
-    if (needs_server_ip) {
-        NetworkAddress detected = host_net.usable()
-            ? host_net.ip
-            : NetworkAddress::detect_local_ip(67);
+                                 (effective_srv.octet(0) == 0 && effective_srv.octet(3) == 0) ||
+                                 (config_.network_auto_detect() && host_net.usable() &&
+                                  (config_.network_interface().empty() || config_.network_interface() == "default" ||
+                                   config_.network_interface() == host_net.interface_name));
+    if (needs_server_ip && host_net.usable()) {
+        effective_srv = NetworkAddress(host_net.ip.octet(0), host_net.ip.octet(1),
+                                       host_net.ip.octet(2), host_net.ip.octet(3),
+                                       effective_srv.port());
+    } else if (needs_server_ip && config_.network_auto_detect()) {
+        // NAT/sim contexts (e.g. QEMU user-net guests reaching us via the
+        // host loopback) explicitly configure 127.0.0.1 with auto-detect off;
+        // honour that instead of substituting the LAN adapter address.
+        NetworkAddress detected = NetworkAddress::detect_local_ip(67);
         if (!detected.is_loopback() && (detected.octet(0) != 0 || detected.octet(3) != 0)) {
             effective_srv = NetworkAddress(detected.octet(0), detected.octet(1),
                                            detected.octet(2), detected.octet(3),
@@ -966,6 +1190,14 @@ Result<void> AdminApp::start_server_services() {
         dhcp->set_station_manager(station_manager_);
     }
 
+    if (config_.dhcp_mode() == "standard" || config_.dhcp_mode() == "full") {
+        dhcp->set_mode(DhcpServerMode::Standard);
+        Logger::default_logger().info("DHCP", "Configured DHCP mode: Standard (full DHCP server, rogue probe disabled)");
+    } else if (config_.dhcp_mode() == "proxy" || config_.dhcp_mode() == "proxydhcp") {
+        dhcp->set_mode(DhcpServerMode::ProxyDhcp);
+        Logger::default_logger().info("DHCP", "Configured DHCP mode: ProxyDHCP");
+    }
+
     std::filesystem::path tftp_root = Configuration::resolve_tftp_boot_directory(config_.tftp_boot_dir());
     std::error_code ec_tftp;
     if (!std::filesystem::exists(tftp_root, ec_tftp)) {
@@ -979,6 +1211,8 @@ Result<void> AdminApp::start_server_services() {
     );
     tftp->set_client_manager(client_manager_);
     tftp->set_image_manager(image_manager_);
+    tftp->set_session_manager(session_manager_);
+    tftp->set_dhcp_server(dhcp);
 
     IscsiTargetConfig iscsi_cfg;
     iscsi_cfg.listen_address = NetworkAddress(0, 0, 0, 0, 3260);
@@ -1243,6 +1477,7 @@ int AdminApp::cli_start_server(bool run_in_background) {
         }
     }
 
+    Logger::default_logger().info("CORE", "[CORE] g_cli_stop_requested triggered, shutting down diskless services...");
     std::cout << "\nShutting down diskless services...\n";
     stop_server_services();
     std::cout << "CobDiskless Server safely stopped.\n";
@@ -3094,10 +3329,62 @@ int AdminApp::run(int argc_in, char* argv_in[]) {
         return cli_inspect_image(argv[2]);
     } else if (arg1 == "--arm-image" || arg1 == "--arm" || arg1 == "arm") {
         if (argc < 3) {
-            std::cerr << "Usage: cobdiskless_app arm <path_to_vhd_or_hive>\n";
+            std::cerr << "Usage: cobdiskless_app arm <path_to_vhd_or_hive> [ven_hex] [dev_hex] [subsys_hex] [rev_hex]\n";
+            std::cerr << "  subsys_hex: SUBSYS_<subdev><subven> (8 hex, PCI config 0x2E/0x2C)\n";
+            std::cerr << "  rev_hex:    revision ID (2 hex, PCI config 0x08)\n";
             return 1;
         }
-        return cli_arm_image(argv[2]);
+        uint16_t ven = 0;
+        uint16_t dev = 0;
+        std::string subsys, rev;
+        if (argc >= 5) {
+            try {
+                ven = static_cast<uint16_t>(std::stoul(argv[3], nullptr, 16));
+                dev = static_cast<uint16_t>(std::stoul(argv[4], nullptr, 16));
+            } catch (...) {}
+        }
+        if (argc >= 6) subsys = argv[5];
+        if (argc >= 7) rev = argv[6];
+        return cli_arm_image(argv[2], ven, dev, subsys, rev);
+    } else if (arg1 == "superclient" || arg1 == "--superclient") {
+        bool enable = true;
+        bool have_mode = false;
+        std::string target;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--mac" || a == "--station") && i + 1 < argc) {
+                target = argv[++i];
+            } else if (a == "enable") {
+                enable = true;
+                have_mode = true;
+            } else if (a == "disable") {
+                enable = false;
+                have_mode = true;
+            }
+        }
+        if (!have_mode || target.empty()) {
+            std::cerr << "Usage: cobdiskless_app superclient <enable|disable> --mac <mac>\n"
+                      << "       cobdiskless_app superclient <enable|disable> --station <name>\n";
+            return 1;
+        }
+        return cli_superclient(enable, target);
+    } else if (arg1 == "commit" || arg1 == "--commit") {
+        std::string target;
+        bool backup = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--mac" || a == "--station") && i + 1 < argc) {
+                target = argv[++i];
+            } else if (a == "--backup") {
+                backup = true;
+            }
+        }
+        if (target.empty()) {
+            std::cerr << "Usage: cobdiskless_app commit --mac <mac> [--backup]\n"
+                      << "       cobdiskless_app commit --station <name> [--backup]\n";
+            return 1;
+        }
+        return cli_commit(target, backup);
     } else if (arg1 == "--list-images") {
         return cli_list_images();
     } else if (arg1 == "--add-image") {

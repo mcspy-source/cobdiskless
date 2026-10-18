@@ -226,10 +226,18 @@ struct WimbootOptions {
     }
     std::string script;
     script += "#!ipxe\n";
-    script += "dhcp\n";
-    script += "set root-path iscsi:" + srv + "::::" + iqn + "\n";
-    script += "sanboot --drive 0x80 ${root-path}\n";
+    script += "set net0/gateway 0.0.0.0\n";
+    script += "set keep-san 1\n";
+    script += "echo [CobDiskless] Attaching SAN volume for ${net0/mac}...\n";
+    script += "sanhook --drive 0x80 --keep iscsi:" + srv + "::::" + iqn + " || goto san_fail\n";
+    script += "sanboot --drive 0x80 || goto san_fail\n\n";
+    script += ":san_fail\n";
+    script += "echo [ERROR] Failed to attach or boot from SAN target!\n";
+    script += "echo Dropping to iPXE recovery shell in 5s...\n";
+    script += "sleep 5\n";
+    script += "shell\n";
     return script;
+
 }
 
 /**
@@ -511,12 +519,38 @@ struct PlatformMismatchOptions {
 }
 
 /**
+ * @brief The six iPXE settings lines that harvest PCI telemetry.
+ *
+ * Shared by every script that must learn the boot NIC before deciding:
+ * `ven`/`dev` (config 0x00/0x02), `rev` (0x08), `subven`/`subdev`
+ * (0x2C/0x2E). On builds/NICs without `${pci/...}` support everything
+ * expands empty and the server treats the params as absent (legacy path).
+ */
+[[nodiscard]] inline std::string pci_sniff_script_lines() {
+    std::string script;
+    script += "set busloc ${net0/busloc}\n";
+    script += "set ven ${pci/${busloc}.0.2:hex}\n";
+    script += "set dev ${pci/${busloc}.2.2:hex}\n";
+    script += "set rev ${pci/${busloc}.8.1:hex}\n";
+    script += "set subven ${pci/${busloc}.2c.2:hex}\n";
+    script += "set subdev ${pci/${busloc}.2e.2:hex}\n";
+    return script;
+}
+
+/**
  * @brief Builds the one-shot re-chain that makes `${platform}` reach the server.
  *
  * DHCP cannot expand iPXE variables, so the boot URL it hands out is bare and
  * the first /boot.ipxe request carries no `platform`. When the guard has an
  * image format to judge against, the firmware class is the only missing half --
  * ask for it once, then decide on the second hop.
+ *
+ * The same hop also harvests PCI telemetry (`ven`/`dev` from config 0x00/0x02,
+ * `rev` from 0x08, `subven`/`subdev` from 0x2C/0x2E) so the second hop can
+ * feed the hardware-enrollment route (/boot with ven/dev). Without this,
+ * stock-iPXE bare-metal stations could never enroll: nothing else in their
+ * flow reports PCI ids. Empty expansions are harmless -- the server treats
+ * absent params as "no telemetry" and keeps the legacy behavior.
  *
  * The chained request always carries the `platform` key (even if `${platform}`
  * expanded to nothing), so the second hop can never ask a third time. Failure
@@ -526,7 +560,10 @@ struct PlatformMismatchOptions {
     const std::string sep = (boot_url.find('?') == std::string::npos) ? "?" : "&";
     std::string script;
     script += "#!ipxe\n";
-    script += "chain " + boot_url + sep + "platform=${platform} || goto probe_failed\n";
+    script += pci_sniff_script_lines();
+    script += "chain " + boot_url + sep +
+               "platform=${platform}&ven=${ven}&dev=${dev}&rev=${rev}"
+               "&subven=${subven}&subdev=${subdev}&sniffed=1 || goto probe_failed\n";
     script += "goto probe_done\n";
     script += ":probe_failed\n";
     script += "echo CobDiskless did not answer the firmware check. Rebooting.\n";
