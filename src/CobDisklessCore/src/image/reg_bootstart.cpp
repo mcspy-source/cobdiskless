@@ -7227,12 +7227,71 @@ static bool inject_loaded_offline_hive(BootStartArmReport& report,
     }
 
     // ---- value 3 of 3: the boot-start service table ---------------------------
+    // Hardware gate for the 10/100 miniport family.
+    //
+    // Rtnic64.sys (service RTL8023x64) is the RTL8139/RTL8023AS driver. It can
+    // be present in System32\drivers on an image whose only real adapter is a
+    // Gigabit part (e.g. an RTL8111E, PCI\VEN_10EC&DEV_8168). Arming it to
+    // Start = 0 / network-boot regardless puts a driver the boot path cannot
+    // bind onto a machine into the Phase 0 NDIS chain, where it is selected and
+    // fails, surfacing as a NIC load failure rather than as a missing driver.
+    // Only arm it when this image really does carry an RTL8139-class binding.
+    bool image_has_rtl8139_binding = false;
+    {
+        const std::wstring net_class =
+            control_set + L"\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}";
+        RegKey cls;
+        if (cls.open(root.get(), net_class.c_str(), KEY_READ) == ERROR_SUCCESS) {
+            for (DWORD i = 0; i < 256; ++i) {
+                wchar_t inst_name[64];
+                DWORD cch = static_cast<DWORD>(_countof(inst_name));
+                if (RegEnumKeyExW(cls.get(), i, inst_name, &cch, nullptr, nullptr,
+                                  nullptr, nullptr) != ERROR_SUCCESS) {
+                    break;
+                }
+                const std::wstring inst_path =
+                    net_class + L"\\" + std::wstring(inst_name, cch);
+                RegKey inst;
+                if (inst.open(cls.get(), inst_name, KEY_READ) != ERROR_SUCCESS) continue;
+                wchar_t comp[256] = {0};
+                DWORD cb = sizeof(comp);
+                DWORD type = 0;
+                if (RegQueryValueExW(inst.get(), L"ComponentId", nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(comp), &cb) == ERROR_SUCCESS) {
+                    std::wstring c(comp);
+                    for (wchar_t& ch : c) ch = static_cast<wchar_t>(towlower(ch));
+                    if (c.find(L"ven_10ec") != std::wstring::npos &&
+                        c.find(L"dev_8139") != std::wstring::npos) {
+                        image_has_rtl8139_binding = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Logger::default_logger().info(
+        "ARMER",
+        std::string("[ARMER] RTL8139-class Net class binding present: ") +
+            (image_has_rtl8139_binding ? "yes" : "no"));
+
     for (const auto& spec : RegBootStart::boot_start_services()) {
         const std::wstring key_path = control_set + L"\\Services\\" + to_wide(spec.service);
         const std::string img_path = RegBootStart::service_image_path(spec);
         const std::string binary = img_path.substr(img_path.find_last_of("\\/") + 1);
         const bool staged =
             drivers_dir.empty() || RegBootStart::staged_binary_present(drivers_dir, binary);
+
+        // The 10/100 miniport only joins the boot path when the hardware it
+        // serves is actually on this image. Otherwise leave it exactly as the
+        // image shipped it - do not arm, do not invent a row.
+        if (!image_has_rtl8139_binding && binary == "Rtnic64.sys") {
+            report.missing_services.push_back(spec.service);
+            report.warnings.push_back(
+                std::string(spec.service) +
+                " (Rtnic64.sys) not armed: this image carries no RTL8139-class "
+                "adapter, so the 10/100 miniport is not a boot driver here");
+            continue;
+        }
 
         RegKey service;
         if (service.open(root.get(), key_path.c_str(), KEY_READ | KEY_WRITE) != ERROR_SUCCESS) {
