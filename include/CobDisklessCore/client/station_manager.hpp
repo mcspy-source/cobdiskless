@@ -169,6 +169,23 @@ public:
     Result<void> set_status(std::string_view mac, std::string_view status);
 
     /**
+     * @brief Pins or clears a station's board identity (operator override).
+     *
+     * Unlike add_or_update_station(), this writes subsystem_id and revision
+     * unconditionally, so passing an empty string CLEARS them. Route a clear
+     * through apply_station() and it is silently dropped, leaving the station
+     * exactly enrolled.
+     *
+     * @param subsys_hex 8 hex, SUBSYS_<subdev><subven>; empty clears.
+     * @param rev_hex    2 hex, PCI revision ID; empty clears.
+     */
+    Result<void> set_hardware_identity(std::string_view mac, std::string_view subsys_hex,
+                                       std::string_view rev_hex);
+
+    /// @brief Operator control for the cobsniffer detour pin.
+    Result<void> set_force_sniff(std::string_view mac, bool enabled);
+
+    /**
      * @brief Removes stations whose last_seen (or registered_at if last_seen is
      * empty) is older than station_ttl_days_. Does nothing when ttl is 0.
      * @return Number of entries purged.

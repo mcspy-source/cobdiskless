@@ -32,6 +32,8 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cctype>
+#include <optional>
 
 #if defined(_WIN32)
 #ifndef UNICODE
@@ -280,6 +282,128 @@ int AdminApp::cli_commit(const std::string& mac_or_station, bool backup) {
     if (!res.is_ok()) {
         std::cerr << "ERROR: commit failed: " << res.error().message() << "\n";
         return 1;
+    }
+    return 0;
+}
+
+int AdminApp::cli_set_identity(const std::string& mac_or_station, const std::string& subsys_hex,
+                               const std::string& rev_hex, bool clear, bool force_sniff,
+                               bool show) {
+    if (!station_manager_) {
+        std::cerr << "ERROR: Station manager not initialized\n";
+        return 1;
+    }
+    if (mac_or_station.empty()) {
+        std::cerr << "Usage: cobdiskless_app set-identity --mac <mac> [--subsys <8hex>] [--rev <2hex>]\n"
+                  << "       cobdiskless_app set-identity --mac <mac> --clear\n"
+                  << "       cobdiskless_app set-identity --mac <mac> [--force-sniff] [--show]\n"
+                  << "\n"
+                  << "  --subsys  8 hex, SUBSYS_<subdev><subven> (PCI config 0x2E/0x2C)\n"
+                  << "  --rev     2 hex, revision ID (PCI config 0x08)\n"
+                  << "  --clear   drop the pinned identity and go back to sniffing\n"
+                  << "  --force-sniff  pin the station to the cobsniffer detour\n"
+                  << "  --show    print the current identity and exit\n";
+        return 1;
+    }
+
+    std::optional<StationEntry> rec = station_manager_->find_by_mac(mac_or_station);
+    if (!rec.has_value()) {
+        rec = station_manager_->find_by_name(mac_or_station);
+    }
+    if (!rec.has_value()) {
+        std::cerr << "ERROR: No station with MAC or name '" << mac_or_station << "'\n";
+        return 1;
+    }
+
+    if (show) {
+        std::cout << "Station " << rec->name << " (" << rec->mac << ")\n";
+        std::cout << "  image        : " << rec->image << "\n";
+        std::cout << "  boot_mode    : " << rec->boot_mode << "\n";
+        std::cout << "  subsystem_id : "
+                  << (rec->subsystem_id.empty() ? "(empty - never enrolled)" : rec->subsystem_id) << "\n";
+        std::cout << "  revision_id  : "
+                  << (rec->revision_id.empty() ? "(empty - never enrolled)" : rec->revision_id) << "\n";
+        std::cout << "  force_sniff  : " << (rec->force_sniff ? "true" : "false") << "\n";
+        return 0;
+    }
+
+    // Validate before touching the registry: a malformed subsys would reach
+    // evaluate_boot_route and quietly keep the station in kDetour, which looks
+    // exactly like "the override did not take".
+    if (!clear) {
+        auto is_hex = [](const std::string& s, size_t want) {
+            if (s.size() != want) return false;
+            for (char ch : s) {
+                if (!std::isxdigit(static_cast<unsigned char>(ch))) return false;
+            }
+            return true;
+        };
+        if (!subsys_hex.empty() && !is_hex(subsys_hex, 8)) {
+            std::cerr << "ERROR: --subsys must be exactly 8 hex digits, e.g. 307C17AA\n";
+            return 1;
+        }
+        if (!rev_hex.empty() && !is_hex(rev_hex, 2)) {
+            std::cerr << "ERROR: --rev must be exactly 2 hex digits, e.g. 06\n";
+            return 1;
+        }
+        if (subsys_hex.empty() && rev_hex.empty() && !force_sniff) {
+            std::cerr << "ERROR: nothing to change. Pass --subsys/--rev, --clear, "
+                         "or --force-sniff.\n";
+            return 1;
+        }
+    }
+
+    StationEntry updated = *rec;
+    std::string new_subsys, new_rev;
+    if (clear) {
+        new_subsys.clear();
+        new_rev.clear();
+    } else {
+        // NB: assign first, then normalise in place. Writing through
+        // .begin() of the still-empty destination would transform nothing.
+        auto lower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            return s;
+        };
+        new_subsys = lower(subsys_hex);
+        new_rev = lower(rev_hex);
+    }
+
+    // set_hardware_identity, not add_or_update_station: the latter routes
+    // through apply_station(), which skips empty subsystem_id/revision_id on
+    // purpose, so a --clear would report success and change nothing.
+    auto res = station_manager_->set_hardware_identity(updated.mac, new_subsys, new_rev);
+    if (!res.is_ok()) {
+        std::cerr << "ERROR: " << res.error().message() << "\n";
+        return 1;
+    }
+    if (clear || force_sniff) {
+        auto fr = station_manager_->set_force_sniff(updated.mac, clear ? false : true);
+        if (!fr.is_ok()) {
+            std::cerr << "ERROR: " << fr.error().message() << "\n";
+            return 1;
+        }
+    }
+    updated.subsystem_id = new_subsys;
+    updated.revision_id = new_rev;
+    if (clear) updated.force_sniff = false;
+    else if (force_sniff) updated.force_sniff = true;
+    auto_save();
+
+    std::cout << "Identity updated for " << updated.name << " (" << updated.mac << "):\n"
+              << "  subsystem_id : "
+              << (updated.subsystem_id.empty() ? "(cleared)" : updated.subsystem_id) << "\n"
+              << "  revision_id  : "
+              << (updated.revision_id.empty() ? "(cleared)" : updated.revision_id) << "\n"
+              << "  force_sniff  : " << (updated.force_sniff ? "true" : "false") << "\n";
+    if (!updated.subsystem_id.empty() && updated.subsystem_id.size() == 8 &&
+        updated.revision_id.size() == 2) {
+        std::cout << "\nThis board is now exactly enrolled. On its next boot the server\n"
+                  << "serves the SAN script directly and replays this identity instead of\n"
+                  << "waiting on a cobsniffer round trip.\n";
+        std::cout << "Note: the identity is only useful if the base image actually carries a\n"
+                  << "binding for it. It does NOT change what the client reports.\n";
     }
     return 0;
 }
@@ -3368,6 +3492,26 @@ int AdminApp::run(int argc_in, char* argv_in[]) {
             return 1;
         }
         return cli_superclient(enable, target);
+    } else if (arg1 == "set-identity" || arg1 == "--set-identity") {
+        std::string target, subsys, rev;
+        bool clear = false, force_sniff = false, show = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if ((a == "--mac" || a == "--station") && i + 1 < argc) {
+                target = argv[++i];
+            } else if (a == "--subsys" && i + 1 < argc) {
+                subsys = argv[++i];
+            } else if (a == "--rev" && i + 1 < argc) {
+                rev = argv[++i];
+            } else if (a == "--clear") {
+                clear = true;
+            } else if (a == "--force-sniff") {
+                force_sniff = true;
+            } else if (a == "--show") {
+                show = true;
+            }
+        }
+        return cli_set_identity(target, subsys, rev, clear, force_sniff, show);
     } else if (arg1 == "commit" || arg1 == "--commit") {
         std::string target;
         bool backup = false;

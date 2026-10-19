@@ -458,6 +458,36 @@ Result<void> StationManager::set_status(std::string_view mac, std::string_view s
     });
 }
 
+Result<void> StationManager::set_hardware_identity(std::string_view mac, std::string_view subsys_hex,
+                                                   std::string_view rev_hex) {
+    const std::string norm = normalize_mac(mac);
+    return store_->mutate([&](MachineMap& all) -> Result<void> {
+        const auto it = all.find(norm);
+        if (it == all.end()) {
+            return Error(ErrorCode::InvalidConfiguration, "Station not found: " + norm);
+        }
+        // Writes through unconditionally, including with an empty value.
+        // apply_station() deliberately skips empty subsystem_id/revision_id
+        // ("only a fresh enrollment writes these"), so a clear routed through
+        // it is silently dropped and the station stays enrolled forever.
+        it->second.subsystem_id = std::string(subsys_hex);
+        it->second.revision = std::string(rev_hex);
+        return {};
+    });
+}
+
+Result<void> StationManager::set_force_sniff(std::string_view mac, bool enabled) {
+    const std::string norm = normalize_mac(mac);
+    return store_->mutate([&](MachineMap& all) -> Result<void> {
+        const auto it = all.find(norm);
+        if (it == all.end()) {
+            return Error(ErrorCode::InvalidConfiguration, "Station not found: " + norm);
+        }
+        it->second.force_sniff = enabled;
+        return {};
+    });
+}
+
 size_t StationManager::purge_stale_stations() {
     const int ttl_days = station_ttl_days_;
     if (ttl_days <= 0) {

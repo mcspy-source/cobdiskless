@@ -56,6 +56,9 @@ public:
     int cli_start_server(bool run_in_background = false);
     int cli_superclient(bool enable, const std::string& mac_or_station);
     int cli_commit(const std::string& mac_or_station, bool backup);
+    int cli_set_identity(const std::string& mac_or_station, const std::string& subsys_hex,
+                         const std::string& rev_hex, bool clear, bool force_sniff,
+                         bool show);
 
     // Server lifecycle controls
     Result<void> start_server_services();
