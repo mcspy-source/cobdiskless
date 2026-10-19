@@ -2128,6 +2128,12 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
         // Absent telemetry falls back to the client-database record below,
         // then to the legacy generic binding.
         std::string subsys_raw = param("subsys");
+        // iPXE's :hex setting type renders bytes colon-separated ("1a:f4"), the
+        // same shape VEN/DEV arrive in and have colons stripped for above. Without
+        // this, parse_hex() stops at the first ':', pos != size, and returns false
+        // -- so a perfectly good SUBSYS read as "absent" and the station could
+        // never be exactly enrolled even though the client sent real values.
+        subsys_raw.erase(std::remove(subsys_raw.begin(), subsys_raw.end(), ':'), subsys_raw.end());
         std::string rev_raw = param("rev");
         try {
             if (!ven.empty()) ven_val = static_cast<uint16_t>(std::stoul(ven, nullptr, 16));
@@ -2165,8 +2171,12 @@ HttpResponse HttpDaemon::handle_request(std::string_view method,
             // subven = config 0x2C, subdev = config 0x2E.
             if (!pci.has_subsys) {
                 unsigned subven = 0, subdev = 0;
-                if (parse_hex(param("subven"), &subven) &&
-                    parse_hex(param("subdev"), &subdev)) {
+                std::string subven_raw = param("subven");
+                std::string subdev_raw = param("subdev");
+                // Same colon stripping as VEN/DEV/subsys above.
+                subven_raw.erase(std::remove(subven_raw.begin(), subven_raw.end(), ':'), subven_raw.end());
+                subdev_raw.erase(std::remove(subdev_raw.begin(), subdev_raw.end(), ':'), subdev_raw.end());
+                if (parse_hex(subven_raw, &subven) && parse_hex(subdev_raw, &subdev)) {
                     pci.subsys_vendor = static_cast<uint16_t>(subven & 0xFFFF);
                     pci.subsys_device = static_cast<uint16_t>(subdev & 0xFFFF);
                     pci.has_subsys = (pci.subsys_device != 0 || pci.subsys_vendor != 0);
