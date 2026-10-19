@@ -1215,6 +1215,41 @@ Result<void> AdminApp::start_server_services() {
         }
     }
 
+    // --- Unreachable-server-IP guard ----------------------------------------
+    // Whatever effective_srv ends up as is what DHCP hands out in siaddr and
+    // what the bootfile URL is built from. If that address is not actually on
+    // this host, a PXE client cannot fetch boot.ipxe, never attaches the SAN
+    // target, and Windows comes up with no boot device -- which surfaces as
+    // 0x7B INACCESSIBLE_BOOT_DEVICE, a long way from the real cause. That is
+    // exactly what a stale server_ip= did: the adapter was not up yet at
+    // auto-detect time, detection failed, the stale value was advertised, and
+    // the client died at 0x7B. Fail loudly here instead.
+    if (!effective_srv.is_loopback() && !effective_srv.is_any()) {
+        NetworkAddress local_probe = host_net.usable()
+            ? host_net.ip
+            : NetworkAddress::detect_local_ip(67);
+        if (!local_probe.is_loopback() && !local_probe.is_any() &&
+            local_probe.octet(0) == effective_srv.octet(0) &&
+            local_probe.octet(1) == effective_srv.octet(1) &&
+            local_probe.octet(2) == effective_srv.octet(2) &&
+            local_probe.octet(3) == effective_srv.octet(3)) {
+            Logger::default_logger().info(
+                "NETWORK",
+                "Server IP " + effective_srv.ip_string() +
+                    " confirmed bound to this host; it will be advertised to clients.");
+        } else {
+            Logger::default_logger().warn(
+                "NETWORK",
+                "Configured server_ip " + effective_srv.ip_string() +
+                    " does not appear to be an address of this host (detected " +
+                    local_probe.ip_string() +
+                    "). Clients will be handed a bootfile URL they cannot reach, "
+                    "which fails the SAN attach and boots to 0x7B "
+                    "INACCESSIBLE_BOOT_DEVICE. Set server_ip to a local address, "
+                    "or to 0.0.0.0 to advertise ${next-server} instead.");
+        }
+    }
+
     // Determine active default OS image (respect explicit config or user selection;
     // do not force an arbitrary image as default on clean setups)
     std::string active_default_img = config_.default_master_vhd();
